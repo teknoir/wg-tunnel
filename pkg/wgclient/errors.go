@@ -59,6 +59,12 @@ var ErrSessionClosed = errors.New("wgclient: session closed")
 // ErrExpired ends a session whose renewals kept failing until it expired.
 var ErrExpired = errors.New("wgclient: session expired without a successful renewal")
 
+// ErrTunnelDead ends a session whose renewal failed at the transport level
+// while no WireGuard packet had been received for more than twice the
+// persistent keepalive interval: the path to the hub is gone (the hub removed
+// the peer, the relay died or the network is down).
+var ErrTunnelDead = errors.New("wgclient: tunnel to the hub is dead")
+
 // ErrHandshakeTimeout is returned by Create when the WireGuard handshake with
 // the hub did not complete in time.
 var ErrHandshakeTimeout = errors.New("wgclient: WireGuard handshake with the hub timed out")

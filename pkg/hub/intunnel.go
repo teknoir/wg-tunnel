@@ -54,6 +54,10 @@ func (h *Hub) ServeTunnel(ctx context.Context) error {
 // its tunnel stays installed, so that the HTTP response can be delivered.
 const responseGrace = 500 * time.Millisecond
 
+// selfEndGrace is the peer grace of a session that ends from inside its own
+// tunnel: long enough for the response and for the closed streams' FIN/RST.
+func (h *Hub) selfEndGrace() time.Duration { return max(responseGrace, h.cfg.FlushGrace) }
+
 func (h *Hub) tunnelHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.RenewPath, h.wrapTunnel("renew", h.handleRenew))
@@ -94,7 +98,7 @@ func (h *Hub) wrapTunnel(op string, fn tunnelFunc) http.HandlerFunc {
 		if den != nil {
 			if den.teardown {
 				// The peer stays up for a moment so the denial reaches the client.
-				if h.endSessionGrace(s, responseGrace) {
+				if h.endSessionGrace(s, h.selfEndGrace()) {
 					h.met.revocations.WithLabelValues(den.reason).Inc()
 				}
 			}
@@ -113,7 +117,7 @@ func (h *Hub) wrapTunnel(op string, fn tunnelFunc) http.HandlerFunc {
 func (h *Hub) handleClose(_ context.Context, _ *http.Request, _ []byte, s *session, _ *dctx) (int, any, *denial) {
 	// The tunnel peer owns its session; ending it needs no further credential
 	// (closing only ever reduces access).
-	h.endSessionGrace(s, responseGrace)
+	h.endSessionGrace(s, h.selfEndGrace())
 	return http.StatusNoContent, nil, nil
 }
 

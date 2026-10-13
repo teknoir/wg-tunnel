@@ -48,6 +48,10 @@ type Session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	started  time.Time
+	swapMu   sync.Mutex
+	lastSwap time.Time
+
 	mu      sync.Mutex
 	resp    api.SessionResponse
 	expires time.Time
@@ -111,6 +115,7 @@ func Create(ctx context.Context, opts Options) (*Session, error) {
 		closeURL: "http://" + net.JoinHostPort(api.HubAddress, strconv.Itoa(api.HubAPIPort)) + api.CloseSessionPath,
 		tracked:  map[io.Closer]struct{}{},
 		done:     make(chan struct{}),
+		started:  time.Now(),
 	}
 	s.address = netip.MustParseAddr(resp.Address)
 	s.ctx, s.cancel = context.WithCancel(context.Background())
@@ -272,6 +277,9 @@ func (s *Session) up(ctx context.Context, priv *wgkey.PrivateKey) error {
 }
 
 func (s *Session) onSwap(reason string) {
+	s.swapMu.Lock()
+	s.lastSwap = time.Now()
+	s.swapMu.Unlock()
 	if reason == relay.ReasonInitial {
 		return // the peer is not configured yet
 	}
@@ -347,6 +355,9 @@ func (s *Session) renewLoop() error {
 		if errors.As(err, &he) && he.Denial() {
 			return err
 		}
+		if derr := s.deadTunnel(err); derr != nil {
+			return derr
+		}
 		s.mu.Lock()
 		expired := time.Now().After(s.expires)
 		s.mu.Unlock()
@@ -358,13 +369,58 @@ func (s *Session) renewLoop() error {
 	}
 }
 
+// lastActivity is the latest sign of life of the tunnel: the last WireGuard
+// packet received, the last relay re-allocation (a recovering relay gets the
+// same grace as a fresh one) or the start of the session.
+func (s *Session) lastActivity() time.Time {
+	t := s.started
+	if s.bind != nil {
+		if r := s.bind.LastReceive(); r.After(t) {
+			t = r
+		}
+	}
+	s.swapMu.Lock()
+	if s.lastSwap.After(t) {
+		t = s.lastSwap
+	}
+	s.swapMu.Unlock()
+	return t
+}
+
+// deadTunnel decides whether a failed renewal means the tunnel itself is dead:
+// the failure is at the transport level (not an HTTP answer from the hub, not a
+// failure to obtain the credential) and nothing at all arrived through
+// WireGuard for more than DeadAfter (2 * PersistentKeepalive). It then returns
+// the error that ends the session at once, instead of retrying until the
+// session expires minutes later.
+func (s *Session) deadTunnel(err error) error {
+	var he *Error
+	var ce *credentialError
+	if errors.As(err, &he) || errors.As(err, &ce) {
+		return nil
+	}
+	silent := time.Since(s.lastActivity())
+	if silent <= s.opts.deadAfter() {
+		return nil
+	}
+	return fmt.Errorf("%w: no WireGuard packet received for %s and the renewal failed: %v",
+		ErrTunnelDead, silent.Round(time.Second), err)
+}
+
+// credentialError marks a failure to obtain the bearer credential, which says
+// nothing about the tunnel.
+type credentialError struct{ err error }
+
+func (e *credentialError) Error() string { return "obtaining credential: " + e.err.Error() }
+func (e *credentialError) Unwrap() error { return e.err }
+
 // renew performs one renewal with a fresh credential and applies TURN rotation.
 func (s *Session) renew() (*api.RenewResponse, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.opts.renewTimeout())
 	defer cancel()
 	token, err := s.opts.Credential(ctx, s.pubB64)
 	if err != nil {
-		return nil, fmt.Errorf("obtaining credential: %w", err)
+		return nil, &credentialError{err}
 	}
 	s.httpOnce()
 	var rr api.RenewResponse

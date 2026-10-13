@@ -85,6 +85,7 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 		Namespace: api.HubNamespace, PodIP: "10.1.2.3", Logger: logger, Now: r.clock.Now,
 		IPRate: 1000, IPBurst: 1000, SubjectRate: 1000, SubjectBurst: 1000,
 		ReapInterval: time.Hour, // tests call reap() themselves
+		FlushGrace:   20 * time.Millisecond,
 	}
 	for _, o := range opts {
 		o(&cfg)

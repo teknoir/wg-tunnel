@@ -132,9 +132,20 @@ type spliceConn struct {
 
 func (c *spliceConn) close() {
 	c.once.Do(func() {
-		_ = c.client.Close()
-		_ = c.dev.Close()
+		abort(c.client)
+		abort(c.dev)
 	})
+}
+
+// abort closes c abortively (RST) where the connection supports it (a
+// SetLinger(0) on kernel sockets) and with a plain Close otherwise: the
+// gVisor netstack connections only offer Close, which sends a FIN (or an RST
+// if unread data is pending). Either way the peer's read fails or returns EOF.
+func abort(c net.Conn) {
+	if l, ok := c.(interface{ SetLinger(int) error }); ok {
+		_ = l.SetLinger(0)
+	}
+	_ = c.Close()
 }
 
 func newID() (string, error) {

@@ -68,6 +68,10 @@ type Options struct {
 	RenewRetry time.Duration
 	// RenewTimeout bounds one renewal attempt (default 15 s).
 	RenewTimeout time.Duration
+	// DeadAfter is how long nothing may arrive through WireGuard before a
+	// transport-level renewal failure ends the session (default
+	// 2 * api.PersistentKeepalive seconds).
+	DeadAfter time.Duration
 }
 
 const (
@@ -181,4 +185,11 @@ func (o Options) renewTimeout() time.Duration {
 		return o.RenewTimeout
 	}
 	return defaultRenewTimeout
+}
+
+func (o Options) deadAfter() time.Duration {
+	if o.DeadAfter > 0 {
+		return o.DeadAfter
+	}
+	return 2 * api.PersistentKeepalive * time.Second
 }

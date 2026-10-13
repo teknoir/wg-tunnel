@@ -168,15 +168,13 @@ func TestDeviceSessionReplacesPrevious(t *testing.T) {
 	if first.SessionID == second.SessionID || first.Address == second.Address {
 		t.Fatal("a new session must get a new id and address")
 	}
-	if r.tun.peerCount() != 1 {
-		t.Fatalf("old peer not removed: %d peers", r.tun.peerCount())
-	}
+	// The old peer is removed after the flush grace, synchronously.
+	waitFor(t, "old peer removal", func() bool { return r.tun.peerCount() == 1 })
 	if _, ok := r.tun.peers[first.pub]; ok {
 		t.Fatal("old peer still installed")
 	}
-	// The old peer was removed before the new one was added.
 	order := strings.Join(r.tun.order, ",")
-	if !strings.Contains(order, "remove "+first.Address+",add "+second.Address) {
+	if !strings.Contains(order, "add "+second.Address) || !strings.Contains(order, "remove "+first.Address) {
 		t.Fatalf("order %s", order)
 	}
 	if d, _ := r.h.sessionCounts(); d != 1 {
@@ -619,9 +617,7 @@ func TestReaperExpiresSessionsAndQuarantinesAddresses(t *testing.T) {
 	if d, c := r.h.sessionCounts(); d != 0 || c != 0 {
 		t.Fatalf("sessions not reaped: %d/%d", d, c)
 	}
-	if r.tun.peerCount() != 0 {
-		t.Fatal("peers not removed")
-	}
+	waitFor(t, "peers removed", func() bool { return r.tun.peerCount() == 0 })
 	// The expired device address is not handed out again within the quarantine.
 	if r.h.ipam.InUse() != 0 {
 		t.Fatalf("in use %d", r.h.ipam.InUse())

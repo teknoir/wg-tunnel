@@ -257,6 +257,18 @@ func (h *Hub) KillSession(id string) {
 	}
 }
 
+// DropPeerSilently removes the WireGuard peer of a session without closing
+// anything first, as a crashed or restarted hub would: no FIN or RST reaches
+// the other side. The session record stays, so the hub still thinks it exists.
+func (h *Hub) DropPeerSilently(id string) {
+	h.mu.Lock()
+	s := h.sessions[id]
+	h.mu.Unlock()
+	if s != nil {
+		_ = h.node.Dev.IpcSet("public_key=" + s.pub.Hex() + "\nremove=true\n")
+	}
+}
+
 // Calls returns a copy of the recorded authenticated calls.
 func (h *Hub) Calls() []Call {
 	h.mu.Lock()

@@ -82,7 +82,17 @@ type wgRig struct {
 
 func newWGDeviceRig(t *testing.T, opts ...rigOpt) *wgRig {
 	t.Helper()
+	return newWGDeviceRigHook(t, nil, opts...)
+}
+
+// newWGDeviceRigHook is newWGDeviceRig with a hook that runs on the hub before
+// anything is served (to wrap the tunnel).
+func newWGDeviceRigHook(t *testing.T, hook func(*Hub), opts ...rigOpt) *wgRig {
+	t.Helper()
 	r := newWGRig(t, opts...)
+	if hook != nil {
+		hook(r.h)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	served := make(chan error, 1)
@@ -121,7 +131,7 @@ func newWGDeviceRig(t *testing.T, opts ...rigOpt) *wgRig {
 		}
 	}()
 	// The hub learns the device endpoint from its first keepalive.
-	hubDev := r.h.tunnel.(*wgTunnel).dev
+	hubDev := rawTunnel(r.h).dev
 	waitFor(t, "device endpoint learned by hub", func() bool {
 		out, _ := hubDev.IpcGet()
 		return strings.Contains(out, "endpoint=")
@@ -170,7 +180,7 @@ func echo(t *testing.T, c net.Conn, msg string) {
 }
 
 func hubPeerCount(r *rig) int {
-	out, _ := r.h.tunnel.(*wgTunnel).dev.IpcGet()
+	out, _ := rawTunnel(r.h).dev.IpcGet()
 	return strings.Count(out, "public_key=")
 }
 

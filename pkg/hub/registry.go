@@ -19,7 +19,7 @@ func (h *Hub) admit(s *session) *denial {
 			if old := h.devices[k]; old != nil {
 				h.detachLocked(old)
 				h.mu.Unlock()
-				h.finalize(old)
+				h.teardown(old, h.cfg.FlushGrace)
 				h.logEnd(old, "replace", "replaced")
 				continue
 			}
@@ -110,8 +110,29 @@ func (h *Hub) detachLocked(s *session) {
 	h.met.sessions.WithLabelValues(s.kind).Dec()
 }
 
-// finalize closes the session's spliced connections, removes the peer
-// (synchronously) and only then releases the address into quarantine.
+// teardown is the one path of every hub-initiated end of a session; s must
+// already be detached. In this order:
+//  1. no new connection or renewal can reach s (detach, done by the caller);
+//  2. every spliced connection on both sides is closed, abortively where the
+//     connection allows it, so the FIN/RST travels through the still
+//     installed peers to the client and the device;
+//  3. the peers stay for the flush grace so that those segments are
+//     delivered; only then is the peer removed (synchronously) and the
+//     address released to quarantine (finalize).
+//
+// Removing the peer first would drop the FIN/RST and leave the client's
+// connection hanging until its renewal fails.
+func (h *Hub) teardown(s *session, grace time.Duration) {
+	s.closeConns()
+	if grace <= 0 {
+		h.finalize(s)
+		return
+	}
+	time.AfterFunc(grace, func() { h.finalize(s) })
+}
+
+// finalize removes the peer (synchronously) and only then releases the
+// address into quarantine. It is idempotent.
 func (h *Hub) finalize(s *session) {
 	s.final.Do(func() { h.finalizeOnce(s) })
 }
@@ -133,26 +154,18 @@ func (h *Hub) finalizeOnce(s *session) {
 
 func (h *Hub) limiterForget(s *session) { h.renewLimit.Forget(s.id) }
 
-// endSession removes a session completely. It reports whether this call ended
-// it (false if it was already gone).
+// endSession ends a session on the hub's initiative (policy or flag change,
+// device replacement, max age, reaper). The session is unreachable at once and
+// its spliced connections are closed at once; the peer follows after the
+// flush grace (see teardown). It reports whether this call ended the session
+// (false if it was already gone).
 func (h *Hub) endSession(s *session, _ string) bool {
-	h.mu.Lock()
-	if s.ended {
-		h.mu.Unlock()
-		return false
-	}
-	h.detachLocked(s)
-	h.mu.Unlock()
-	h.finalize(s)
-	return true
+	return h.endSessionGrace(s, h.cfg.FlushGrace)
 }
 
-// endSessionGrace ends a session that asked for it (a denied renewal, a
-// close) but keeps its WireGuard peer for a short grace period so the HTTP
-// response can still reach the client. The session is unreachable at once: it
-// is detached from every lookup and its spliced connections are closed; only
-// the peer removal and the address release are delayed. It is also what the
-// hub does for any session ended from inside its own tunnel.
+// endSessionGrace is endSession with an explicit grace period; a session that
+// asked for its own end (a denied renewal, a close) uses it to keep the peer
+// long enough for the HTTP response to be delivered.
 func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
 	h.mu.Lock()
 	if s.ended {
@@ -161,8 +174,7 @@ func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
 	}
 	h.detachLocked(s)
 	h.mu.Unlock()
-	s.closeConns()
-	time.AfterFunc(grace, func() { h.finalize(s) })
+	h.teardown(s, grace)
 	return true
 }
 

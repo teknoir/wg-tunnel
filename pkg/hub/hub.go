@@ -39,6 +39,10 @@ type Config struct {
 	ReapInterval   time.Duration // default 10s
 	DialTimeout    time.Duration // default 10s
 	Quarantine     time.Duration // IP quarantine (default 5m)
+	// FlushGrace is how long the WireGuard peer of a session ended by the hub
+	// stays installed after its spliced connections were closed, so that the
+	// FIN/RST reaches the other side (default 300ms).
+	FlushGrace time.Duration
 
 	MaxSessions         int // default 5000
 	MaxPerNamespace     int // default 200
@@ -79,6 +83,7 @@ func (c *Config) applyDefaults() {
 	dur(&c.ReapInterval, 10*time.Second)
 	dur(&c.DialTimeout, 10*time.Second)
 	dur(&c.Quarantine, 5*time.Minute)
+	dur(&c.FlushGrace, 300*time.Millisecond)
 	num(&c.MaxSessions, 5000)
 	num(&c.MaxPerNamespace, 200)
 	num(&c.MaxPerSubjectDevice, 5)
@@ -221,6 +226,14 @@ func (h *Hub) Close() error {
 			h.detachLocked(s)
 		}
 		h.mu.Unlock()
+		// Close every stream first, give the FIN/RST a moment to leave, then
+		// remove the peers.
+		for _, s := range all {
+			s.closeConns()
+		}
+		if len(all) > 0 && h.tunnel.Up() {
+			time.Sleep(min(h.cfg.FlushGrace, 100*time.Millisecond))
+		}
 		for _, s := range all {
 			h.finalize(s)
 		}
@@ -289,7 +302,8 @@ func (h *Hub) enforce(k devKey) {
 				conns += c.connCount()
 			}
 		}
-		// Device first: removes its peer and closes every spliced stream to it.
+		// Device first: closes every spliced stream to it (its peer follows
+		// after the flush grace).
 		if dev != nil && h.endSession(dev, eff.Reason) {
 			ended++
 		}

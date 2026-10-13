@@ -340,3 +340,61 @@ func TestLogsNeverContainSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestDeadTunnelEndsSessionBeforeExpiry(t *testing.T) {
+	// The hub drops the peer (no FIN/RST can reach us). The in-tunnel renewal
+	// fails at the transport level and nothing arrives through WireGuard, so
+	// the session ends with ErrTunnelDead long before its 3 minute TTL.
+	r := newRig(t, fakehub.Options{RenewAfter: time.Second})
+	var dn, cn atomic.Int64
+	dev := create(t, r.deviceOpts(deviceCred(&dn)))
+	echoOn(t, dev, 22)
+	o := r.clientOpts(counter("cli", &cn))
+	o.RenewTimeout = 400 * time.Millisecond
+	o.DeadAfter = 1500 * time.Millisecond
+	cli := create(t, o)
+	c, err := cli.Dial(ctxT(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := roundTrip(c, "alive"); err != nil {
+		t.Fatal(err)
+	}
+	// Drop only the peer, silently: no spliced connection is closed first.
+	r.hub.DropPeerSilently(r.hub.SessionIDs(api.KindClient)[0])
+	t0 := time.Now()
+	select {
+	case <-cli.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("session did not end although the tunnel is dead")
+	}
+	if !errors.Is(cli.Err(), wgclient.ErrTunnelDead) {
+		t.Fatalf("Err() = %v", cli.Err())
+	}
+	if time.Since(t0) > 15*time.Second {
+		t.Fatalf("took %v", time.Since(t0))
+	}
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the Dial'ed connection survived the session")
+	}
+}
+
+func TestSlowRenewalWithLiveTunnelDoesNotEndSession(t *testing.T) {
+	// A transport-level failure alone is not enough: while packets keep
+	// arriving, the session is retried.
+	r := newRig(t, fakehub.Options{RenewAfter: time.Second})
+	var dn, cn atomic.Int64
+	create(t, r.deviceOpts(deviceCred(&dn)))
+	o := r.clientOpts(counter("cli", &cn))
+	o.DeadAfter = time.Hour
+	o.RenewTimeout = 300 * time.Millisecond
+	cli := create(t, o)
+	r.hub.DropPeerSilently(r.hub.SessionIDs(api.KindClient)[0])
+	select {
+	case <-cli.Done():
+		t.Fatalf("session ended: %v", cli.Err())
+	case <-time.After(3 * time.Second):
+	}
+}
