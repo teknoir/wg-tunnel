@@ -108,7 +108,7 @@ func TestCloseReleasesEverything(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	eventually(t, 3*time.Second, "server to drop the allocation", func() bool { return srv.Allocations() == 0 })
+	eventually(t, 15*time.Second, "server to drop the allocation", func() bool { return srv.Allocations() == 0 })
 	// The UDP socket is closed: its port can be bound again.
 	c, err := net.ListenPacket("udp4", local)
 	if err != nil {

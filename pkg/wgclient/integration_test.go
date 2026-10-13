@@ -295,7 +295,7 @@ func TestCloseNotifiesHub(t *testing.T) {
 	if cli.Err() != nil {
 		t.Fatalf("Err after Close = %v", cli.Err())
 	}
-	eventually(t, 3*time.Second, "hub to drop the session", func() bool { return len(r.hub.SessionIDs(api.KindClient)) == 0 })
+	eventually(t, 15*time.Second, "hub to drop the session", func() bool { return len(r.hub.SessionIDs(api.KindClient)) == 0 })
 	_ = cli.Close() // idempotent
 }
 

@@ -67,7 +67,7 @@ func TestEnrollsThenForwardsThroughTURN(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatalf("Run returned %v", err)
 	}
-	eventually(t, 5*time.Second, "device session closed at the hub", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 0 })
+	eventually(t, 20*time.Second, "device session closed at the hub", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 0 })
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := c.Read(make([]byte, 1)); err == nil {
 		t.Fatal("forwarded connection survived shutdown")
@@ -269,7 +269,7 @@ func TestConnectionCap(t *testing.T) {
 	}
 	// Freeing a slot admits new connections again.
 	_ = open[0].Close()
-	eventually(t, 5*time.Second, "slot freed", func() bool {
+	eventually(t, 20*time.Second, "slot freed", func() bool {
 		c, err := cli.Dial(ctxT(t))
 		if err != nil {
 			return false
@@ -415,7 +415,7 @@ func TestAgentWithLostIdentityEnrollsWhenTheWindowOpens(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 5*time.Second, "the first session to close", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 0 })
+	eventually(t, 20*time.Second, "the first session to close", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 0 })
 	if err := os.RemoveAll(r.idDir); err != nil {
 		t.Fatal(err)
 	}

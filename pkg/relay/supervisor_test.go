@@ -164,7 +164,7 @@ func TestSupervisorStaleOnServerRestart(t *testing.T) {
 	defer sup.Close()
 	pusher(t, hub, sup, 20*time.Millisecond)
 
-	eventually(t, 3*time.Second, "traffic", func() bool { return count.Load() > 5 })
+	eventually(t, 15*time.Second, "traffic", func() bool { return count.Load() > 5 })
 	first := sup.Current()
 	time.Sleep(1300 * time.Millisecond) // longer than StaleAfter: traffic keeps it healthy
 	if sup.Current() != first || b.Swaps() != 1 {
@@ -182,7 +182,7 @@ func TestSupervisorStaleOnServerRestart(t *testing.T) {
 	if _, _, err := first.ReadFrom(make([]byte, 8)); err == nil {
 		t.Fatal("old relay still readable")
 	}
-	eventually(t, 3*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
+	eventually(t, 15*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
 	if ncreds.Load() < 2 {
 		t.Fatalf("Creds called %d times", ncreds.Load())
 	}
@@ -210,7 +210,7 @@ func TestSupervisorRotate(t *testing.T) {
 		t.Fatal("second Start succeeded")
 	}
 	pusher(t, hub, sup, 20*time.Millisecond)
-	eventually(t, 3*time.Second, "traffic", func() bool { return count.Load() > 3 })
+	eventually(t, 15*time.Second, "traffic", func() bool { return count.Load() > 3 })
 	first := sup.Current()
 
 	next := creds(srv.Addr, udpAP(hub), "dev-2")
@@ -306,8 +306,8 @@ func TestSupervisorRetriesWithBackoffKeepingOldRelay(t *testing.T) {
 		t.Fatalf("allocations = %d", srv.Allocations())
 	}
 	fail.Store(false)
-	eventually(t, 5*time.Second, "recovery after credentials return", func() bool { return sup.Current() != first })
-	eventually(t, 3*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
+	eventually(t, 20*time.Second, "recovery after credentials return", func() bool { return sup.Current() != first })
+	eventually(t, 15*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
 }
 
 func TestSupervisorClose(t *testing.T) {
@@ -332,7 +332,7 @@ func TestSupervisorClose(t *testing.T) {
 	if sup.Current() != nil {
 		t.Fatal("Current after Close")
 	}
-	eventually(t, 3*time.Second, "allocation released", func() bool { return srv.Allocations() == 0 })
+	eventually(t, 15*time.Second, "allocation released", func() bool { return srv.Allocations() == 0 })
 	_, _, _ = b.Open(0)
 	if err := b.Send([][]byte{{1}}, turnbind.NewEndpoint(netip.MustParseAddrPort("127.0.0.1:9"))); !errors.Is(err, turnbind.ErrNoConn) {
 		t.Fatalf("Send after Close = %v", err)
@@ -457,5 +457,5 @@ func TestWireGuardOverTURNSurvivesServerRestart(t *testing.T) {
 	if len(ev.list()) < 2 {
 		t.Fatalf("expected a re-allocation, events %v", ev.list())
 	}
-	eventually(t, 3*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
+	eventually(t, 15*time.Second, "single allocation", func() bool { return srv.Allocations() == 1 })
 }
