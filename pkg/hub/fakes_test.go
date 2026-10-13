@@ -105,27 +105,40 @@ func (p *fakePolicy) Delete(ns, device string) {
 type fakeFlags struct {
 	subscribers
 	mu sync.Mutex
-	m  map[devKey]map[string]string
+	m  map[devKey]api.FlagsEntry
 }
 
-func newFakeFlags() *fakeFlags { return &fakeFlags{m: map[devKey]map[string]string{}} }
+func newFakeFlags() *fakeFlags { return &fakeFlags{m: map[devKey]api.FlagsEntry{}} }
 
-func (f *fakeFlags) Annotations(ns, device string) (map[string]string, bool) {
+func (f *fakeFlags) Flags(ns, device string) (api.FlagsEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a, ok := f.m[devKey{ns, device}]
-	return a, ok
+	e, ok := f.m[devKey{ns, device}]
+	return e, ok
 }
 func (f *fakeFlags) Subscribe(fn func(ns, device string)) { f.add(fn) }
 func (f *fakeFlags) HasSynced() bool                      { return true }
 
-// Set replaces the annotations of a device (creating it).
+// Set replaces the flags of a device (creating it) from Device annotations,
+// the way the flags watcher mirrors them.
 func (f *fakeFlags) Set(ns, device string, ann map[string]string) {
-	f.mu.Lock()
-	f.m[devKey{ns, device}] = ann
-	f.mu.Unlock()
-	f.notify(ns, device)
+	f.SetEntry(api.FlagsEntry{
+		Device: device, Namespace: ns, Exists: true,
+		WireGuard:         ann[api.AnnotationWireGuard] == "enabled",
+		Compromised:       api.FlagSet(ann[api.AnnotationCompromised]),
+		HealthCheckFailed: api.FlagSet(ann[api.AnnotationHealthCheckFailed]),
+	})
 }
+
+// SetEntry stores an entry as is.
+func (f *fakeFlags) SetEntry(e api.FlagsEntry) {
+	f.mu.Lock()
+	f.m[devKey{e.Namespace, e.Device}] = e
+	f.mu.Unlock()
+	f.notify(e.Namespace, e.Device)
+}
+
+// Delete removes the entry (the Device is gone).
 func (f *fakeFlags) Delete(ns, device string) {
 	f.mu.Lock()
 	delete(f.m, devKey{ns, device})
@@ -139,7 +152,9 @@ type memIdentity struct {
 	mu        sync.Mutex
 	m         map[devKey]api.IdentityEntry
 	conflicts int
+	voids     int
 	getErr    error
+	voidErr   error
 }
 
 func newMemIdentity() *memIdentity { return &memIdentity{m: map[devKey]api.IdentityEntry{}} }
@@ -158,11 +173,28 @@ func (s *memIdentity) Pin(_ context.Context, e api.IdentityEntry) (api.IdentityE
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := devKey{e.Namespace, e.Device}
-	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration >= e.EnrollmentGeneration {
+	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration == e.EnrollmentGeneration && cur.EnrollmentEpoch == e.EnrollmentEpoch {
 		return cur, false, nil
 	}
 	s.m[k] = e
 	return e, true, nil
+}
+
+func (s *memIdentity) Void(_ context.Context, ns, device, reason string, at time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.voidErr != nil {
+		return false, s.voidErr
+	}
+	k := devKey{ns, device}
+	cur, ok := s.m[k]
+	if !ok || cur.Voided {
+		return false, nil
+	}
+	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
+	s.m[k] = cur
+	s.voids++
+	return true, nil
 }
 
 func (s *memIdentity) RecordConflict(_ context.Context, ns, device string, at time.Time) error {
@@ -192,6 +224,7 @@ type fakeUsers struct {
 	mu     sync.Mutex
 	tokens map[string]UserIdentity
 	err    error
+	n      int
 }
 
 func newFakeUsers() *fakeUsers { return &fakeUsers{tokens: map[string]UserIdentity{}} }
@@ -209,9 +242,16 @@ func (u *fakeUsers) Authenticate(_ context.Context, token string) (UserIdentity,
 	return id, nil
 }
 
+// set registers (or re-issues) a token. Every call gives the token a new id and
+// a later issue time, the way a refreshed Keycloak access token differs from
+// the previous one; renewals need such a fresh token.
 func (u *fakeUsers) set(token, email string, exp time.Time) {
 	u.mu.Lock()
-	u.tokens[token] = UserIdentity{Email: email, ExpiresAt: exp}
+	u.n++
+	u.tokens[token] = UserIdentity{
+		Email: email, ExpiresAt: exp,
+		TokenID: fmt.Sprintf("%s#%d", token, u.n), IssuedAt: time.Date(2026, 10, 13, 11, 0, 0, 0, time.UTC).Add(time.Duration(u.n) * time.Second),
+	}
 	u.mu.Unlock()
 }
 
@@ -370,6 +410,11 @@ func (c *deviceCreds) newIdentity(t testing.TB) {
 	}
 	c.idPriv = priv
 	c.idPubB64 = identity.EncodePublicKey(pub)
+}
+
+// fingerprint is the fingerprint of the current identity key.
+func (c *deviceCreds) fingerprint() string {
+	return identity.Fingerprint(c.idPriv.Public().(ed25519.PublicKey))
 }
 
 func (c *deviceCreds) sub() string { return api.DeviceSubject(testNS, testDevice) }

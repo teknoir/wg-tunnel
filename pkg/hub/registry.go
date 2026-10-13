@@ -32,15 +32,24 @@ func (h *Hub) admit(s *session) *denial {
 
 func (h *Hub) admitLocked(s *session) *denial {
 	k := s.key()
-	switch {
-	case len(h.byID) >= h.cfg.MaxSessions:
+	subjKey := s.limitKey() + "|" + k.String()
+	if s.kind == api.KindClient {
+		// Quotas protect against client sessions only. A device holds exactly
+		// one session of its own, so clients can never fill the teamspace and
+		// lock the devices out.
+		switch {
+		case len(h.byID) >= h.cfg.MaxSessions:
+			return deny(api.ReasonSessionLimit, "hub session limit reached")
+		case h.perNS[s.ns] >= h.cfg.MaxPerNamespace:
+			return deny(api.ReasonSessionLimit, "teamspace session limit reached")
+		case h.perSubj[subjKey] >= h.cfg.MaxPerSubjectDevice:
+			return deny(api.ReasonSessionLimit, "too many sessions for this device")
+		case h.perSubjAll[s.limitKey()] >= h.cfg.MaxPerSubject:
+			return deny(api.ReasonSessionLimit, "too many sessions for this user")
+		}
+	} else if len(h.byID) >= 2*h.cfg.MaxSessions {
+		// Devices have headroom of their own on top of the client limit.
 		return deny(api.ReasonSessionLimit, "hub session limit reached")
-	case h.perNS[s.ns] >= h.cfg.MaxPerNamespace:
-		return deny(api.ReasonSessionLimit, "teamspace session limit reached")
-	}
-	subjKey := s.subject + "|" + k.String()
-	if s.kind == api.KindClient && h.perSubj[subjKey] >= h.cfg.MaxPerSubjectDevice {
-		return deny(api.ReasonSessionLimit, "too many sessions for this device")
 	}
 	if _, dup := h.byWG[s.wgKey]; dup || s.wgKey == h.tunnel.PublicKey() {
 		return deny(api.ReasonBadRequest, "WireGuard key already in use")
@@ -58,10 +67,10 @@ func (h *Hub) admitLocked(s *session) *denial {
 	h.byID[s.id] = s
 	h.byIP[ip] = s
 	h.byWG[s.wgKey] = s
-	h.perNS[s.ns]++
 	if s.kind == api.KindDevice {
 		h.devices[k] = s
 	} else {
+		h.perNS[s.ns]++
 		m := h.clients[k]
 		if m == nil {
 			m = map[string]*session{}
@@ -69,6 +78,7 @@ func (h *Hub) admitLocked(s *session) *denial {
 		}
 		m[s.id] = s
 		h.perSubj[subjKey]++
+		h.perSubjAll[s.limitKey()]++
 	}
 	h.met.sessions.WithLabelValues(s.kind).Inc()
 	h.met.creates.WithLabelValues(s.kind).Inc()
@@ -86,25 +96,29 @@ func (h *Hub) detachLocked(s *session) {
 	k := s.key()
 	delete(h.byID, s.id)
 	delete(h.byIP, s.ip)
-	h.perNS[s.ns]--
-	if h.perNS[s.ns] <= 0 {
-		delete(h.perNS, s.ns)
-	}
 	if s.kind == api.KindDevice {
 		if h.devices[k] == s {
 			delete(h.devices, k)
 		}
 	} else {
+		h.perNS[s.ns]--
+		if h.perNS[s.ns] <= 0 {
+			delete(h.perNS, s.ns)
+		}
 		if m := h.clients[k]; m != nil {
 			delete(m, s.id)
 			if len(m) == 0 {
 				delete(h.clients, k)
 			}
 		}
-		sk := s.subject + "|" + k.String()
+		sk := s.limitKey() + "|" + k.String()
 		h.perSubj[sk]--
 		if h.perSubj[sk] <= 0 {
 			delete(h.perSubj, sk)
+		}
+		h.perSubjAll[s.limitKey()]--
+		if h.perSubjAll[s.limitKey()] <= 0 {
+			delete(h.perSubjAll, s.limitKey())
 		}
 	}
 	h.met.sessions.WithLabelValues(s.kind).Dec()

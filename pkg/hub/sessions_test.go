@@ -74,6 +74,7 @@ func TestDeviceSessionRequiresEnrollment(t *testing.T) {
 func TestDeviceSessionRejects(t *testing.T) {
 	r := newRig(t)
 	r.enrollOK()
+	r.approve()
 	now := r.clock.Now()
 
 	t.Run("token signed by an unpinned identity", func(t *testing.T) {
@@ -150,6 +151,7 @@ func TestDeviceSessionStateDenials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRig(t)
 			r.enrollOK()
+			r.approve()
 			tc.mutate(r)
 			tok, req, _ := r.dev.sessionRequest(t, r.clock.Now())
 			st, body := r.post(api.DeviceSessionPath, tok, req)
@@ -246,9 +248,26 @@ func TestClientSessionDenials(t *testing.T) {
 		st, body := post(aliceToken, func(q *api.ClientSessionRequest) { q.Device = "Cam/1" })
 		wantReason(t, st, body, http.StatusBadRequest, api.ReasonBadRequest)
 	})
-	t.Run("direct without delegation", func(t *testing.T) {
-		st, body := post(aliceToken, func(q *api.ClientSessionRequest) { q.Direct = true })
+	// The outside API (reachable through the ingress gateways) refuses
+	// delegation and direct sessions whatever credential comes with them.
+	t.Run("direct on the outside API", func(t *testing.T) {
+		req, _ := r.clientReq(22)
+		req.Direct = true
+		st, body := r.post(api.ClientSessionPath, aliceToken, req)
 		wantReason(t, st, body, http.StatusForbidden, api.ReasonForbidden)
+	})
+	t.Run("onBehalfOf on the outside API", func(t *testing.T) {
+		r := newRig(t)
+		r.deviceSessionOK()
+		r.sa.add("sa-token", "term-cam-1", testNS, testDevice)
+		req, _ := r.clientReq(22)
+		req.OnBehalfOf = aliceEmail
+		st, body := r.post(api.ClientSessionPath, "sa-token", req)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonForbidden)
+		// The same request is fine on the internal port.
+		if st, body = r.clientSessionInternal("sa-token", req); st != http.StatusCreated {
+			t.Fatalf("internal: %d %s", st, body)
+		}
 	})
 	t.Run("onBehalfOf with a Keycloak token", func(t *testing.T) {
 		st, body := post(aliceToken, func(q *api.ClientSessionRequest) { q.OnBehalfOf = "bob@example.com" })
@@ -399,14 +418,35 @@ func TestSessionLimits(t *testing.T) {
 		r.h.endSession(one, "test")
 		r.clientSessionOK()
 	})
-	t.Run("per namespace", func(t *testing.T) {
-		r := newRig(t, func(c *Config) { c.MaxPerNamespace = 3 })
+	t.Run("per namespace counts clients only", func(t *testing.T) {
+		r := newRig(t, func(c *Config) { c.MaxPerNamespace = 2 })
 		r.deviceSessionOK()
 		r.clientSessionOK()
 		r.clientSessionOK()
 		req, _ := r.clientReq(22)
 		st, body := r.clientSession(aliceToken, req)
 		wantReason(t, st, body, http.StatusTooManyRequests, api.ReasonSessionLimit)
+		// The teamspace is full of client sessions, yet the device can still
+		// reconnect (a restart or a blip must not lock devices out).
+		r.deviceSessionOK()
+		r.deviceSessionOK()
+	})
+	t.Run("per subject across devices", func(t *testing.T) {
+		r := newRig(t, func(c *Config) { c.MaxPerSubject = 3; c.MaxPerSubjectDevice = 10 })
+		r.deviceSessionOK()
+		for range 3 {
+			r.clientSessionOK()
+		}
+		req, _ := r.clientReq(22)
+		st, body := r.clientSession(aliceToken, req)
+		wantReason(t, st, body, http.StatusTooManyRequests, api.ReasonSessionLimit)
+		// Another user is unaffected.
+		r.users.set("carol", "carol@example.com", r.clock.Now().Add(time.Minute))
+		r.authz.set("carol@example.com", testNS, true)
+		req, _ = r.clientReq(22)
+		if st, body = r.clientSession("carol", req); st != http.StatusCreated {
+			t.Fatalf("%d %s", st, body)
+		}
 	})
 	t.Run("global", func(t *testing.T) {
 		r := newRig(t, func(c *Config) { c.MaxSessions = 2 })
@@ -430,8 +470,9 @@ func TestSessionLimits(t *testing.T) {
 
 func TestRateLimitsApplyBeforeAllocation(t *testing.T) {
 	t.Run("per source IP", func(t *testing.T) {
-		r := newRig(t, func(c *Config) { c.IPRate = 0.001; c.IPBurst = 3 })
+		r := newRig(t, func(c *Config) { c.IPRate = 0.001; c.IPBurst = 3; c.ClientIPHeader = testIPHeader })
 		r.enrollOK() // 1
+		r.approve()
 		var last int
 		var lastBody []byte
 		for range 5 {
@@ -462,8 +503,9 @@ func TestRateLimitsApplyBeforeAllocation(t *testing.T) {
 		}
 	})
 	t.Run("429 carries Retry-After", func(t *testing.T) {
-		r := newRig(t, func(c *Config) { c.IPRate = 0.001; c.IPBurst = 1 })
+		r := newRig(t, func(c *Config) { c.IPRate = 0.001; c.IPBurst = 1; c.ClientIPHeader = testIPHeader })
 		req, _ := http.NewRequest(http.MethodPost, r.srv.URL+api.ClientSessionPath, nil)
+		req.Header.Set(testIPHeader, "203.0.113.50")
 		for range 2 {
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -588,15 +630,20 @@ func TestEnforcementOnGenerationBumpAndPortChange(t *testing.T) {
 	r := newRig(t)
 	r.deviceSessionOK()
 	r.clientSessionOK()
-	// Narrowing the ports ends the client session that used port 22.
+	// Narrowing the ports ends the client session that used port 22. The
+	// device session ends too: the agent exposes the ports it was told at
+	// session creation, so it must reconnect to learn the new set.
 	p := r.policy
 	p.AllowedPorts = []int{2222}
 	r.setPolicy(p)
 	waitFor(t, "client to end", func() bool { _, c := r.h.sessionCounts(); return c == 0 })
-	if d, _ := r.h.sessionCounts(); d != 1 {
-		t.Fatal("device session should survive a port change")
+	waitFor(t, "device to end", func() bool { d, _ := r.h.sessionCounts(); return d == 0 })
+
+	// The reconnected device gets the new set, and a new epoch voids its identity.
+	dev := r.deviceSessionOK()
+	if len(dev.AllowedPorts) != 1 || dev.AllowedPorts[0] != 2222 {
+		t.Fatalf("allowed ports %v", dev.AllowedPorts)
 	}
-	// Resetting enrollment voids the device identity: its session ends.
 	p.EnrollmentGeneration = 2
 	r.setPolicy(p)
 	waitFor(t, "device to end", func() bool { d, _ := r.h.sessionCounts(); return d == 0 })
@@ -747,6 +794,7 @@ func TestRenewReevaluatesPolicy(t *testing.T) {
 		r.deviceSessionOK()
 		c := r.clientSessionOK()
 		r.authz.set(aliceEmail, testNS, false)
+		r.users.set(aliceToken, aliceEmail, r.clock.Now().Add(5*time.Minute))
 		st, body := r.tunnelPost(api.RenewPath, c.Address, aliceToken, nil)
 		wantReason(t, st, body, http.StatusForbidden, api.ReasonForbidden)
 		if _, n := r.h.sessionCounts(); n != 0 {
@@ -758,8 +806,9 @@ func TestRenewReevaluatesPolicy(t *testing.T) {
 		r.deviceSessionOK()
 		c := r.clientSessionOK()
 		r.flags.mu.Lock()
-		r.flags.m[devKey{testNS, testDevice}] = map[string]string{api.AnnotationWireGuard: "enabled", api.AnnotationCompromised: "true"}
+		r.flags.m[devKey{testNS, testDevice}] = api.FlagsEntry{Device: testDevice, Namespace: testNS, Exists: true, WireGuard: true, Compromised: true}
 		r.flags.mu.Unlock()
+		r.users.set(aliceToken, aliceEmail, r.clock.Now().Add(5*time.Minute))
 		st, body := r.tunnelPost(api.RenewPath, c.Address, aliceToken, nil)
 		wantReason(t, st, body, http.StatusForbidden, api.ReasonDeviceRevoked)
 	})
@@ -861,6 +910,7 @@ func TestRenewRateLimitedPerSession(t *testing.T) {
 	c := r.clientSessionOK()
 	var last int
 	for range 10 {
+		r.users.set(aliceToken, aliceEmail, r.clock.Now().Add(5*time.Minute))
 		last, _ = r.tunnelPost(api.RenewPath, c.Address, aliceToken, nil)
 	}
 	if last != http.StatusTooManyRequests {

@@ -45,28 +45,59 @@ func TestLimiterBoundedKeys(t *testing.T) {
 
 func TestReplayCache(t *testing.T) {
 	clock := newFakeClock()
-	c := newReplayCache(3, clock.Now)
+	c := newReplayCache(3, 3, clock.Now)
 	exp := clock.Now().Add(time.Minute)
-	if err := c.Check("a", exp); err != nil {
+	if err := c.Check("s", "a", exp); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Check("a", exp); !errors.Is(err, errReplay) {
+	if err := c.Check("s", "a", exp); !errors.Is(err, errReplay) {
 		t.Fatalf("replay not detected: %v", err)
 	}
-	_ = c.Check("b", exp)
-	_ = c.Check("c", exp)
-	if err := c.Check("d", exp); !errors.Is(err, errReplayFull) {
+	// The same id of another subject is another token.
+	if err := c.Check("t", "a", exp); err != nil {
+		t.Fatalf("ids are scoped to their subject: %v", err)
+	}
+	_ = c.Check("u", "c", exp)
+	if err := c.Check("v", "d", exp); !errors.Is(err, errReplayFull) {
 		t.Fatalf("a full cache of live entries must refuse, got %v", err)
 	}
 	clock.Advance(2 * time.Minute)
-	if err := c.Check("d", clock.Now().Add(time.Minute)); err != nil {
+	if err := c.Check("v", "d", clock.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("expired entries must be reclaimed: %v", err)
 	}
-	if err := c.Check("a", clock.Now().Add(time.Minute)); err != nil {
+	if err := c.Check("s", "a", clock.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("an expired jti may be recorded again: %v", err)
 	}
 	if c.Len() > 3 {
 		t.Fatalf("cache exceeds its bound: %d", c.Len())
+	}
+}
+
+// One subject can neither fill the cache nor evict the entries of another.
+func TestReplayCacheIsPartitionedPerSubject(t *testing.T) {
+	clock := newFakeClock()
+	c := newReplayCache(1000, 5, clock.Now)
+	exp := clock.Now().Add(time.Minute)
+	if err := c.Check("victim", "v1", exp); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		if err := c.Check("attacker", fmt.Sprintf("a%d", i), exp); err != nil {
+			t.Fatalf("attacker entry %d: %v", i, err)
+		}
+	}
+	if err := c.Check("attacker", "a-more", exp); !errors.Is(err, errReplayFull) {
+		t.Fatalf("the attacker's partition must be full, got %v", err)
+	}
+	// The victim is unaffected, and its recorded token is still remembered.
+	if err := c.Check("victim", "v2", exp); err != nil {
+		t.Fatalf("victim blocked by another subject: %v", err)
+	}
+	if err := c.Check("victim", "v1", exp); !errors.Is(err, errReplay) {
+		t.Fatalf("victim's entry was evicted: %v", err)
+	}
+	if c.Len() != 7 {
+		t.Fatalf("len %d, want 7", c.Len())
 	}
 }
 

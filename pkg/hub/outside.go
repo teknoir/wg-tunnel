@@ -32,13 +32,24 @@ const (
 type handlerFunc func(ctx context.Context, r *http.Request, body []byte, d *dctx) (int, any, *denial)
 
 // Handler serves the outside-tunnel API (enroll, device and client session
-// creation) plus /healthz and /readyz. The caller wraps it in an http.Server
+// creation) plus /healthz and /readyz on the port reachable through the
+// ingress gateways (api.HubHTTPPort). It authenticates Keycloak users and
+// devices only: service-account delegation and direct sessions are refused
+// here and served by InternalHandler. The caller wraps it in an http.Server
 // with the hub's timeouts (see NewHTTPServer).
-func (h *Hub) Handler() http.Handler {
+func (h *Hub) Handler() http.Handler { return h.apiHandler(false) }
+
+// InternalHandler serves the same API for in-cluster callers on
+// api.HubInternalPort, which no VirtualService routes to. In addition to
+// everything Handler accepts it accepts service-account delegation
+// (OnBehalfOf) and direct UDP sessions.
+func (h *Hub) InternalHandler() http.Handler { return h.apiHandler(true) }
+
+func (h *Hub) apiHandler(internal bool) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc(api.DeviceEnrollPath, h.wrap("enroll", h.handleEnroll))
-	mux.HandleFunc(api.DeviceSessionPath, h.wrap("session", h.handleDeviceSession))
-	mux.HandleFunc(api.ClientSessionPath, h.wrap("session", h.handleClientSession))
+	mux.HandleFunc(api.DeviceEnrollPath, h.wrap("enroll", internal, h.handleEnroll))
+	mux.HandleFunc(api.DeviceSessionPath, h.wrap("session", internal, h.handleDeviceSession))
+	mux.HandleFunc(api.ClientSessionPath, h.wrap("session", internal, h.handleClientSession))
 	mux.HandleFunc(api.HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -67,11 +78,18 @@ func NewHTTPServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// wrap adds the common prelude: method, per-source rate limit (before anything
-// is parsed or allocated), body limit, JSON rendering and the decision line.
-func (h *Hub) wrap(op string, fn handlerFunc) http.HandlerFunc {
+// wrap adds the common prelude: method, rate limits (per trusted source
+// address when there is one, plus a global backstop per endpoint; both before
+// anything is parsed or allocated), body limit, JSON rendering and the
+// decision line.
+func (h *Hub) wrap(op string, internal bool, fn handlerFunc) http.HandlerFunc {
+	listener := "outside|"
+	if internal {
+		listener = "internal|"
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		d := &dctx{op: op, remote: h.clientIP(r)}
+		ip, trusted := h.clientIP(r)
+		d := &dctx{op: op, remote: ip, internal: internal}
 		if r.Method != http.MethodPost {
 			den := deny(api.ReasonBadRequest, "POST required")
 			den.status = http.StatusMethodNotAllowed
@@ -79,9 +97,19 @@ func (h *Hub) wrap(op string, fn handlerFunc) http.HandlerFunc {
 			h.writeDenial(w, d, den)
 			return
 		}
-		if ok, retry := h.ipLimit.Allow(d.remote); !ok {
+		// The per-source limiter needs a client address that a trusted proxy
+		// vouches for. Without one every request would share the proxy's
+		// address and one caller could exhaust the limit for everybody.
+		if trusted {
+			if ok, retry := h.ipLimit.Allow(ip); !ok {
+				w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+				h.writeDenial(w, d, deny(api.ReasonRateLimited, "too many requests"))
+				return
+			}
+		}
+		if ok, retry := h.globalLimit.Allow(listener + r.URL.Path); !ok {
 			w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
-			h.writeDenial(w, d, deny(api.ReasonRateLimited, "too many requests"))
+			h.writeDenial(w, d, deny(api.ReasonRateLimited, "the hub is busy"))
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
@@ -170,13 +198,18 @@ func validPosture(p api.Posture, softwares ...string) *denial {
 	return nil
 }
 
-func (h *Hub) replayDenial(key string, claims *api.DeviceClaims) *denial {
-	until := time.Unix(claims.ExpiresAt, 0).Add(api.MaxClockSkew)
-	switch err := h.replay.Check(key+"|"+claims.ID, until); {
+// replayDenial records the jti of a verified device token in the partition of
+// subjectKey. The subject limiter must run first, so a subject that is already
+// over its rate cannot even add entries.
+func (h *Hub) replayDenial(subjectKey string, claims *api.DeviceClaims) *denial {
+	// The entry must outlive the token's last moment of validity, which is
+	// exp plus the accepted clock skew, rounded up to a whole second.
+	until := time.Unix(claims.ExpiresAt, 0).Add(api.MaxClockSkew + 2*time.Second)
+	switch err := h.replay.Check(subjectKey, claims.ID, until); {
 	case errors.Is(err, errReplay):
 		return deny(api.ReasonReplay, "token already used")
 	case err != nil:
-		return deny(api.ReasonRateLimited, "replay cache full")
+		return deny(api.ReasonRateLimited, "too many tokens for this subject")
 	}
 	return nil
 }
@@ -187,6 +220,10 @@ func (h *Hub) subjectDenial(key string) *denial {
 	}
 	return nil
 }
+
+// errUnauthenticated is the one answer an unauthenticated caller gets for
+// anything that depends on a device's existence or enrollment state.
+func unauthenticatedDenial() *denial { return deny(api.ReasonUnauthenticated, "invalid token") }
 
 func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d *dctx) (int, any, *denial) {
 	d.kind = api.KindDevice
@@ -208,9 +245,11 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	}
 	d.ns, d.device, d.subject = ns, device, sub
 
+	// Until the token is verified, every failure looks the same: a caller who
+	// cannot prove the legacy key learns nothing about which devices exist.
 	pol, ok := h.deps.Policy.Get(ns, device)
 	if !ok {
-		return 0, nil, deny(api.ReasonDeviceUnknown, "no policy for device")
+		return 0, nil, unauthenticatedDenial()
 	}
 	now := h.now()
 	claims, err := identity.VerifyEnrollJWT(tok, []byte(pol.RSAPublicCert), sub, now)
@@ -227,10 +266,12 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	if err := identity.VerifyEnrollProof(idPub, sub, claims.ID, req.Proof); err != nil {
 		return 0, nil, deny(api.ReasonUnauthenticated, "invalid proof of possession")
 	}
-	if den := h.replayDenial("enroll|"+sub, claims); den != nil {
+	// Subject limit first, then the replay cache: a subject over its rate must
+	// not be able to fill its replay partition.
+	if den := h.subjectDenial("enroll|" + sub); den != nil {
 		return 0, nil, den
 	}
-	if den := h.subjectDenial("enroll|" + sub); den != nil {
+	if den := h.replayDenial("enroll|"+sub, claims); den != nil {
 		return 0, nil, den
 	}
 	if den := validPosture(req.Posture, "wg-agent"); den != nil {
@@ -248,9 +289,15 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
 		return 0, nil, denyUnavailable("identity store unavailable")
 	}
-	if found && cur.EnrollmentGeneration >= pol.EnrollmentGeneration {
+	if found && sameEpoch(cur, pol) {
+		// First wins per enrollment epoch.
+		if cur.Voided {
+			return 0, nil, deny(api.ReasonEnrollClosed, "the pinned identity was voided; an admin must reset enrollment")
+		}
 		return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 	}
+	// No pin, or a pin of another epoch or generation (void): enrollment is
+	// allowed only inside the open window of this policy.
 	if !now.Before(pol.EnrollUntil) {
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
@@ -259,11 +306,15 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		IdentityPublicKey:    identity.EncodePublicKey(idPub),
 		Fingerprint:          fingerprint,
 		EnrollmentGeneration: pol.EnrollmentGeneration,
+		EnrollmentEpoch:      pol.EnrollmentEpoch,
 		EnrolledAt:           now,
 	})
 	if err != nil {
 		h.log.Error("pinning identity failed", "ns", ns, "device", device, "err", err)
 		return 0, nil, denyUnavailable("identity store unavailable")
+	}
+	if created {
+		h.log.Info("identity pinned; waiting for admin approval", "ns", ns, "device", device, "fingerprint", fingerprint)
 	}
 	return h.enrollResult(ctx, got, req.IdentityPublicKey, created, d)
 }
@@ -283,25 +334,37 @@ func (h *Hub) enrollResult(ctx context.Context, pin api.IdentityEntry, requested
 	return http.StatusOK, resp, nil
 }
 
-// pinnedKey loads the identity pin of a device and checks it against the
-// current policy generation.
-func (h *Hub) pinnedKey(ctx context.Context, ns, device string, pol api.PolicyEntry) (ed25519.PublicKey, int64, *denial) {
+// loadPin loads the identity pin of a device and its key. It does not judge
+// the pin against the policy (see checkPin): a caller must authenticate with
+// the pinned key first, so that the reasons below stay hidden from strangers.
+func (h *Hub) loadPin(ctx context.Context, ns, device string) (api.IdentityEntry, ed25519.PublicKey, *denial) {
 	pin, found, err := h.deps.Identity.Get(ctx, ns, device)
 	switch {
 	case err != nil:
 		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
-		return nil, 0, denyUnavailable("identity store unavailable")
+		return pin, nil, denyUnavailable("identity store unavailable")
 	case !found:
-		return nil, 0, deny(api.ReasonNotEnrolled, "device identity is not enrolled")
-	case pin.EnrollmentGeneration < pol.EnrollmentGeneration:
-		return nil, 0, deny(api.ReasonReenroll, "enrollment was reset; enroll a new identity")
+		return pin, nil, deny(api.ReasonNotEnrolled, "device identity is not enrolled")
 	}
 	pub, err := identity.ParsePublicKey(pin.IdentityPublicKey)
 	if err != nil {
 		h.log.Error("pinned identity key is malformed", "ns", ns, "device", device)
-		return nil, 0, deny(api.ReasonInternal, "pinned identity is invalid")
+		return pin, nil, deny(api.ReasonInternal, "pinned identity is invalid")
 	}
-	return pub, pin.EnrollmentGeneration, nil
+	return pin, pub, nil
+}
+
+// checkPin judges an authenticated device's pin against the policy: the pin
+// must belong to the current enrollment (epoch and generation, not voided) and
+// its fingerprint must be the one an admin approved.
+func checkPin(pin api.IdentityEntry, pub ed25519.PublicKey, pol api.PolicyEntry) *denial {
+	if !pinCurrent(pin, pol) {
+		return deny(api.ReasonReenroll, "enrollment was reset; enroll a new identity")
+	}
+	if pol.ApprovedFingerprint == "" || identity.Fingerprint(pub) != pol.ApprovedFingerprint {
+		return deny(api.ReasonPendingApproval, "the device identity is waiting for an admin to approve it in the Teknoir UI")
+	}
+	return nil
 }
 
 // sanitizeHostKeys keeps the valid authorized_keys-format SSH host keys in a
@@ -349,11 +412,12 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	}
 	d.ns, d.device, d.subject = ns, device, sub
 
-	pol, ok := h.deps.Policy.Get(ns, device)
-	if !ok {
-		return 0, nil, deny(api.ReasonDeviceUnknown, "no policy for device")
+	// Unknown devices look like bad tokens. Only a device that has a pin can
+	// be told more, and only after it proved it holds the pinned key.
+	if _, ok := h.deps.Policy.Get(ns, device); !ok {
+		return 0, nil, unauthenticatedDenial()
 	}
-	pub, gen, den := h.pinnedKey(ctx, ns, device, pol)
+	pin, pub, den := h.loadPin(ctx, ns, device)
 	if den != nil {
 		return 0, nil, den
 	}
@@ -362,6 +426,15 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	if err != nil {
 		return 0, nil, deny(api.ReasonUnauthenticated, "invalid identity token")
 	}
+	// Authenticated. A device that is revoked, disabled or unknown to the
+	// policy hears that before anything about its pin.
+	eff := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)
+	if !eff.Active {
+		return 0, nil, deny(eff.Reason, eff.Detail)
+	}
+	if den := checkPin(pin, pub, eff.Policy); den != nil {
+		return 0, nil, den
+	}
 	wgPub, err := wgkey.ParsePublic(req.WGPublicKey)
 	if err != nil {
 		return 0, nil, deny(api.ReasonBadRequest, "invalid WireGuard public key")
@@ -369,18 +442,14 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	if tokKey, err := wgkey.ParsePublic(claims.WGKey); err != nil || tokKey != wgPub {
 		return 0, nil, deny(api.ReasonUnauthenticated, "token is not bound to this WireGuard key")
 	}
-	if den := h.replayDenial("device|"+sub, claims); den != nil {
+	if den := h.subjectDenial("device|" + sub); den != nil {
 		return 0, nil, den
 	}
-	if den := h.subjectDenial("device|" + sub); den != nil {
+	if den := h.replayDenial("device|"+sub, claims); den != nil {
 		return 0, nil, den
 	}
 	if den := validPosture(req.Posture, "wg-agent"); den != nil {
 		return 0, nil, den
-	}
-	eff := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)
-	if !eff.Active {
-		return 0, nil, deny(eff.Reason, eff.Detail)
 	}
 
 	id, err := newID()
@@ -392,9 +461,11 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 		h.log.Error("minting TURN credentials failed", "err", err)
 		return 0, nil, denyUnavailable("TURN credentials unavailable")
 	}
+	ports := validPorts(eff.Policy.AllowedPorts)
 	s := &session{
 		id: id, kind: api.KindDevice, authKind: authDevice, ns: ns, device: device, subject: sub,
-		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now, generation: gen,
+		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now,
+		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), ports: ports,
 		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote,
 		expiresAt: now.Add(h.cfg.SessionTTL), turnExpiry: turn.ExpiresAt,
 	}
@@ -402,17 +473,45 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	if den := h.admit(s); den != nil {
 		return 0, nil, den
 	}
-	// An annotation may have flipped between the check and the registration.
+	// An annotation or the policy may have changed between the checks and the
+	// registration; the enforcer saw that change before s existed.
 	if again := computeEffective(h.deps.Policy, h.deps.Flags, ns, device); !again.Active {
 		h.endSession(s, again.Reason)
 		return 0, nil, deny(again.Reason, again.Detail)
+	} else if reason, detail := deviceStale(s, again.Policy); reason != "" {
+		h.endSession(s, reason)
+		return 0, nil, deny(staleDenialReason(reason), detail)
 	}
 	return http.StatusCreated, &api.SessionResponse{
 		SessionID: id, Kind: api.KindDevice, Address: s.ip.String(),
 		HubAddress: api.HubAddress, HubPublicKey: h.tunnel.PublicKey().Base64(), HubEndpoint: h.Endpoint(),
 		TURN: turn, ExpiresAt: s.expiresAt, RenewAfterSeconds: int(h.cfg.RenewAfter.Seconds()), MTU: api.MTU,
-		AllowedPorts: slices.Clone(eff.Policy.AllowedPorts),
+		AllowedPorts: slices.Clone(ports),
 	}, nil
+}
+
+// deviceStale reports why a live device session no longer matches pol: its
+// identity belongs to an older enrollment, the admin approved another
+// fingerprint, or the allowed ports changed (the agent only learns the ports
+// at session creation, so it must reconnect).
+func deviceStale(s *session, pol api.PolicyEntry) (reason, detail string) {
+	switch {
+	case pol.EnrollmentGeneration != s.generation || pol.EnrollmentEpoch != s.epoch:
+		return api.ReasonReenroll, "enrollment reset"
+	case pol.ApprovedFingerprint != s.fingerprint:
+		return api.ReasonPendingApproval, "identity approval changed"
+	case !samePorts(pol.AllowedPorts, s.ports):
+		return reasonPortsChanged, "allowed ports changed"
+	}
+	return "", ""
+}
+
+// staleDenialReason maps an internal end reason to a wire reason.
+func staleDenialReason(reason string) string {
+	if reason == reasonPortsChanged {
+		return api.ReasonForbidden
+	}
+	return reason
 }
 
 func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []byte, d *dctx) (int, any, *denial) {
@@ -424,6 +523,12 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	var req api.ClientSessionRequest
 	if den := decodeJSON(body, &req); den != nil {
 		return 0, nil, den
+	}
+	// Service-account delegation and direct UDP are in-cluster features: the
+	// outside API (reachable through the ingress gateways) refuses them, no
+	// matter what credential comes with the request.
+	if !d.internal && (req.OnBehalfOf != "" || req.Direct) {
+		return 0, nil, deny(api.ReasonForbidden, "delegation and direct sessions are not available on this endpoint")
 	}
 	if !validLabel(req.Namespace) || !validLabel(req.Device) || req.Port < 1 || req.Port > 65535 {
 		return 0, nil, deny(api.ReasonBadRequest, "invalid namespace, device or port")
@@ -440,6 +545,8 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		email, saName string
 		authKind      = authKeycloak
 		tokenExp      time.Time
+		tokenID       string
+		tokenIAT      time.Time
 	)
 	if req.OnBehalfOf != "" {
 		if !ValidEmail(req.OnBehalfOf) {
@@ -458,16 +565,14 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		if err != nil {
 			return 0, nil, asDenial(err)
 		}
-		email, tokenExp = u.Email, u.ExpiresAt
+		email, tokenExp, tokenID, tokenIAT = u.Email, u.ExpiresAt, u.TokenID, u.IssuedAt
 	}
 	d.subject = email
 	if authKind == authSA {
 		d.subject = email + " via sa:" + saName
 	}
-	if req.Direct && authKind != authSA {
-		return 0, nil, deny(api.ReasonForbidden, "direct UDP is only available to in-cluster clients")
-	}
-	if den := h.subjectDenial("client|" + email); den != nil {
+	probe := &session{authKind: authKind, saName: saName, subject: email}
+	if den := h.subjectDenial("client|" + probe.limitKey()); den != nil {
 		return 0, nil, den
 	}
 	if den := validPosture(req.Posture, "tnctl", "web-terminal"); den != nil {
@@ -510,7 +615,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	s := &session{
 		id: id, kind: api.KindClient, authKind: authKind, ns: ns, device: device, subject: email, saName: saName,
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now, targetPort: req.Port, direct: req.Direct,
-		remote: d.remote, tokenExpiry: tokenExp,
+		remote: d.remote, tokenExpiry: tokenExp, lastTokenID: tokenID, lastTokenIAT: tokenIAT,
 		expiresAt: capExpiry(now.Add(h.cfg.SessionTTL), tokenExp, h.cfg.SessionTTL),
 	}
 	if turn != nil {

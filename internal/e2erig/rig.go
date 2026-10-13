@@ -73,7 +73,19 @@ type Options struct {
 	AgentBackoff agent.Backoff
 	// Hub lets a test adjust the hub configuration.
 	Hub func(*hub.Config)
+	// ManualApproval stops the rig from approving the agent's identity: the
+	// test plays the admin itself (Rig.Policy.Approve / Rig.ApproveAgent).
+	// By default the rig approves every identity the agent pins, the way an
+	// admin clicking "Approve identity" in the UI would.
+	ManualApproval bool
 }
+
+// Epoch names of the rig's enrollment windows; tests that reset enrollment
+// write a new one.
+const (
+	Epoch1 = "e2e-epoch-1"
+	Epoch2 = "e2e-epoch-2"
+)
 
 // LogBuf is a goroutine-safe log sink.
 type LogBuf struct {
@@ -261,7 +273,7 @@ func New(t testing.TB, opts Options) *Rig {
 	// Policy: active, enrollment window open, the fake sshd's port allowed.
 	r.Policy.Set(api.PolicyEntry{
 		Device: DeviceName, Namespace: NS, State: api.StateActive, RSAPublicCert: rsaCert,
-		AllowedPorts: []int{r.Echo.Port}, EnrollmentGeneration: 1, EnrollUntil: time.Now().Add(time.Hour),
+		AllowedPorts: []int{r.Echo.Port}, EnrollmentGeneration: 1, EnrollmentEpoch: Epoch1, EnrollUntil: time.Now().Add(time.Hour),
 	})
 	r.Flags.Set(NS, DeviceName, map[string]string{api.AnnotationWireGuard: "enabled"})
 	r.Authz.Set(AliceEmail, NS, true)
@@ -270,6 +282,7 @@ func New(t testing.TB, opts Options) *Rig {
 	cfg := hub.Config{
 		PodIP: "127.0.0.1", Logger: logger(r.HubLogs), RenewAfter: opts.RenewAfter,
 		IPRate: 1000, IPBurst: 1000, SubjectRate: 1000, SubjectBurst: 1000,
+		GlobalRate: 100000, GlobalBurst: 100000,
 	}
 	if opts.Hub != nil {
 		opts.Hub(&cfg)
@@ -447,6 +460,9 @@ func (r *Rig) StartAgent() *Agent {
 	r.agentRuns++
 	r.secMu.Unlock()
 	var once sync.Once
+	if !r.Opts.ManualApproval {
+		go r.autoApprove(ctx)
+	}
 	r.T.Cleanup(func() {
 		once.Do(func() {
 			cancel()
@@ -458,6 +474,43 @@ func (r *Rig) StartAgent() *Agent {
 		})
 	})
 	return ag
+}
+
+// ApproveAgent plays the admin: it approves the identity currently pinned for
+// the device (waiting for the agent to enroll first) by writing its
+// fingerprint into the policy, the way device-controller copies the
+// approved-identity annotation.
+func (r *Rig) ApproveAgent() {
+	r.T.Helper()
+	Eventually(r.T, 30*time.Second, "the agent to pin an identity", func() bool { return r.approveOnce() })
+}
+
+// approveOnce approves the pinned identity if it belongs to the current
+// enrollment and is not yet approved; it reports whether one is pinned.
+func (r *Rig) approveOnce() bool {
+	pol, ok := r.Policy.Get(NS, DeviceName)
+	pin := r.Identity.Entry(NS, DeviceName)
+	if !ok || pin.Fingerprint == "" || pin.Voided ||
+		pin.EnrollmentGeneration != pol.EnrollmentGeneration || pin.EnrollmentEpoch != pol.EnrollmentEpoch {
+		return false
+	}
+	if pol.ApprovedFingerprint != pin.Fingerprint {
+		r.Policy.Approve(NS, DeviceName, pin.Fingerprint)
+	}
+	return true
+}
+
+func (r *Rig) autoApprove(ctx context.Context) {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.approveOnce()
+		}
+	}
 }
 
 // WaitDeviceUp waits until the hub has a device session and the agent has

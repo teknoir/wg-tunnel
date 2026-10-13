@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
-	metafake "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
@@ -27,7 +26,17 @@ import (
 // ---- SA delegation ----
 
 func saFixture(name string, ann map[string]string) *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: api.HubNamespace, Annotations: ann}}
+	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: api.HubNamespace, Annotations: ann,
+		Labels: map[string]string{SAManagedByLabel: SAManagedByValue},
+	}}
+}
+
+// saUnmanaged has the right annotations but was not created by device-controller.
+func saUnmanaged(name string, ann map[string]string) *corev1.ServiceAccount {
+	sa := saFixture(name, ann)
+	sa.Labels = nil
+	return sa
 }
 
 func tokenReviewReactor(cs *fake.Clientset, calls *atomic.Int32, results map[string]authnv1.TokenReviewStatus) {
@@ -49,23 +58,25 @@ func TestK8sSADelegation(t *testing.T) {
 		saFixture("term-cam-1", bound),
 		saFixture("term-other", map[string]string{api.SAAnnotationNamespace: "acme", api.SAAnnotationDevice: "cam-2"}),
 		saFixture("term-bare", nil),
+		saUnmanaged("term-unmanaged", bound),
 	)
 	var calls atomic.Int32
 	user := func(sa string) authnv1.UserInfo {
 		return authnv1.UserInfo{Username: "system:serviceaccount:" + api.HubNamespace + ":" + sa}
 	}
 	tokenReviewReactor(cs, &calls, map[string]authnv1.TokenReviewStatus{
-		"tok-bound":    {Authenticated: true, User: user("term-cam-1"), Audiences: []string{api.SATokenAudience}},
-		"tok-other":    {Authenticated: true, User: user("term-other"), Audiences: []string{api.SATokenAudience}},
-		"tok-bare":     {Authenticated: true, User: user("term-bare"), Audiences: []string{api.SATokenAudience}},
-		"tok-ghost":    {Authenticated: true, User: user("ghost"), Audiences: []string{api.SATokenAudience}},
-		"tok-badaud":   {Authenticated: true, User: user("term-cam-1"), Audiences: []string{"https://kubernetes.default.svc"}},
-		"tok-otherns":  {Authenticated: true, User: authnv1.UserInfo{Username: "system:serviceaccount:acme:term-cam-1"}, Audiences: []string{api.SATokenAudience}},
-		"tok-human":    {Authenticated: true, User: authnv1.UserInfo{Username: "alice@example.com"}, Audiences: []string{api.SATokenAudience}},
-		"tok-unauth":   {Authenticated: false, Error: "expired"},
-		"tok-nested":   {Authenticated: true, User: user("a:b"), Audiences: []string{api.SATokenAudience}},
-		"tok-nopfx":    {Authenticated: true, User: authnv1.UserInfo{Username: "system:serviceaccount:" + api.HubNamespace + ":"}, Audiences: []string{api.SATokenAudience}},
-		"tok-noaud-ok": {Authenticated: true, User: user("term-cam-1")},
+		"tok-bound":     {Authenticated: true, User: user("term-cam-1"), Audiences: []string{api.SATokenAudience}},
+		"tok-other":     {Authenticated: true, User: user("term-other"), Audiences: []string{api.SATokenAudience}},
+		"tok-bare":      {Authenticated: true, User: user("term-bare"), Audiences: []string{api.SATokenAudience}},
+		"tok-unmanaged": {Authenticated: true, User: user("term-unmanaged"), Audiences: []string{api.SATokenAudience}},
+		"tok-ghost":     {Authenticated: true, User: user("ghost"), Audiences: []string{api.SATokenAudience}},
+		"tok-badaud":    {Authenticated: true, User: user("term-cam-1"), Audiences: []string{"https://kubernetes.default.svc"}},
+		"tok-otherns":   {Authenticated: true, User: authnv1.UserInfo{Username: "system:serviceaccount:acme:term-cam-1"}, Audiences: []string{api.SATokenAudience}},
+		"tok-human":     {Authenticated: true, User: authnv1.UserInfo{Username: "alice@example.com"}, Audiences: []string{api.SATokenAudience}},
+		"tok-unauth":    {Authenticated: false, Error: "expired"},
+		"tok-nested":    {Authenticated: true, User: user("a:b"), Audiences: []string{api.SATokenAudience}},
+		"tok-nopfx":     {Authenticated: true, User: authnv1.UserInfo{Username: "system:serviceaccount:" + api.HubNamespace + ":"}, Audiences: []string{api.SATokenAudience}},
+		"tok-noaud-ok":  {Authenticated: true, User: user("term-cam-1")},
 	})
 	d := NewK8sSADelegation(cs, api.HubNamespace)
 	ctx := context.Background()
@@ -78,7 +89,10 @@ func TestK8sSADelegation(t *testing.T) {
 		wantErr    error // nil = success
 	}{
 		{"bound SA, matching device", "tok-bound", "acme", "cam-1", "alice@example.com", nil},
-		{"audience not echoed by the API server is tolerated", "tok-noaud-ok", "acme", "cam-1", "alice@example.com", nil},
+		// An empty audience list means "valid for the API server's own audience"
+		// (an ordinary automounted pod token): never a delegation credential.
+		{"empty audience list is refused", "tok-noaud-ok", "acme", "cam-1", "alice@example.com", ErrUnauthenticated},
+		{"annotated SA not managed by device-controller", "tok-unmanaged", "acme", "cam-1", "alice@example.com", ErrForbidden},
 		{"bound to another device (namespace/device mismatch)", "tok-bound", "acme", "cam-2", "alice@example.com", ErrForbidden},
 		{"bound to another namespace", "tok-bound", "evil", "cam-1", "alice@example.com", ErrForbidden},
 		{"SA bound to cam-2 asked for cam-1", "tok-other", "acme", "cam-1", "alice@example.com", ErrForbidden},
@@ -314,80 +328,94 @@ func TestK8sPolicySourceInformer(t *testing.T) {
 
 // ---- device flags ----
 
-func TestFlagStore(t *testing.T) {
-	f := newFlagStore()
+func flagsCM(ns, device string, mut func(*corev1.ConfigMap, *api.FlagsEntry)) *corev1.ConfigMap {
+	e := api.FlagsEntry{Device: device, Namespace: ns, Exists: true, WireGuard: true}
+	cm, err := BuildFlagsConfigMap(api.HubNamespace, e, nil)
+	if err != nil {
+		panic(err)
+	}
+	if mut != nil {
+		mut(cm, &e)
+		raw, _ := json.Marshal(e)
+		cm.Data[api.FlagsDataKey] = string(raw)
+	}
+	return cm
+}
+
+func TestFlagStoreValidationAndEvents(t *testing.T) {
+	logger, _ := captureLogger()
+	f := newFlagStore(logger)
 	var n atomic.Int32
 	f.Subscribe(func(string, string) { n.Add(1) })
-	obj := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "cam-1", Namespace: "acme", Annotations: map[string]string{
-		api.AnnotationWireGuard: "enabled", "unrelated": "x", "kubectl.kubernetes.io/last-applied-configuration": "SECRET",
-	}}}
-	f.apply(obj)
-	ann, ok := f.Annotations("acme", "cam-1")
-	if !ok || ann[api.AnnotationWireGuard] != "enabled" || len(ann) != 1 {
-		t.Fatalf("annotations %v %v (only ztna annotations may be kept)", ann, ok)
+
+	cm := flagsCM("acme", "cam-1", nil)
+	f.apply(cm)
+	e, ok := f.Flags("acme", "cam-1")
+	if !ok || !e.Exists || !e.WireGuard || e.Compromised {
+		t.Fatalf("got %+v %v", e, ok)
 	}
-	f.apply(obj) // unchanged: no event
+	// Only the observation time changed: no event.
+	same := flagsCM("acme", "cam-1", func(_ *corev1.ConfigMap, e *api.FlagsEntry) { e.ObservedAt = time.Unix(99, 0).UTC() })
+	f.apply(same)
 	if n.Load() != 1 {
 		t.Fatalf("events %d, want 1", n.Load())
 	}
-	upd := obj.DeepCopy()
-	upd.Annotations[api.AnnotationCompromised] = "true"
-	f.apply(upd)
+	f.apply(flagsCM("acme", "cam-1", func(_ *corev1.ConfigMap, e *api.FlagsEntry) { e.Compromised = true }))
 	if n.Load() != 2 {
 		t.Fatalf("events %d, want 2", n.Load())
 	}
-	f.remove(upd)
-	if _, ok := f.Annotations("acme", "cam-1"); ok || n.Load() != 3 {
-		t.Fatalf("delete not applied (events %d)", n.Load())
+
+	// Anything that disagrees with its own name or labels is treated as absent.
+	for name, bad := range map[string]*corev1.ConfigMap{
+		"no label":      flagsCM("acme", "cam-1", func(cm *corev1.ConfigMap, _ *api.FlagsEntry) { delete(cm.Labels, api.FlagsLabel) }),
+		"wrong name":    flagsCM("acme", "cam-1", func(_ *corev1.ConfigMap, e *api.FlagsEntry) { e.Device = "cam-2" }),
+		"foreign entry": flagsCM("acme", "cam-1", func(_ *corev1.ConfigMap, e *api.FlagsEntry) { e.Namespace = "evil" }),
+		"malformed": func() *corev1.ConfigMap {
+			cm := flagsCM("acme", "cam-1", nil)
+			cm.Data[api.FlagsDataKey] = "{nope"
+			return cm
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f.apply(flagsCM("acme", "cam-1", nil))
+			f.apply(bad)
+			if _, ok := f.Flags("acme", "cam-1"); ok {
+				t.Fatal("a bad flags ConfigMap must fail closed (entry removed)")
+			}
+		})
+	}
+	f.apply(flagsCM("acme", "cam-1", nil))
+	f.remove(cm)
+	if _, ok := f.Flags("acme", "cam-1"); ok {
+		t.Fatal("delete not applied")
 	}
 }
 
-func TestK8sDeviceFlagsMetadataInformer(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := metav1.AddMetaToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	dev := &metav1.PartialObjectMetadata{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "teknoir.org/v1", Kind: "Device"},
-		ObjectMeta: metav1.ObjectMeta{Name: "cam-1", Namespace: "acme", Annotations: map[string]string{api.AnnotationWireGuard: "enabled"}},
-	}
-	mc := metafake.NewSimpleMetadataClient(scheme, dev)
-	flags, err := NewK8sDeviceFlags(mc)
+func TestK8sFlagsSourceInformer(t *testing.T) {
+	cs := fake.NewSimpleClientset(flagsCM("acme", "cam-1", nil))
+	logger, _ := captureLogger()
+	src, err := NewK8sFlagsSource(cs, api.HubNamespace, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var n atomic.Int32
-	flags.Subscribe(func(string, string) { n.Add(1) })
+	src.Subscribe(func(string, string) { n.Add(1) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	flags.Start(ctx)
-	waitFor(t, "flags sync", flags.HasSynced)
-	ann, ok := flags.Annotations("acme", "cam-1")
-	if !ok || ann[api.AnnotationWireGuard] != "enabled" {
-		t.Fatalf("got %v %v", ann, ok)
+	src.Start(ctx)
+	waitFor(t, "flags sync", src.HasSynced)
+	if e, ok := src.Flags("acme", "cam-1"); !ok || !e.WireGuard {
+		t.Fatalf("got %+v %v", e, ok)
 	}
-
-	gvr := schema.GroupVersionResource{Group: "teknoir.org", Version: "v1", Resource: "devices"}
-	if gvr != DeviceGVR {
-		t.Fatalf("unexpected GVR %v", DeviceGVR)
-	}
-	upd := dev.DeepCopy()
-	upd.Annotations[api.AnnotationHealthCheckFailed] = "true"
-	patchObj := &metav1.PartialObjectMetadata{TypeMeta: dev.TypeMeta, ObjectMeta: upd.ObjectMeta}
-	_ = patchObj
-	// The fake metadata client supports merge patches on annotations.
-	body := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:"true"}}}`, api.AnnotationHealthCheckFailed))
-	if _, err := mc.Resource(gvr).Namespace("acme").Patch(ctx, "cam-1", "application/merge-patch+json", body, metav1.PatchOptions{}); err != nil {
+	upd := flagsCM("acme", "cam-1", func(_ *corev1.ConfigMap, e *api.FlagsEntry) { e.HealthCheckFailed = true })
+	if _, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Update(ctx, upd, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "health flag", func() bool {
-		a, _ := flags.Annotations("acme", "cam-1")
-		return a[api.AnnotationHealthCheckFailed] == "true"
-	})
-	if err := mc.Resource(gvr).Namespace("acme").Delete(ctx, "cam-1", metav1.DeleteOptions{}); err != nil {
+	waitFor(t, "health flag", func() bool { e, _ := src.Flags("acme", "cam-1"); return e.HealthCheckFailed })
+	if err := cs.CoreV1().ConfigMaps(api.HubNamespace).Delete(ctx, upd.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "device delete", func() bool { _, ok := flags.Annotations("acme", "cam-1"); return !ok })
+	waitFor(t, "flags delete", func() bool { _, ok := src.Flags("acme", "cam-1"); return !ok })
 	if n.Load() < 3 {
 		t.Fatalf("only %d events", n.Load())
 	}
@@ -396,7 +424,14 @@ func TestK8sDeviceFlagsMetadataInformer(t *testing.T) {
 // ---- identity store ----
 
 func idEntry(gen int64, key string) api.IdentityEntry {
-	return api.IdentityEntry{Device: "cam-1", Namespace: "acme", IdentityPublicKey: key, Fingerprint: "SHA256:" + key, EnrollmentGeneration: gen, EnrolledAt: time.Unix(1, 0).UTC()}
+	return idEntryE(gen, "epoch-1", key)
+}
+
+func idEntryE(gen int64, epoch, key string) api.IdentityEntry {
+	return api.IdentityEntry{
+		Device: "cam-1", Namespace: "acme", IdentityPublicKey: key, Fingerprint: "SHA256:" + key,
+		EnrollmentGeneration: gen, EnrollmentEpoch: epoch, EnrolledAt: time.Unix(1, 0).UTC(),
+	}
 }
 
 func TestK8sIdentityStorePinSemantics(t *testing.T) {
@@ -411,23 +446,33 @@ func TestK8sIdentityStorePinSemantics(t *testing.T) {
 	if err != nil || !created || cur.IdentityPublicKey != "keyA" {
 		t.Fatalf("first pin: %+v %v %v", cur, created, err)
 	}
-	// Same generation, different key: the existing pin stays.
+	// Same epoch and generation, different key: the existing pin stays.
 	cur, created, err = s.Pin(ctx, idEntry(1, "keyB"))
 	if err != nil || created || cur.IdentityPublicKey != "keyA" {
 		t.Fatalf("second pin must not replace: %+v %v %v", cur, created, err)
 	}
-	// Older generation: no.
-	cur, created, _ = s.Pin(ctx, idEntry(0, "keyZ"))
-	if created || cur.IdentityPublicKey != "keyA" {
-		t.Fatalf("older generation must not replace: %+v %v", cur, created)
+	// A voided pin of the same epoch is still the pin of that epoch: the
+	// window is over, first wins.
+	if changed, err := s.Void(ctx, "acme", "cam-1", api.RevokeCompromised, time.Unix(5, 0).UTC()); err != nil || !changed {
+		t.Fatalf("void: %v %v", changed, err)
 	}
-	// Newer generation: the old pin is void and replaced.
-	cur, created, err = s.Pin(ctx, idEntry(2, "keyC"))
-	if err != nil || !created || cur.IdentityPublicKey != "keyC" || cur.EnrollmentGeneration != 2 {
-		t.Fatalf("newer generation must replace: %+v %v %v", cur, created, err)
+	if changed, _ := s.Void(ctx, "acme", "cam-1", api.RevokeCompromised, time.Unix(6, 0).UTC()); changed {
+		t.Fatal("voiding twice must be a no-op")
+	}
+	cur, created, _ = s.Pin(ctx, idEntry(1, "keyB"))
+	if created || cur.IdentityPublicKey != "keyA" || !cur.Voided || cur.VoidedReason != api.RevokeCompromised {
+		t.Fatalf("a voided pin must stay in place for its epoch: %+v %v", cur, created)
+	}
+	// Another generation (older or newer) or another epoch is a different
+	// enrollment: the old pin is void and replaced, whatever its number.
+	for i, e := range []api.IdentityEntry{idEntry(2, "keyC"), idEntry(1, "keyD"), idEntryE(1, "epoch-2", "keyE"), idEntryE(0, "epoch-3", "keyF")} {
+		cur, created, err = s.Pin(ctx, e)
+		if err != nil || !created || cur.IdentityPublicKey != e.IdentityPublicKey || cur.Voided {
+			t.Fatalf("case %d: a pin of another epoch/generation must be replaced: %+v %v %v", i, cur, created, err)
+		}
 	}
 	got, found, err := s.Get(ctx, "acme", "cam-1")
-	if err != nil || !found || got.IdentityPublicKey != "keyC" {
+	if err != nil || !found || got.IdentityPublicKey != "keyF" {
 		t.Fatalf("get: %+v %v %v", got, found, err)
 	}
 

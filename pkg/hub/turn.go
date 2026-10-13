@@ -58,9 +58,15 @@ func SplitList(s string) []string {
 	return out
 }
 
+// secretRetryAfterFailure spaces re-reads of the TURN secret after a failure
+// when no value is cached yet.
+const secretRetryAfterFailure = 2 * time.Second
+
 // K8sSecretSource reads the TURN shared secret (key "secret") from a Secret,
 // re-reading it every refresh interval so a rotated secret is picked up. If a
-// re-read fails, the last known value keeps being served.
+// re-read fails, the last known value keeps being served and the next attempt
+// waits for the refresh interval again. The mutex is never held across the API
+// call, and concurrent callers share one read.
 type K8sSecretSource struct {
 	cs      kubernetes.Interface
 	ns      string
@@ -68,9 +74,18 @@ type K8sSecretSource struct {
 	refresh time.Duration
 	now     func() time.Time
 
-	mu      sync.Mutex
-	value   string
-	fetched time.Time
+	mu          sync.Mutex
+	value       string
+	fetched     time.Time // last success
+	lastAttempt time.Time // last read, successful or not
+	lastErr     error
+	flight      *secretFlight
+}
+
+type secretFlight struct {
+	done chan struct{}
+	val  string
+	err  error
 }
 
 // NewK8sSecretSource parses ref ("namespace/name") and returns the source.
@@ -88,26 +103,69 @@ func NewK8sSecretSource(cs kubernetes.Interface, ref string, refresh time.Durati
 // Secret implements SecretFunc.
 func (s *K8sSecretSource) Secret() (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.value != "" && s.now().Sub(s.fetched) < s.refresh {
-		return s.value, nil
+	now := s.now()
+	if s.value != "" && now.Sub(s.fetched) < s.refresh {
+		v := s.value
+		s.mu.Unlock()
+		return v, nil
 	}
+	// Stale or empty. Do not hammer the API server: after an attempt, wait for
+	// the refresh interval (or a short retry delay if we have nothing yet).
+	wait := s.refresh
+	if s.value == "" {
+		wait = min(secretRetryAfterFailure, s.refresh)
+	}
+	if !s.lastAttempt.IsZero() && now.Sub(s.lastAttempt) < wait && s.flight == nil {
+		v, err := s.value, s.lastErr
+		s.mu.Unlock()
+		if v != "" {
+			return v, nil
+		}
+		return "", err
+	}
+	if f := s.flight; f != nil {
+		v := s.value
+		s.mu.Unlock()
+		if v != "" {
+			return v, nil // serve the stale value while another caller refreshes
+		}
+		<-f.done
+		return f.val, f.err
+	}
+	f := &secretFlight{done: make(chan struct{})}
+	s.flight, s.lastAttempt = f, now
+	stale := s.value
+	s.mu.Unlock()
+
+	v, err := s.read()
+
+	s.mu.Lock()
+	switch {
+	case err == nil:
+		s.value, s.fetched, s.lastErr = v, s.now(), nil
+	default:
+		s.lastErr = err
+		if stale != "" {
+			v, err = stale, nil
+		}
+	}
+	s.flight = nil
+	s.mu.Unlock()
+	f.val, f.err = v, err
+	close(f.done)
+	return v, err
+}
+
+func (s *K8sSecretSource) read() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sec, err := s.cs.CoreV1().Secrets(s.ns).Get(ctx, s.name, metav1.GetOptions{})
 	if err != nil {
-		if s.value != "" {
-			return s.value, nil
-		}
 		return "", fmt.Errorf("hub: reading TURN secret: %w", err)
 	}
 	v := string(sec.Data["secret"])
 	if v == "" {
-		if s.value != "" {
-			return s.value, nil
-		}
 		return "", errors.New("hub: TURN secret has no \"secret\" key")
 	}
-	s.value, s.fetched = v, s.now()
 	return v, nil
 }

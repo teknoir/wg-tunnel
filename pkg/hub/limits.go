@@ -89,46 +89,80 @@ var (
 )
 
 // replayCache remembers JWT ids until the token would no longer verify. It is
-// bounded: when full of live entries it refuses (fail closed) rather than
+// partitioned per subject: one subject can neither fill the cache nor evict the
+// entries of another. It is bounded twice (per subject and overall); when a
+// bound is hit with live entries it refuses (fail closed) rather than
 // forgetting.
 type replayCache struct {
-	mu  sync.Mutex
-	m   map[string]time.Time
-	max int
-	now func() time.Time
+	mu         sync.Mutex
+	m          map[string]map[string]time.Time // subject -> jti -> valid until
+	total      int
+	max        int
+	maxSubject int
+	now        func() time.Time
 }
 
-func newReplayCache(max int, now func() time.Time) *replayCache {
-	return &replayCache{m: map[string]time.Time{}, max: max, now: now}
+func newReplayCache(max, maxPerSubject int, now func() time.Time) *replayCache {
+	if maxPerSubject <= 0 || maxPerSubject > max {
+		maxPerSubject = max
+	}
+	return &replayCache{m: map[string]map[string]time.Time{}, max: max, maxSubject: maxPerSubject, now: now}
 }
 
-// Check records key until `until`. It returns errReplay when key is already
-// recorded and still live, and errReplayFull when the cache has no room.
-func (c *replayCache) Check(key string, until time.Time) error {
+// Check records id of subject until `until`. It returns errReplay when the id
+// is already recorded and still live, and errReplayFull when the subject's
+// partition (or the whole cache) has no room.
+func (c *replayCache) Check(subject, id string, until time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	if exp, ok := c.m[key]; ok {
+	part := c.m[subject]
+	if exp, ok := part[id]; ok {
 		if now.Before(exp) {
 			return errReplay
 		}
-		delete(c.m, key)
+		delete(part, id)
+		c.total--
 	}
-	if len(c.m) >= c.max {
-		c.sweepLocked(now)
-		if len(c.m) >= c.max {
+	if len(part) >= c.maxSubject {
+		c.sweepSubjectLocked(subject, now)
+		part = c.m[subject]
+		if len(part) >= c.maxSubject {
 			return errReplayFull
 		}
 	}
-	c.m[key] = until
+	if c.total >= c.max {
+		c.sweepLocked(now)
+		part = c.m[subject]
+		if c.total >= c.max {
+			return errReplayFull
+		}
+	}
+	if part == nil {
+		part = map[string]time.Time{}
+		c.m[subject] = part
+	}
+	part[id] = until
+	c.total++
 	return nil
 }
 
-func (c *replayCache) sweepLocked(now time.Time) {
-	for k, exp := range c.m {
+func (c *replayCache) sweepSubjectLocked(subject string, now time.Time) {
+	part := c.m[subject]
+	for id, exp := range part {
 		if !now.Before(exp) {
-			delete(c.m, k)
+			delete(part, id)
+			c.total--
 		}
+	}
+	if len(part) == 0 {
+		delete(c.m, subject)
+	}
+}
+
+func (c *replayCache) sweepLocked(now time.Time) {
+	for subject := range c.m {
+		c.sweepSubjectLocked(subject, now)
 	}
 }
 
@@ -143,5 +177,5 @@ func (c *replayCache) Sweep() {
 func (c *replayCache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return len(c.m)
+	return c.total
 }

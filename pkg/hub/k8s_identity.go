@@ -137,15 +137,16 @@ func (s *K8sIdentityStore) build(name, ns, device string, e api.IdentityEntry, p
 	return cm, nil
 }
 
-// Pin implements IdentityStore. An existing pin for the same or a newer
-// generation is never replaced; a pin of a lower generation is void.
+// Pin implements IdentityStore. An existing pin of the SAME enrollment epoch
+// and generation is never replaced (first wins per epoch, voided or not); a pin
+// of any other epoch or generation is void and is replaced.
 func (s *K8sIdentityStore) Pin(ctx context.Context, entry api.IdentityEntry) (api.IdentityEntry, bool, error) {
 	if !validLabel(entry.Namespace) || !validLabel(entry.Device) {
 		return api.IdentityEntry{}, false, errors.New("hub: invalid identity entry")
 	}
 	current := entry
 	wrote, err := s.mutate(ctx, entry.Namespace, entry.Device, func(cur *api.IdentityEntry) *api.IdentityEntry {
-		if cur != nil && cur.EnrollmentGeneration >= entry.EnrollmentGeneration {
+		if cur != nil && cur.EnrollmentGeneration == entry.EnrollmentGeneration && cur.EnrollmentEpoch == entry.EnrollmentEpoch {
 			current = *cur
 			return nil
 		}
@@ -156,6 +157,21 @@ func (s *K8sIdentityStore) Pin(ctx context.Context, entry api.IdentityEntry) (ap
 		return api.IdentityEntry{}, false, err
 	}
 	return current, wrote, nil
+}
+
+// Void implements IdentityStore.
+func (s *K8sIdentityStore) Void(ctx context.Context, ns, device, reason string, at time.Time) (bool, error) {
+	if !validLabel(ns) || !validLabel(device) {
+		return false, errors.New("hub: invalid identity entry")
+	}
+	return s.mutate(ctx, ns, device, func(cur *api.IdentityEntry) *api.IdentityEntry {
+		if cur == nil || cur.Voided {
+			return nil // nothing pinned, or already void
+		}
+		next := *cur
+		next.Voided, next.VoidedReason, next.VoidedAt = true, reason, at
+		return &next
+	})
 }
 
 // RecordConflict implements IdentityStore.

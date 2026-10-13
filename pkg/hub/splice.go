@@ -65,8 +65,6 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		return
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
-	defer cancel()
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, s.ns, s.device)
 	if !eff.Active {
 		closeDenied(eff.Reason, eff.Detail)
@@ -76,6 +74,21 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		closeDenied(api.ReasonPortNotAllowed, "port is no longer allowed")
 		return
 	}
+	// The connection cap is enforced before any slow work: a reserved slot is
+	// held while authorizing and dialling, so a burst of attempts cannot
+	// exceed MaxConnsPerSession in flight.
+	if err := s.reserveConn(h.cfg.MaxConnsPerSession); err != nil {
+		closeDenied(api.ReasonSessionLimit, "too many concurrent connections")
+		return
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			s.unreserveConn()
+		}
+	}()
+	cctx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
+	defer cancel()
 	allowed, err := h.deps.Authz.CanExec(cctx, s.subject, s.ns)
 	if err != nil {
 		h.log.Error("authorization check failed", "ns", s.ns, "err", err)
@@ -97,12 +110,13 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		return
 	}
 	sc := &spliceConn{client: c, dev: dc, cs: s, ds: dev}
-	if err := s.addConn(sc, h.cfg.MaxConnsPerSession); err != nil {
+	reserved = false
+	if err := s.commitConn(sc); err != nil {
 		_ = dc.Close()
-		closeDenied(api.ReasonSessionLimit, "too many concurrent connections")
+		closeDenied(api.ReasonSessionLimit, "session ended")
 		return
 	}
-	if err := dev.addConn(sc, 0); err != nil {
+	if err := dev.addConn(sc); err != nil {
 		s.removeConn(sc)
 		_ = dc.Close()
 		closeDenied(api.ReasonDeviceOffline, "device session ended")

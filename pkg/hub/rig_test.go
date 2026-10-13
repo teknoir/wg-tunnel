@@ -17,6 +17,10 @@ import (
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
+// testIPHeader carries the (trusted) client address in rigs that configure
+// Config.ClientIPHeader.
+const testIPHeader = "X-Test-Client-IP"
+
 const (
 	aliceEmail = "alice@example.com"
 	aliceToken = "alice-keycloak-token-SECRET"
@@ -36,7 +40,8 @@ type rig struct {
 	tun    *fakeTunnel
 	clock  *fakeClock
 	logs   *syncBuf
-	srv    *httptest.Server
+	srv    *httptest.Server // outside API (api.HubHTTPPort)
+	isrv   *httptest.Server // internal API (api.HubInternalPort)
 	dev    *deviceCreds
 	policy api.PolicyEntry
 
@@ -84,6 +89,7 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 	cfg := Config{
 		Namespace: api.HubNamespace, PodIP: "10.1.2.3", Logger: logger, Now: r.clock.Now,
 		IPRate: 1000, IPBurst: 1000, SubjectRate: 1000, SubjectBurst: 1000,
+		GlobalRate: 100000, GlobalBurst: 100000,
 		ReapInterval: time.Hour, // tests call reap() themselves
 		FlushGrace:   20 * time.Millisecond,
 	}
@@ -105,10 +111,12 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 	t.Cleanup(func() { _ = h.Close() })
 	r.srv = httptest.NewServer(h.Handler())
 	t.Cleanup(r.srv.Close)
+	r.isrv = httptest.NewServer(h.InternalHandler())
+	t.Cleanup(r.isrv.Close)
 
 	r.policy = api.PolicyEntry{
 		Device: testDevice, Namespace: testNS, State: api.StateActive, RSAPublicCert: r.dev.certPEM,
-		AllowedPorts: []int{22}, EnrollmentGeneration: 1, EnrollUntil: r.clock.Now().Add(15 * time.Minute),
+		AllowedPorts: []int{22}, EnrollmentGeneration: 1, EnrollmentEpoch: "epoch-1", EnrollUntil: r.clock.Now().Add(15 * time.Minute),
 	}
 	r.setPolicy(r.policy)
 	r.flags.Set(testNS, testDevice, map[string]string{api.AnnotationWireGuard: "enabled"})
@@ -120,6 +128,10 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 func (r *rig) setPolicy(p api.PolicyEntry) { r.policy = p; r.pol.Set(p) }
 
 func (r *rig) post(path, token string, body any) (int, []byte) {
+	return r.postTo(r.srv.URL, path, token, body)
+}
+
+func (r *rig) postTo(base, path, token string, body any) (int, []byte) {
 	r.t.Helper()
 	var rd io.Reader
 	switch b := body.(type) {
@@ -133,7 +145,7 @@ func (r *rig) post(path, token string, body any) (int, []byte) {
 		}
 		rd = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(http.MethodPost, r.srv.URL+path, rd)
+	req, err := http.NewRequest(http.MethodPost, base+path, rd)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -141,6 +153,7 @@ func (r *rig) post(path, token string, body any) (int, []byte) {
 		req.Header.Set("Authorization", "Bearer "+token)
 		r.addSecret(token)
 	}
+	req.Header.Set(testIPHeader, "203.0.113.9")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		r.t.Fatal(err)
@@ -184,11 +197,23 @@ type devSess struct {
 	pub  wgkey.PublicKey
 }
 
-// deviceSessionOK creates a device session (enrolling first if needed).
+// approve records the admin approval of the rig device's current identity.
+func (r *rig) approve() {
+	r.t.Helper()
+	p := r.policy
+	p.ApprovedFingerprint = r.dev.fingerprint()
+	r.setPolicy(p)
+}
+
+// deviceSessionOK creates a device session (enrolling and getting the identity
+// approved first if needed).
 func (r *rig) deviceSessionOK(hostKeys ...string) devSess {
 	r.t.Helper()
 	if _, found, _ := r.ids.Get(context.Background(), testNS, testDevice); !found {
 		r.enrollOK()
+	}
+	if r.policy.ApprovedFingerprint != r.dev.fingerprint() {
+		r.approve()
 	}
 	tok, req, priv := r.dev.sessionRequest(r.t, r.clock.Now(), hostKeys...)
 	st, body := r.post(api.DeviceSessionPath, tok, req)
@@ -214,8 +239,18 @@ func (r *rig) clientReq(port int) (api.ClientSessionRequest, wgkey.PrivateKey) {
 	}, priv
 }
 
+// clientSession posts to the outside API, or to the internal API when the
+// request asks for delegation or a direct session (which only it serves).
 func (r *rig) clientSession(token string, req api.ClientSessionRequest) (int, []byte) {
+	if req.OnBehalfOf != "" || req.Direct {
+		return r.postTo(r.isrv.URL, api.ClientSessionPath, token, req)
+	}
 	return r.post(api.ClientSessionPath, token, req)
+}
+
+// clientSessionInternal posts to the internal API.
+func (r *rig) clientSessionInternal(token string, req api.ClientSessionRequest) (int, []byte) {
+	return r.postTo(r.isrv.URL, api.ClientSessionPath, token, req)
 }
 
 func (r *rig) clientSessionOK() api.SessionResponse {

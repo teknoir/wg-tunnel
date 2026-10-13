@@ -42,11 +42,15 @@ type session struct {
 	createdAt  time.Time
 	targetPort int
 	hostKeys   []string
-	// generation is the enrollment generation of the device identity that
-	// created a device session.
-	generation int64
-	direct     bool
-	remote     string
+	// generation, epoch and fingerprint identify the device identity (pin)
+	// that created a device session; ports is the allowed-port set the agent
+	// was told to expose. A change of any of them ends the session.
+	generation  int64
+	epoch       string
+	fingerprint string
+	ports       []int
+	direct      bool
+	remote      string
 
 	// ended is protected by Hub.mu.
 	ended bool
@@ -58,9 +62,26 @@ type session struct {
 	turnExpiry  time.Time
 	conns       map[*spliceConn]struct{}
 	connsClosed bool
+	// reserved counts splice connections that passed the cap and are still
+	// dialling the device.
+	reserved int
+	// lastTokenID/lastTokenIAT identify the Keycloak token accepted last
+	// (create or renew); the next renewal must present a newer one.
+	lastTokenID  string
+	lastTokenIAT time.Time
 }
 
 func (s *session) key() devKey { return devKey{s.ns, s.device} }
+
+// limitKey is the subject the per-user quotas and rate limits count against.
+// Delegated sessions are keyed by the service account AND the asserted email,
+// so one terminal token cannot multiply its budget by naming other members.
+func (s *session) limitKey() string {
+	if s.authKind == authSA {
+		return "sa:" + s.saName + "|" + s.subject
+	}
+	return s.subject
+}
 
 // subjectLabel is the log form of the subject.
 func (s *session) subjectLabel() string {
@@ -78,15 +99,66 @@ func (s *session) expiry() time.Time {
 
 var errConnsClosed = errors.New("session closed")
 
-// addConn registers a spliced connection; max > 0 caps the concurrent count.
-func (s *session) addConn(sc *spliceConn, max int) error {
+// acceptToken records the Keycloak token of a renewal and reports whether it is
+// fresh: issued later than the previously accepted one, or in the same second
+// with a different id. Replaying the accepted token (or an older one) fails.
+func (s *session) acceptToken(id string, iat time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fresh := iat.After(s.lastTokenIAT) || (iat.Equal(s.lastTokenIAT) && id != "" && id != s.lastTokenID)
+	if fresh {
+		s.lastTokenID, s.lastTokenIAT = id, iat
+	}
+	return fresh
+}
+
+// reserveConn takes one of the max connection slots before the (slow) dial to
+// the device, so a flood of connection attempts cannot exceed the cap while
+// they are in flight. Release it with commitConn or unreserveConn.
+func (s *session) reserveConn(max int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.connsClosed {
 		return errConnsClosed
 	}
-	if max > 0 && len(s.conns) >= max {
-		return fmt.Errorf("session has %d connections", len(s.conns))
+	if max > 0 && len(s.conns)+s.reserved >= max {
+		return fmt.Errorf("session has %d connections", len(s.conns)+s.reserved)
+	}
+	s.reserved++
+	return nil
+}
+
+func (s *session) unreserveConn() {
+	s.mu.Lock()
+	if s.reserved > 0 {
+		s.reserved--
+	}
+	s.mu.Unlock()
+}
+
+// commitConn turns a reservation into a registered connection.
+func (s *session) commitConn(sc *spliceConn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reserved > 0 {
+		s.reserved--
+	}
+	if s.connsClosed {
+		return errConnsClosed
+	}
+	if s.conns == nil {
+		s.conns = map[*spliceConn]struct{}{}
+	}
+	s.conns[sc] = struct{}{}
+	return nil
+}
+
+// addConn registers a spliced connection without a reservation (device side).
+func (s *session) addConn(sc *spliceConn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connsClosed {
+		return errConnsClosed
 	}
 	if s.conns == nil {
 		s.conns = map[*spliceConn]struct{}{}

@@ -16,6 +16,13 @@ import (
 	"github.com/teknoir/wg-tunnel/pkg/api"
 )
 
+// Labels device-controller puts on the delegating service accounts of the WG
+// web terminals (in addition to the api.SAAnnotation* annotations).
+const (
+	SAManagedByLabel = "app.kubernetes.io/managed-by"
+	SAManagedByValue = "device-controller"
+)
+
 // K8sSADelegation implements SADelegation with TokenReview and a ServiceAccount
 // lookup in the hub namespace.
 type K8sSADelegation struct {
@@ -47,7 +54,10 @@ func (d *K8sSADelegation) Verify(ctx context.Context, token, ns, device, onBehal
 	if !tr.Status.Authenticated {
 		return SAIdentity{}, fmt.Errorf("%w: token not authenticated", ErrUnauthenticated)
 	}
-	if len(tr.Status.Audiences) > 0 && !slices.Contains(tr.Status.Audiences, api.SATokenAudience) {
+	// The API contract: an empty audience list means "valid for the API
+	// server's own audience", which is exactly what an ordinary pod token
+	// (automounted) is. Require the delegation audience explicitly.
+	if !slices.Contains(tr.Status.Audiences, api.SATokenAudience) {
 		return SAIdentity{}, fmt.Errorf("%w: wrong audience", ErrUnauthenticated)
 	}
 	prefix := "system:serviceaccount:" + d.ns + ":"
@@ -61,6 +71,11 @@ func (d *K8sSADelegation) Verify(ctx context.Context, token, ns, device, onBehal
 	}
 	if err != nil {
 		return SAIdentity{}, fmt.Errorf("%w: service account lookup: %v", ErrUnavailable, err)
+	}
+	// Only service accounts that device-controller created count; annotations
+	// alone are not enough.
+	if sa.Labels[SAManagedByLabel] != SAManagedByValue {
+		return SAIdentity{}, fmt.Errorf("%w: service account is not managed by device-controller", ErrForbidden)
 	}
 	if sa.Annotations[api.SAAnnotationNamespace] != ns || sa.Annotations[api.SAAnnotationDevice] != device ||
 		ns == "" || device == "" {

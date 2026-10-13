@@ -313,6 +313,9 @@ func TestIntegrationRenewWithMismatchedCredential(t *testing.T) {
 	hc := client.httpClient()
 	renew := func(tok string) (int, []byte) {
 		w.addSecret(tok)
+		if tok == aliceToken {
+			w.users.set(aliceToken, aliceEmail, w.clock.Now().Add(5*time.Minute)) // a refreshed token
+		}
 		req, _ := http.NewRequest(http.MethodPost, "http://"+api.HubAddress+"/v1/renew", strings.NewReader("{}"))
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)

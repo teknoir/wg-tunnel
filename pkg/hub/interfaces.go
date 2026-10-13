@@ -34,12 +34,14 @@ type PolicySource interface {
 	HasSynced() bool
 }
 
-// DeviceFlags serves the operator switches on the Device objects (metadata
-// only: annotations).
+// DeviceFlags serves the operator switches (wireguard, compromised, health)
+// that the flags watcher mirrors from the Device annotations into the flags
+// store. The hub never reads Device objects itself.
 type DeviceFlags interface {
-	// Annotations returns the relevant annotations of the Device and whether
-	// the Device exists.
-	Annotations(ns, device string) (map[string]string, bool)
+	// Flags returns the mirrored switches of a device. ok is false when the
+	// flags store has no entry; the hub then treats the device as NOT enabled
+	// (fail closed), exactly like an entry with Exists == false.
+	Flags(ns, device string) (e api.FlagsEntry, ok bool)
 	// Subscribe registers fn, called after a relevant change; fn must not block.
 	Subscribe(fn func(ns, device string))
 	HasSynced() bool
@@ -49,13 +51,18 @@ type DeviceFlags interface {
 type IdentityStore interface {
 	// Get returns the pin of a device, if any.
 	Get(ctx context.Context, ns, device string) (api.IdentityEntry, bool, error)
-	// Pin stores entry unless a pin for the same or a newer enrollment
-	// generation exists. It returns the entry that is in effect afterwards
-	// and whether entry was written (created == true). A pin with a lower
-	// generation is void and is replaced.
+	// Pin stores entry unless a pin for the SAME enrollment epoch and
+	// generation exists (first wins per epoch, voided or not). It returns the
+	// entry that is in effect afterwards and whether entry was written
+	// (created == true). A pin of any other epoch or generation is void and is
+	// replaced.
 	Pin(ctx context.Context, entry api.IdentityEntry) (current api.IdentityEntry, created bool, err error)
 	// RecordConflict counts a rejected enrollment with a different key.
 	RecordConflict(ctx context.Context, ns, device string, at time.Time) error
+	// Void marks the pin of a device void for good (sticky revocation): it is
+	// never accepted again, whatever the policy says. It is a no-op (false)
+	// when nothing is pinned or the pin is already void.
+	Void(ctx context.Context, ns, device, reason string, at time.Time) (changed bool, err error)
 }
 
 // UserIdentity is an authenticated end user.
@@ -64,6 +71,10 @@ type UserIdentity struct {
 	Email string
 	// ExpiresAt is the token expiry.
 	ExpiresAt time.Time
+	// TokenID (jti) and IssuedAt (iat) identify the token; renewals must
+	// present a different, not older token than the previously accepted one.
+	TokenID  string
+	IssuedAt time.Time
 }
 
 // UserAuthenticator verifies Keycloak access tokens.

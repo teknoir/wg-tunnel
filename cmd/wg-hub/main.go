@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
@@ -31,8 +30,20 @@ func main() {
 			return
 		case "help", "--help", "-h":
 			fmt.Println("wg-hub: WireGuard ZTNA session broker and gateway (" + version.Version + ").\n" +
-				"It takes no arguments; configuration is by environment (POD_IP, DOMAIN, TURN_URLS, KEYCLOAK_ISSUER, ...).\n" +
-				"Usage: wg-hub [version|--help]")
+				"Without arguments it runs the hub; configuration is by environment (POD_IP, DOMAIN, TURN_URLS, KEYCLOAK_ISSUER, ...).\n" +
+				"'wg-hub flags-watcher' runs the Device flags mirror (HUB_NAMESPACE, LOG_LEVEL, METRICS_ADDR); it is the only\n" +
+				"component that reads Devices.\n" +
+				"Usage: wg-hub [flags-watcher|version|--help]")
+			return
+		case "flags-watcher":
+			if len(os.Args) > 2 {
+				fmt.Fprintf(os.Stderr, "wg-hub flags-watcher: unexpected argument %q\n", os.Args[2])
+				os.Exit(2)
+			}
+			if err := runFlagsWatcher(); err != nil {
+				slog.New(slog.NewJSONHandler(os.Stderr, nil)).Error("wg-hub flags-watcher failed", "err", err)
+				os.Exit(1)
+			}
 			return
 		}
 		fmt.Fprintf(os.Stderr, "wg-hub: unexpected argument %q (try --help)\n", os.Args[1])
@@ -97,10 +108,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	mc, err := metadata.NewForConfig(restCfg)
-	if err != nil {
-		return err
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -109,7 +116,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	flags, err := hub.NewK8sDeviceFlags(mc)
+	flags, err := hub.NewK8sFlagsSource(cs, hubNS, log)
 	if err != nil {
 		return err
 	}
@@ -150,11 +157,16 @@ func run() error {
 	defer func() { _ = h.Close() }()
 	log.Info("wg-hub starting", "version", version.Version, "namespace", hubNS, "wgPort", h.WGPort(), "endpoint", h.Endpoint())
 
+	// The outside API (users and devices through the ingress gateways) and the
+	// internal API (service-account delegation and direct sessions from pods
+	// in the hub namespace; no VirtualService routes to it).
 	httpSrv := hub.NewHTTPServer(env("HTTP_ADDR", fmt.Sprintf(":%d", api.HubHTTPPort)), h.Handler())
+	internalSrv := hub.NewHTTPServer(env("INTERNAL_HTTP_ADDR", fmt.Sprintf(":%d", api.HubInternalPort)), h.InternalHandler())
 	metricsSrv := hub.NewHTTPServer(env("METRICS_ADDR", ":9090"), metricsMux(h))
 
-	errc := make(chan error, 3)
+	errc := make(chan error, 4)
 	go func() { errc <- httpSrv.ListenAndServe() }()
+	go func() { errc <- internalSrv.ListenAndServe() }()
 	go func() { errc <- metricsSrv.ListenAndServe() }()
 	go func() { errc <- h.ServeTunnel(ctx) }()
 
@@ -165,11 +177,11 @@ func run() error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server stopped", "err", err)
 			stop()
-			shutdown(httpSrv, metricsSrv)
+			shutdown(httpSrv, internalSrv, metricsSrv)
 			return err
 		}
 	}
-	shutdown(httpSrv, metricsSrv)
+	shutdown(httpSrv, internalSrv, metricsSrv)
 	return nil
 }
 

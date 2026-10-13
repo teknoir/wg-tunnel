@@ -155,6 +155,12 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		if u.Email != s.subject {
 			return 0, nil, deny(api.ReasonUnauthenticated, "credential does not belong to this session")
 		}
+		// A renewal needs a freshly issued token, not the one that was already
+		// accepted: otherwise a disabled user would keep the tunnel until the
+		// old access token expires.
+		if !s.acceptToken(u.TokenID, u.IssuedAt) {
+			return 0, nil, deny(api.ReasonUnauthenticated, "renewal needs a freshly issued access token")
+		}
 		tokenExp = u.ExpiresAt
 	case authSA:
 		if h.deps.SA == nil {
@@ -188,8 +194,8 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		if !portAllowed(eff.Policy.AllowedPorts, s.targetPort) {
 			return 0, nil, deny(api.ReasonPortNotAllowed, "port is no longer allowed")
 		}
-	} else if eff.Policy.EnrollmentGeneration > s.generation {
-		return 0, nil, deny(api.ReasonReenroll, "enrollment was reset")
+	} else if reason, detail := deviceStale(s, eff.Policy); reason != "" {
+		return 0, nil, deny(staleDenialReason(reason), detail)
 	}
 
 	// 3. Extend, capped by max age and the user's token.
@@ -227,13 +233,20 @@ func (h *Hub) reauthDevice(ctx context.Context, tok string, s *session, now time
 	if !ok {
 		return deny(api.ReasonDeviceUnknown, "no policy for device")
 	}
-	pub, _, den := h.pinnedKey(ctx, s.ns, s.device, pol)
+	pin, pub, den := h.loadPin(ctx, s.ns, s.device)
 	if den != nil {
 		return den
 	}
 	claims, err := identity.VerifyIdentityJWT(tok, pub, s.subject, now)
 	if err != nil {
 		return deny(api.ReasonUnauthenticated, "invalid identity token")
+	}
+	// A revoked device hears device_revoked, not a statement about its pin.
+	if eff := computeEffective(h.deps.Policy, h.deps.Flags, s.ns, s.device); !eff.Active {
+		return deny(eff.Reason, eff.Detail)
+	}
+	if den := checkPin(pin, pub, pol); den != nil {
+		return den
 	}
 	if k, err := wgkey.ParsePublic(claims.WGKey); err != nil || k != s.wgKey {
 		return deny(api.ReasonUnauthenticated, "token is not bound to this session's WireGuard key")

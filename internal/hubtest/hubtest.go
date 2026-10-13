@@ -62,34 +62,60 @@ func (p *Policy) Set(e api.PolicyEntry) {
 	p.notify(e.Namespace, e.Device)
 }
 
-// Flags is a hub.DeviceFlags.
+// Update applies fn to the stored entry of a device and notifies the hub.
+func (p *Policy) Update(ns, device string, fn func(*api.PolicyEntry)) {
+	p.mu.Lock()
+	e := p.m[key{ns, device}]
+	fn(&e)
+	p.m[key{ns, device}] = e
+	p.mu.Unlock()
+	p.notify(ns, device)
+}
+
+// Approve records the admin-approved identity fingerprint in the policy, the
+// way device-controller copies the approved-identity annotation.
+func (p *Policy) Approve(ns, device, fingerprint string) {
+	p.Update(ns, device, func(e *api.PolicyEntry) { e.ApprovedFingerprint = fingerprint })
+}
+
+// Flags is a hub.DeviceFlags (the flags store the flags watcher fills).
 type Flags struct {
 	subscribers
 	mu sync.Mutex
-	m  map[key]map[string]string
+	m  map[key]api.FlagsEntry
 }
 
 var _ hub.DeviceFlags = (*Flags)(nil)
 
-func NewFlags() *Flags { return &Flags{m: map[key]map[string]string{}} }
+func NewFlags() *Flags { return &Flags{m: map[key]api.FlagsEntry{}} }
 
-func (f *Flags) Annotations(ns, device string) (map[string]string, bool) {
+func (f *Flags) Flags(ns, device string) (api.FlagsEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a, ok := f.m[key{ns, device}]
-	out := make(map[string]string, len(a))
-	for k, v := range a {
-		out[k] = v
-	}
-	return out, ok
+	e, ok := f.m[key{ns, device}]
+	return e, ok
 }
 func (f *Flags) Subscribe(fn func(ns, device string)) { f.add(fn) }
 func (f *Flags) HasSynced() bool                      { return true }
 
-// Set replaces the annotations of a device (creating it) and notifies the hub.
+// Set replaces the flags of a device (creating it) from Device annotations,
+// the way the flags watcher mirrors them, and notifies the hub.
 func (f *Flags) Set(ns, device string, ann map[string]string) {
 	f.mu.Lock()
-	f.m[key{ns, device}] = ann
+	f.m[key{ns, device}] = api.FlagsEntry{
+		Device: device, Namespace: ns, Exists: true,
+		WireGuard:         ann[api.AnnotationWireGuard] == "enabled",
+		Compromised:       api.FlagSet(ann[api.AnnotationCompromised]),
+		HealthCheckFailed: api.FlagSet(ann[api.AnnotationHealthCheckFailed]),
+	}
+	f.mu.Unlock()
+	f.notify(ns, device)
+}
+
+// Delete removes the entry (the Device is gone) and notifies the hub.
+func (f *Flags) Delete(ns, device string) {
+	f.mu.Lock()
+	delete(f.m, key{ns, device})
 	f.mu.Unlock()
 	f.notify(ns, device)
 }
@@ -116,11 +142,24 @@ func (s *Identity) Pin(_ context.Context, e api.IdentityEntry) (api.IdentityEntr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := key{e.Namespace, e.Device}
-	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration >= e.EnrollmentGeneration {
+	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration == e.EnrollmentGeneration && cur.EnrollmentEpoch == e.EnrollmentEpoch {
 		return cur, false, nil
 	}
 	s.m[k] = e
 	return e, true, nil
+}
+
+func (s *Identity) Void(_ context.Context, ns, device, reason string, at time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key{ns, device}
+	cur, ok := s.m[k]
+	if !ok || cur.Voided {
+		return false, nil
+	}
+	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
+	s.m[k] = cur
+	return true, nil
 }
 
 func (s *Identity) RecordConflict(_ context.Context, ns, device string, at time.Time) error {

@@ -18,6 +18,8 @@ type dctx struct {
 	subject string
 	session string
 	remote  string
+	// internal is true for requests served on api.HubInternalPort.
+	internal bool
 }
 
 // log writes the single decision line of a request and counts it.
@@ -44,15 +46,18 @@ func (h *Hub) logDecision(d *dctx, decision, reason, detail string) {
 	h.log.LogAttrs(context.Background(), lvl, "decision", attrs...)
 }
 
-// clientIP returns the address used for per-source rate limits and logs.
-func (h *Hub) clientIP(r *http.Request) string {
+// clientIP returns the address used for logs and per-source rate limits.
+// trusted is true only when the configured ClientIPHeader carried a parseable
+// address; otherwise the peer address is returned (for logs only), because
+// behind a mesh sidecar or a load balancer it is the same for every caller.
+func (h *Hub) clientIP(r *http.Request) (ip string, trusted bool) {
 	if hdr := h.cfg.ClientIPHeader; hdr != "" {
 		first, _, _ := strings.Cut(r.Header.Get(hdr), ",")
 		if a, err := netip.ParseAddr(strings.TrimSpace(first)); err == nil {
-			return a.Unmap().String()
+			return a.Unmap().String(), true
 		}
 	}
-	return remoteIP(r.RemoteAddr)
+	return remoteIP(r.RemoteAddr), false
 }
 
 func remoteIP(remote string) string {

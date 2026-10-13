@@ -28,7 +28,10 @@ type Config struct {
 	// Endpoint overrides the advertised "ip:port" (default PodIP:<listen port>).
 	Endpoint string
 	// ClientIPHeader names a header with the real client address set by a
-	// trusted proxy (e.g. X-Envoy-External-Address). Empty: use the peer address.
+	// trusted proxy (e.g. X-Envoy-External-Address). Per-source rate limits
+	// apply only to requests that carry a parseable address in it: behind a
+	// service mesh or a load balancer that hides client addresses the peer
+	// address is the same for everyone and must not be used as a limiter key.
 	ClientIPHeader string
 
 	SessionTTL     time.Duration // default 3m
@@ -47,15 +50,21 @@ type Config struct {
 	MaxSessions         int // default 5000
 	MaxPerNamespace     int // default 200
 	MaxPerSubjectDevice int // default 5
+	MaxPerSubject       int // client sessions of one user across all devices (default 20)
 	MaxConnsPerSession  int // default 16
 	ReplayCacheSize     int // default 10000
+	ReplayPerSubject    int // replay entries per subject (default 128)
 
 	// Rate limits: tokens per second and burst, per source IP and per subject,
 	// applied to enroll and session-create requests before any allocation.
-	IPRate       float64 // default 5
+	IPRate       float64 // default 5; only for requests with a trusted client address
 	IPBurst      int     // default 40
 	SubjectRate  float64 // default 0.5
 	SubjectBurst int     // default 10
+	// GlobalRate/GlobalBurst are the generous per-endpoint backstop shared by
+	// all callers (default 50 rps, burst 200).
+	GlobalRate  float64
+	GlobalBurst int
 
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -87,6 +96,9 @@ func (c *Config) applyDefaults() {
 	num(&c.MaxSessions, 5000)
 	num(&c.MaxPerNamespace, 200)
 	num(&c.MaxPerSubjectDevice, 5)
+	num(&c.MaxPerSubject, 20)
+	num(&c.ReplayPerSubject, 128)
+	num(&c.GlobalBurst, 200)
 	num(&c.MaxConnsPerSession, 16)
 	num(&c.ReplayCacheSize, 10000)
 	num(&c.IPBurst, 40)
@@ -96,6 +108,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SubjectRate <= 0 {
 		c.SubjectRate = 0.5
+	}
+	if c.GlobalRate <= 0 {
+		c.GlobalRate = 50
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -117,10 +132,11 @@ type Hub struct {
 	ipam    *ipam
 	met     *metrics
 
-	ipLimit    *limiter
-	subjLimit  *limiter
-	renewLimit *limiter
-	replay     *replayCache
+	ipLimit     *limiter
+	globalLimit *limiter
+	subjLimit   *limiter
+	renewLimit  *limiter
+	replay      *replayCache
 
 	// mu guards the session registry below.
 	mu      sync.Mutex
@@ -129,8 +145,10 @@ type Hub struct {
 	byWG    map[[32]byte]*session
 	devices map[devKey]*session
 	clients map[devKey]map[string]*session
-	perNS   map[string]int
-	perSubj map[string]int
+	perNS   map[string]int // client sessions per teamspace
+	perSubj map[string]int // client sessions per (user, device)
+	// perSubjAll counts client sessions per user across all devices.
+	perSubjAll map[string]int
 
 	pendMu  sync.Mutex
 	pending map[devKey]struct{}
@@ -171,20 +189,22 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 	h := &Hub{
 		cfg: cfg, deps: deps, log: log, now: cfg.Now,
 		tunnel: tun, hubAddr: hubAddr, ipam: pool, met: newMetrics(),
-		ipLimit:    newLimiter(cfg.IPRate, cfg.IPBurst, 50000, cfg.Now),
-		subjLimit:  newLimiter(cfg.SubjectRate, cfg.SubjectBurst, 50000, cfg.Now),
-		renewLimit: newLimiter(0.5, 5, 50000, cfg.Now),
-		replay:     newReplayCache(cfg.ReplayCacheSize, cfg.Now),
-		byID:       map[string]*session{},
-		byIP:       map[netip.Addr]*session{},
-		byWG:       map[[32]byte]*session{},
-		devices:    map[devKey]*session{},
-		clients:    map[devKey]map[string]*session{},
-		perNS:      map[string]int{},
-		perSubj:    map[string]int{},
-		pending:    map[devKey]struct{}{},
-		wake:       make(chan struct{}, 1),
-		ctx:        ctx, cancel: cancel,
+		ipLimit:     newLimiter(cfg.IPRate, cfg.IPBurst, 50000, cfg.Now),
+		globalLimit: newLimiter(cfg.GlobalRate, cfg.GlobalBurst, 64, cfg.Now),
+		subjLimit:   newLimiter(cfg.SubjectRate, cfg.SubjectBurst, 50000, cfg.Now),
+		renewLimit:  newLimiter(0.5, 5, 50000, cfg.Now),
+		replay:      newReplayCache(cfg.ReplayCacheSize, cfg.ReplayPerSubject, cfg.Now),
+		byID:        map[string]*session{},
+		byIP:        map[netip.Addr]*session{},
+		byWG:        map[[32]byte]*session{},
+		devices:     map[devKey]*session{},
+		clients:     map[devKey]map[string]*session{},
+		perNS:       map[string]int{},
+		perSubj:     map[string]int{},
+		perSubjAll:  map[string]int{},
+		pending:     map[devKey]struct{}{},
+		wake:        make(chan struct{}, 1),
+		ctx:         ctx, cancel: cancel,
 	}
 	deps.Policy.Subscribe(h.notify)
 	deps.Flags.Subscribe(h.notify)
@@ -279,6 +299,11 @@ func (h *Hub) enforcer() {
 // whatever is no longer allowed.
 func (h *Hub) enforce(k devKey) {
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, k.ns, k.device)
+	if eff.VoidReason != "" {
+		// Sticky revocation: whatever device-controller does or does not see, a
+		// device that was ever flagged needs a NEW identity afterwards.
+		h.voidPin(k, eff.VoidReason)
+	}
 
 	h.mu.Lock()
 	dev := h.devices[k]
@@ -319,12 +344,23 @@ func (h *Hub) enforce(k devKey) {
 		return
 	}
 
-	// Still active: an identity pinned for an older generation is void, and a
-	// narrowed port list ends the sessions that used a removed port.
-	if dev != nil && eff.Policy.EnrollmentGeneration > dev.generation {
-		if h.endSession(dev, api.ReasonReenroll) {
-			h.met.revocations.WithLabelValues(api.ReasonReenroll).Inc()
-			h.logRevoke(k, api.ReasonReenroll, "enrollment reset", dev.id)
+	// Still active: the device session must belong to the current enrollment
+	// (epoch and generation), to the identity an admin approved, and must
+	// expose the ports the policy allows now; a narrowed port list ends the
+	// client sessions that used a removed port.
+	if dev != nil {
+		reason, detail := "", ""
+		switch {
+		case eff.Policy.EnrollmentGeneration != dev.generation || eff.Policy.EnrollmentEpoch != dev.epoch:
+			reason, detail = api.ReasonReenroll, "enrollment reset"
+		case eff.Policy.ApprovedFingerprint != dev.fingerprint:
+			reason, detail = api.ReasonPendingApproval, "identity approval changed"
+		case !samePorts(eff.Policy.AllowedPorts, dev.ports):
+			reason, detail = reasonPortsChanged, "allowed ports changed"
+		}
+		if reason != "" && h.endSession(dev, reason) {
+			h.met.revocations.WithLabelValues(reason).Inc()
+			h.logRevoke(k, reason, detail, dev.id)
 		}
 	}
 	for _, c := range clients {
@@ -334,6 +370,33 @@ func (h *Hub) enforce(k devKey) {
 				h.logRevoke(k, api.ReasonPortNotAllowed, "port removed from policy", c.id)
 			}
 		}
+	}
+}
+
+// reasonPortsChanged ends a device session whose allowed-port set changed, so
+// that the agent reconnects and exposes the new set (log and metric label only;
+// not a wire reason).
+const reasonPortsChanged = "ports_changed"
+
+// voidPin marks the device's identity pin void. A failure is retried until it
+// works (or the hub stops): the pin must never outlive a flag.
+func (h *Hub) voidPin(k devKey, reason string) {
+	ctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+	defer cancel()
+	changed, err := h.deps.Identity.Void(ctx, k.ns, k.device, reason, h.now())
+	if err != nil {
+		h.log.Error("voiding the identity pin failed; retrying", "ns", k.ns, "device", k.device, "err", err)
+		time.AfterFunc(2*time.Second, func() {
+			if h.ctx.Err() == nil {
+				h.notify(k.ns, k.device)
+			}
+		})
+		return
+	}
+	if changed {
+		h.met.revocations.WithLabelValues("identity_voided").Inc()
+		h.log.LogAttrs(context.Background(), slog.LevelWarn, "identity pin voided",
+			slog.String("ns", k.ns), slog.String("device", k.device), slog.String("reason", reason))
 	}
 }
 

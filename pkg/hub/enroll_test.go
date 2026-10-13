@@ -106,8 +106,12 @@ func TestEnrollReenrollGeneration(t *testing.T) {
 	if got.EnrollmentGeneration != 2 || got.IdentityPublicKey != r.dev.idPubB64 {
 		t.Fatalf("pin %+v", got)
 	}
-	// And the new identity can now create a session.
+	// The new identity is pinned but needs the admin's approval first.
 	stok, sreq2, _ := r.dev.sessionRequest(t, r.clock.Now())
+	st, body = r.post(api.DeviceSessionPath, stok, sreq2)
+	wantReason(t, st, body, http.StatusForbidden, api.ReasonPendingApproval)
+	r.approve()
+	stok, sreq2, _ = r.dev.sessionRequest(t, r.clock.Now())
 	if st, body = r.post(api.DeviceSessionPath, stok, sreq2); st != http.StatusCreated {
 		t.Fatalf("session after re-enrol: %d %s", st, body)
 	}
@@ -124,7 +128,6 @@ func TestEnrollRequiresActiveDevice(t *testing.T) {
 		}, api.ReasonDeviceRevoked},
 		{"wireguard disabled", func(r *rig) { r.flags.Set(testNS, testDevice, map[string]string{}) }, api.ReasonDeviceDisabled},
 		{"policy revoked", func(r *rig) { p := r.policy; p.State = api.StateRevoked; r.setPolicy(p) }, api.ReasonDeviceRevoked},
-		{"no policy", func(r *rig) { r.pol.Delete(testNS, testDevice) }, api.ReasonDeviceUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,6 +138,15 @@ func TestEnrollRequiresActiveDevice(t *testing.T) {
 			wantReason(t, st, body, http.StatusForbidden, tc.reason)
 		})
 	}
+	// A device without a policy cannot even be told that: the hub cannot verify
+	// the token, so a stranger learns nothing about which devices exist.
+	t.Run("no policy", func(t *testing.T) {
+		r := newRig(t)
+		r.pol.Delete(testNS, testDevice)
+		tok, req := r.dev.enrollRequest(t, r.clock.Now())
+		st, body := r.enroll(tok, req)
+		wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
+	})
 }
 
 func TestEnrollRejectsBadCredentials(t *testing.T) {
@@ -177,8 +189,8 @@ func TestEnrollRejectsBadCredentials(t *testing.T) {
 		_ = jti
 		_, req := good()
 		st, body := r.enroll(tok, req)
-		// cam-2 has no policy.
-		wantReason(t, st, body, http.StatusForbidden, api.ReasonDeviceUnknown)
+		// cam-2 has no policy: indistinguishable from any other bad token.
+		wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
 	})
 	t.Run("malformed subject", func(t *testing.T) {
 		tok, _, _ := identity.MintEnrollJWTAt(r.dev.rsaPEM, "no-slash", r.dev.idPubB64, 30*time.Second, now)

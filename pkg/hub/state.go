@@ -1,7 +1,7 @@
 package hub
 
 import (
-	"strings"
+	"slices"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 )
@@ -16,30 +16,34 @@ type effective struct {
 	Reason string
 	// Detail is a short log-safe explanation.
 	Detail string
+	// VoidReason is set (api.RevokeCompromised or api.RevokeHealthCheckFailed)
+	// when a compromised or health-check flag is in force; the enforcer then
+	// voids the device's identity pin for good.
+	VoidReason string
 	// Policy is the policy entry (zero value when none exists).
 	Policy api.PolicyEntry
 }
 
-func flagTrue(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "true") }
-
 // computeEffective combines the policy entry (device-controller) with the
-// Device annotations (operator switches, watched directly) and fails closed:
-// a device is active only if the policy entry exists and is active, the
-// Device exists, WireGuard is enabled and neither the compromised nor the
-// health-check-failed flag is set. Either source revoking wins.
+// mirrored Device flags (operator switches, written by the flags watcher) and
+// fails closed: a device is active only if the policy entry exists and is
+// active, the flags entry exists and says the Device exists, WireGuard is
+// enabled and neither the compromised nor the health-check-failed flag is
+// set. Either source revoking wins. A missing flags entry means "not enabled".
 func computeEffective(pol PolicySource, flags DeviceFlags, ns, device string) effective {
 	entry, havePolicy := pol.Get(ns, device)
-	ann, exists := flags.Annotations(ns, device)
+	fl, haveFlags := flags.Flags(ns, device)
+	exists := haveFlags && fl.Exists
 
-	revoked := func(detail string) effective {
-		return effective{State: api.StateRevoked, Reason: api.ReasonDeviceRevoked, Detail: detail, Policy: entry}
+	revoked := func(detail, void string) effective {
+		return effective{State: api.StateRevoked, Reason: api.ReasonDeviceRevoked, Detail: detail, VoidReason: void, Policy: entry}
 	}
 	if exists {
 		switch {
-		case flagTrue(ann[api.AnnotationCompromised]):
-			return revoked(api.RevokeCompromised)
-		case flagTrue(ann[api.AnnotationHealthCheckFailed]):
-			return revoked(api.RevokeHealthCheckFailed)
+		case fl.Compromised:
+			return revoked(api.RevokeCompromised, api.RevokeCompromised)
+		case fl.HealthCheckFailed:
+			return revoked(api.RevokeHealthCheckFailed, api.RevokeHealthCheckFailed)
 		}
 	}
 	if !havePolicy {
@@ -47,7 +51,14 @@ func computeEffective(pol PolicySource, flags DeviceFlags, ns, device string) ef
 	}
 	switch entry.State {
 	case api.StateRevoked:
-		return revoked("policy revoked")
+		void := ""
+		switch {
+		case slices.Contains(entry.Reasons, api.RevokeCompromised):
+			void = api.RevokeCompromised
+		case slices.Contains(entry.Reasons, api.RevokeHealthCheckFailed):
+			void = api.RevokeHealthCheckFailed
+		}
+		return revoked("policy revoked", void)
 	case api.StateActive:
 	default:
 		return effective{State: api.StateDisabled, Reason: api.ReasonDeviceDisabled, Detail: "policy " + entry.State, Policy: entry}
@@ -55,17 +66,42 @@ func computeEffective(pol PolicySource, flags DeviceFlags, ns, device string) ef
 	if !exists {
 		return effective{State: api.StateDisabled, Reason: api.ReasonDeviceUnknown, Detail: "device does not exist", Policy: entry}
 	}
-	if ann[api.AnnotationWireGuard] != "enabled" {
+	if !fl.WireGuard {
 		return effective{State: api.StateDisabled, Reason: api.ReasonDeviceDisabled, Detail: "wireguard not enabled", Policy: entry}
 	}
 	return effective{Active: true, State: api.StateActive, Policy: entry}
 }
 
 func portAllowed(ports []int, p int) bool {
-	for _, a := range ports {
-		if a == p {
-			return true
+	return slices.Contains(ports, p)
+}
+
+// validPorts keeps the TCP ports in 1..65535, deduplicated and sorted.
+func validPorts(ports []int) []int {
+	out := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p >= 1 && p <= 65535 && !slices.Contains(out, p) {
+			out = append(out, p)
 		}
 	}
-	return false
+	slices.Sort(out)
+	return out
+}
+
+// samePorts compares two port sets regardless of order.
+func samePorts(a, b []int) bool {
+	return slices.Equal(validPorts(a), validPorts(b))
+}
+
+// pinCurrent reports whether pin is valid for pol: same enrollment epoch AND
+// generation, and not voided. Anything else is a void pin and the agent must
+// enroll a NEW identity.
+func pinCurrent(pin api.IdentityEntry, pol api.PolicyEntry) bool {
+	return !pin.Voided && pin.EnrollmentGeneration == pol.EnrollmentGeneration && pin.EnrollmentEpoch == pol.EnrollmentEpoch
+}
+
+// sameEpoch reports whether pin belongs to the policy's current enrollment
+// window (epoch and generation), voided or not.
+func sameEpoch(pin api.IdentityEntry, pol api.PolicyEntry) bool {
+	return pin.EnrollmentGeneration == pol.EnrollmentGeneration && pin.EnrollmentEpoch == pol.EnrollmentEpoch
 }

@@ -162,6 +162,7 @@ func TestClearedDeviceReenrollsAndWorksAgain(t *testing.T) {
 	// flag is still set the device stays out.
 	p, _ := r.Policy.Get(e2erig.NS, e2erig.DeviceName)
 	p.EnrollmentGeneration = 2
+	p.EnrollmentEpoch = e2erig.Epoch2
 	p.EnrollUntil = time.Now().Add(time.Hour)
 	r.Policy.Set(p)
 	e2erig.Eventually(t, 10*time.Second, "the agent to be refused while flagged", func() bool {

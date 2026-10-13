@@ -68,6 +68,7 @@ func TestRevocationReachesTheClientBeforeThePeerIsRemoved(t *testing.T) {
 		}},
 		{"renewal denied", func(w *wgRig, client *wgPeer, id string) {
 			w.authz.set(aliceEmail, testNS, false)
+			w.users.set(aliceToken, aliceEmail, w.clock.Now().Add(5*time.Minute)) // a refreshed token
 			w.h.renewLimit.Forget(id)
 			req, _ := http.NewRequest(http.MethodPost, "http://"+api.HubAddress+"/v1/renew", strings.NewReader("{}"))
 			req.Header.Set("Authorization", "Bearer "+aliceToken)
