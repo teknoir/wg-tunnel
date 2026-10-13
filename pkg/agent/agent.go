@@ -186,6 +186,7 @@ func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []
 		HandshakeTimeout:   a.cfg.HandshakeTimeout,
 		RenewRetry:         a.cfg.RenewRetry,
 		RenewTimeout:       a.cfg.RenewTimeout,
+		DeadAfter:          a.cfg.DeadAfter,
 	})
 }
 

@@ -398,3 +398,21 @@ func TestSlowRenewalWithLiveTunnelDoesNotEndSession(t *testing.T) {
 	case <-time.After(3 * time.Second):
 	}
 }
+
+func TestRelaySupervisorOutlivesCreateContext(t *testing.T) {
+	// Create's context bounds only Create; callers cancel it right after. The
+	// relay supervisor must keep running (with a short StaleAfter an idle
+	// tunnel re-allocates its relay again and again).
+	r := newRig(t, fakehub.Options{})
+	var n atomic.Int64
+	o := r.deviceOpts(deviceCred(&n))
+	o.StaleAfter = 400 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	s, err := wgclient.Create(ctx, o)
+	cancel() // as wg-connect does
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	eventually(t, 15*time.Second, "the relay to be re-allocated after Create's context ended", func() bool { return s.RelaySwaps() >= 3 })
+}

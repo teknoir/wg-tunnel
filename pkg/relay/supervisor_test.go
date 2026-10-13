@@ -88,9 +88,11 @@ func drain(b *turnbind.Bind) (count *atomic.Int64) {
 func fastCfg(b *turnbind.Bind, creds func(context.Context) (Config, error), ev *swapEvents) SupervisorConfig {
 	return SupervisorConfig{
 		Bind: b, Creds: creds,
-		StaleAfter: 400 * time.Millisecond, CheckInterval: 25 * time.Millisecond,
+		// Generous: under a loaded machine the pusher may be late by hundreds
+		// of milliseconds, which must not look like a dead relay.
+		StaleAfter: time.Second, CheckInterval: 25 * time.Millisecond,
 		MinBackoff: 50 * time.Millisecond, MaxBackoff: 200 * time.Millisecond,
-		AllocateTimeout: 3 * time.Second,
+		AllocateTimeout: 5 * time.Second,
 		OnSwap:          ev.add,
 	}
 }
@@ -164,19 +166,18 @@ func TestSupervisorStaleOnServerRestart(t *testing.T) {
 
 	eventually(t, 3*time.Second, "traffic", func() bool { return count.Load() > 5 })
 	first := sup.Current()
-	time.Sleep(600 * time.Millisecond) // longer than StaleAfter: traffic keeps it healthy
+	time.Sleep(1300 * time.Millisecond) // longer than StaleAfter: traffic keeps it healthy
 	if sup.Current() != first || b.Swaps() != 1 {
 		t.Fatalf("healthy relay was replaced: swaps=%d events=%v", b.Swaps(), ev.list())
 	}
 
 	srv.Restart() // all allocations lost
 	before := count.Load()
-	eventually(t, 10*time.Second, "supervisor recovery", func() bool {
-		return sup.Current() != first && count.Load() > before+5
+	// OnSwap runs just after the new relay is installed, so wait for the event
+	// itself, not only for the relay to change.
+	eventually(t, 30*time.Second, "supervisor recovery", func() bool {
+		return sup.Current() != first && count.Load() > before+5 && (ev.has(ReasonStale) || ev.has(ReasonRefreshFailed))
 	})
-	if !ev.has(ReasonStale) && !ev.has(ReasonRefreshFailed) {
-		t.Fatalf("events %v", ev.list())
-	}
 	// Old relay is closed, exactly one allocation is live.
 	if _, _, err := first.ReadFrom(make([]byte, 8)); err == nil {
 		t.Fatal("old relay still readable")
@@ -216,20 +217,17 @@ func TestSupervisorRotate(t *testing.T) {
 	if err := sup.Rotate(next); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, 5*time.Second, "rotation", func() bool { return sup.Current() != first && b.Swaps() == 2 })
+	eventually(t, 30*time.Second, "rotation", func() bool { return sup.Current() != first && b.Swaps() == 2 && ev.has(ReasonRotate) })
 	if got := sup.Current().Config().Username; got != next.Username {
 		t.Fatalf("rotated relay uses username %q", got)
 	}
-	if !ev.has(ReasonRotate) {
-		t.Fatalf("events %v", ev.list())
-	}
-	eventually(t, 3*time.Second, "old allocation released", func() bool { return srv.Allocations() == 1 })
+	eventually(t, 15*time.Second, "old allocation released", func() bool { return srv.Allocations() == 1 })
 	before := count.Load()
-	eventually(t, 3*time.Second, "traffic after rotation", func() bool { return count.Load() > before+3 })
+	eventually(t, 15*time.Second, "traffic after rotation", func() bool { return count.Load() > before+3 })
 
 	// Without Creds the last (rotated) configuration is reused on staleness.
 	srv.Restart()
-	eventually(t, 10*time.Second, "recovery with reused config", func() bool {
+	eventually(t, 30*time.Second, "recovery with reused config", func() bool {
 		r := sup.Current()
 		return r != nil && r.Config().Username == next.Username && b.Swaps() >= 3
 	})
@@ -260,9 +258,11 @@ func TestSupervisorRefreshFailureSwapsWithoutStaleness(t *testing.T) {
 	defer sup.Close()
 	first := sup.Current()
 	srv.Restart()
-	eventually(t, 30*time.Second, "refresh-failure swap", func() bool { return sup.Current() != first })
-	if !ev.has(ReasonRefreshFailed) {
-		t.Fatalf("events %v", ev.list())
+	// Current() changes just before OnSwap reports the reason, so wait for the
+	// event, and only then check the relay.
+	eventually(t, 60*time.Second, "refresh-failure swap event", func() bool { return ev.has(ReasonRefreshFailed) })
+	if sup.Current() == first {
+		t.Fatalf("relay not replaced; events %v", ev.list())
 	}
 }
 

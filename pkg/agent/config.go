@@ -74,6 +74,7 @@ type Config struct {
 	HandshakeTimeout time.Duration
 	RenewRetry       time.Duration
 	RenewTimeout     time.Duration
+	DeadAfter        time.Duration
 }
 
 // ConfigFromEnv reads the environment of wg-agent run:

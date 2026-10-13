@@ -396,6 +396,9 @@ func (h *Hub) logEnd(s *session, op, reason string) {
 		slog.String("subject", s.subjectLabel()), slog.String("session", s.id), slog.String("remote", s.remote))
 }
 
+// SessionCounts returns the live sessions by kind (tests and diagnostics).
+func (h *Hub) SessionCounts() (devices, clients int) { return h.sessionCounts() }
+
 // sessionCounts returns the live sessions by kind (tests and diagnostics).
 func (h *Hub) sessionCounts() (devices, clients int) {
 	h.mu.Lock()

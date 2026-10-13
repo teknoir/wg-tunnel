@@ -113,7 +113,11 @@ func (s *Server) start(listen string) {
 	s.mu.Lock()
 	s.srv = srv
 	s.trk = trk
-	s.Addr = pc.LocalAddr().String()
+	if s.Addr == "" {
+		// Only on the first start: Addr is read without a lock by tests and
+		// stays the same across Restart.
+		s.Addr = pc.LocalAddr().String()
+	}
 	s.mu.Unlock()
 }
 

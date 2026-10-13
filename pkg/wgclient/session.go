@@ -260,7 +260,17 @@ func (s *Session) up(ctx context.Context, priv *wgkey.PrivateKey) error {
 			return err
 		}
 		s.sup = sup
-		if err := sup.Start(ctx); err != nil {
+		// ctx bounds only Create: the supervisor must outlive it (callers
+		// cancel the Create context as soon as Create returns), so it runs on
+		// the session's context, which ctx may cancel only while Start runs.
+		sctx, cancelStart := context.WithCancel(s.ctx)
+		stop := context.AfterFunc(ctx, cancelStart)
+		err = sup.Start(sctx)
+		if !stop() && err == nil {
+			err = ctx.Err() // ctx ended right after Start: the supervisor is cancelled
+		}
+		if err != nil {
+			cancelStart()
 			return fmt.Errorf("wgclient: TURN relay: %w", err)
 		}
 	}
