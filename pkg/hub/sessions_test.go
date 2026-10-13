@@ -68,7 +68,12 @@ func TestDeviceSessionRequiresEnrollment(t *testing.T) {
 	r := newRig(t)
 	tok, req, _ := r.dev.sessionRequest(t, r.clock.Now())
 	st, body := r.post(api.DeviceSessionPath, tok, req)
-	wantReason(t, st, body, http.StatusForbidden, api.ReasonNotEnrolled)
+	// Not "not_enrolled": nothing has proven yet that the caller holds a
+	// pinned key, so the enrollment state is not disclosed.
+	wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
+	if r.tun.peerCount() != 0 {
+		t.Fatal("a peer was installed for an unenrolled device")
+	}
 }
 
 func TestDeviceSessionRejects(t *testing.T) {

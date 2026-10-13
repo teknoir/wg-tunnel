@@ -301,6 +301,11 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	if !now.Before(pol.EnrollUntil) {
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
+	// A voided identity is never re-admitted, whatever the epoch: a new window
+	// needs a NEW key (sticky void).
+	if found && IsVoidedFingerprint(cur, fingerprint) {
+		return 0, nil, h.voidedEnrollDenial(ctx, d)
+	}
 	got, created, err := h.deps.Identity.Pin(ctx, api.IdentityEntry{
 		Device: device, Namespace: ns,
 		IdentityPublicKey:    identity.EncodePublicKey(idPub),
@@ -309,6 +314,9 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		EnrollmentEpoch:      pol.EnrollmentEpoch,
 		EnrolledAt:           now,
 	})
+	if errors.Is(err, ErrFingerprintVoided) {
+		return 0, nil, h.voidedEnrollDenial(ctx, d)
+	}
 	if err != nil {
 		h.log.Error("pinning identity failed", "ns", ns, "device", device, "err", err)
 		return 0, nil, denyUnavailable("identity store unavailable")
@@ -317,6 +325,15 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		h.log.Info("identity pinned; waiting for admin approval", "ns", ns, "device", device, "fingerprint", fingerprint)
 	}
 	return h.enrollResult(ctx, got, req.IdentityPublicKey, created, d)
+}
+
+// voidedEnrollDenial answers an enrollment with an identity that was voided
+// before. It is recorded as a conflict, like any other rejected key.
+func (h *Hub) voidedEnrollDenial(ctx context.Context, d *dctx) *denial {
+	if err := h.deps.Identity.RecordConflict(ctx, d.ns, d.device, h.now()); err != nil {
+		h.log.Error("recording enrollment conflict failed", "ns", d.ns, "device", d.device, "err", err)
+	}
+	return deny(api.ReasonEnrollConflict, "this identity was voided and cannot be enrolled again")
 }
 
 // enrollResult answers an enrollment given the pin in effect.
@@ -419,6 +436,12 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	}
 	pin, pub, den := h.loadPin(ctx, ns, device)
 	if den != nil {
+		if den.reason == api.ReasonNotEnrolled || den.reason == api.ReasonInternal && den.status != http.StatusServiceUnavailable {
+			// Nothing proves yet that the caller holds a pinned key, so the
+			// enrollment state stays hidden: the agent enrolls on this answer
+			// too (see pkg/agent).
+			return 0, nil, unauthenticatedDenial()
+		}
 		return 0, nil, den
 	}
 	now := h.now()

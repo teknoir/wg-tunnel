@@ -349,7 +349,7 @@ func TestPendingApprovalIsLoggedAndTheAgentStaysEnrolled(t *testing.T) {
 	r.hub.SetOnCreate(func(fakehub.Call) *fakehub.Denial {
 		switch {
 		case r.hub.PinnedKey(testNS, testDevice) == nil:
-			return &fakehub.Denial{Status: 403, Reason: api.ReasonNotEnrolled}
+			return &fakehub.Denial{Status: 401, Reason: api.ReasonUnauthenticated} // what the hub says before a pin exists
 		case pending.Load():
 			return &fakehub.Denial{Status: 403, Reason: api.ReasonPendingApproval}
 		}
@@ -382,6 +382,25 @@ func TestPendingApprovalIsLoggedAndTheAgentStaysEnrolled(t *testing.T) {
 	eventually(t, 15*time.Second, "session after approval", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
 	if again, _ := identity.LoadOrCreate(r.idDir); !again.Equal(priv) {
 		t.Fatal("identity changed")
+	}
+}
+
+// The hub no longer says "not_enrolled" to a caller that has not proven a
+// pinned key (the enrollment state would leak): a first start gets the same
+// bare "unauthenticated" as a stranger, and must enroll on it, once, then come
+// up.
+func TestFirstStartEnrollsOnTheUniformUnauthenticatedAnswer(t *testing.T) {
+	r := newRig(t, fakehub.Options{})
+	r.start(r.config())
+	eventually(t, 15*time.Second, "session after first enrollment", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	if n := r.hub.Enrollments(testNS, testDevice); n != 1 {
+		t.Fatalf("enrollments = %d, want exactly 1", n)
+	}
+	if !strings.Contains(r.logs.String(), "trying to enroll it") {
+		t.Fatalf("the agent must enroll because of the unauthenticated answer:\n%s", r.logs.String())
+	}
+	if strings.Contains(r.logs.String(), "not_enrolled") {
+		t.Fatal("the hub must not answer not_enrolled to an unverified caller")
 	}
 }
 

@@ -142,11 +142,20 @@ func (s *Identity) Pin(_ context.Context, e api.IdentityEntry) (api.IdentityEntr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := key{e.Namespace, e.Device}
-	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration == e.EnrollmentGeneration && cur.EnrollmentEpoch == e.EnrollmentEpoch {
+	var curP *api.IdentityEntry
+	cur, ok := s.m[k]
+	if ok {
+		curP = &cur
+	}
+	next, same, err := hub.ReplacePin(curP, e)
+	if err != nil {
+		return api.IdentityEntry{}, false, err
+	}
+	if same {
 		return cur, false, nil
 	}
-	s.m[k] = e
-	return e, true, nil
+	s.m[k] = next
+	return next, true, nil
 }
 
 func (s *Identity) Void(_ context.Context, ns, device, reason string, at time.Time) (bool, error) {
@@ -157,8 +166,7 @@ func (s *Identity) Void(_ context.Context, ns, device, reason string, at time.Ti
 	if !ok || cur.Voided {
 		return false, nil
 	}
-	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
-	s.m[k] = cur
+	s.m[k] = hub.VoidEntry(cur, reason, at)
 	return true, nil
 }
 

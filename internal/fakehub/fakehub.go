@@ -565,7 +565,9 @@ func (h *Hub) authDevice(d *device, tok, ns, name, wgPub string) (int, string) {
 		return 0, ""
 	}
 	if d.pinned == nil {
-		return 403, api.ReasonNotEnrolled
+		// Like the real hub: nothing proves the caller holds a pinned key, so
+		// the enrollment state stays hidden behind the one anonymous answer.
+		return 401, api.ReasonUnauthenticated
 	}
 	// Like the real hub: a token that does not verify against the pinned key
 	// is just "unauthenticated"; only the pinned key's owner hears "reenroll".

@@ -173,11 +173,20 @@ func (s *memIdentity) Pin(_ context.Context, e api.IdentityEntry) (api.IdentityE
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := devKey{e.Namespace, e.Device}
-	if cur, ok := s.m[k]; ok && cur.EnrollmentGeneration == e.EnrollmentGeneration && cur.EnrollmentEpoch == e.EnrollmentEpoch {
+	var curP *api.IdentityEntry
+	cur, ok := s.m[k]
+	if ok {
+		curP = &cur
+	}
+	next, same, err := ReplacePin(curP, e)
+	if err != nil {
+		return api.IdentityEntry{}, false, err
+	}
+	if same {
 		return cur, false, nil
 	}
-	s.m[k] = e
-	return e, true, nil
+	s.m[k] = next
+	return next, true, nil
 }
 
 func (s *memIdentity) Void(_ context.Context, ns, device, reason string, at time.Time) (bool, error) {
@@ -191,8 +200,7 @@ func (s *memIdentity) Void(_ context.Context, ns, device, reason string, at time
 	if !ok || cur.Voided {
 		return false, nil
 	}
-	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
-	s.m[k] = cur
+	s.m[k] = VoidEntry(cur, reason, at)
 	s.voids++
 	return true, nil
 }

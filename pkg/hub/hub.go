@@ -32,6 +32,8 @@ type Config struct {
 	// apply only to requests that carry a parseable address in it: behind a
 	// service mesh or a load balancer that hides client addresses the peer
 	// address is the same for everyone and must not be used as a limiter key.
+	// A value that is loopback, private, CGNAT, link-local or unspecified is a
+	// proxy or NAT hop, not a client, and is ignored the same way.
 	ClientIPHeader string
 
 	SessionTTL     time.Duration // default 3m

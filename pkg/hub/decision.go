@@ -53,11 +53,32 @@ func (h *Hub) logDecision(d *dctx, decision, reason, detail string) {
 func (h *Hub) clientIP(r *http.Request) (ip string, trusted bool) {
 	if hdr := h.cfg.ClientIPHeader; hdr != "" {
 		first, _, _ := strings.Cut(r.Header.Get(hdr), ",")
-		if a, err := netip.ParseAddr(strings.TrimSpace(first)); err == nil {
+		if a, err := netip.ParseAddr(strings.TrimSpace(first)); err == nil && publicClientAddr(a.Unmap()) {
 			return a.Unmap().String(), true
 		}
 	}
 	return remoteIP(r.RemoteAddr), false
+}
+
+// cgnat is the shared address space of RFC 6598 (100.64.0.0/10).
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// publicClientAddr reports whether a can plausibly be a real client address.
+// Loopback, private (RFC 1918 and ULA), CGNAT, link-local, multicast and
+// unspecified addresses are what a proxy or a NAT hop (k3s servicelb, a mesh
+// sidecar, the node itself) shows instead of the caller. Keying a limiter on
+// one of them would let a single caller exhaust the budget of everybody, so
+// such a value is treated like no trusted address at all: only the global
+// backstop applies.
+func publicClientAddr(a netip.Addr) bool {
+	switch {
+	case !a.IsValid(), a.IsUnspecified(), a.IsLoopback(), a.IsPrivate(),
+		a.IsLinkLocalUnicast(), a.IsLinkLocalMulticast(), a.IsInterfaceLocalMulticast(), a.IsMulticast():
+		return false
+	case a.Is4() && cgnat.Contains(a):
+		return false
+	}
+	return true
 }
 
 func remoteIP(remote string) string {

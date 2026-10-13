@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -137,22 +138,121 @@ func (s *K8sIdentityStore) build(name, ns, device string, e api.IdentityEntry, p
 	return cm, nil
 }
 
+// ErrFingerprintVoided is returned by IdentityStore.Pin when the identity to
+// pin was voided before (it is in IdentityEntry.VoidedFingerprints, or is the
+// fingerprint of the current voided pin). A voided identity is never pinned
+// again, in any epoch or generation.
+var ErrFingerprintVoided = errors.New("hub: identity fingerprint was voided")
+
+// VoidEntry returns cur marked void, with its fingerprint appended to the
+// bounded VoidedFingerprints history.
+func VoidEntry(cur api.IdentityEntry, reason string, at time.Time) api.IdentityEntry {
+	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
+	cur.VoidedFingerprints = appendVoided(cur.VoidedFingerprints, cur.Fingerprint)
+	return cur
+}
+
+// appendVoided appends fp (newest last), drops duplicates and keeps the newest
+// api.MaxVoidedFingerprints. It never modifies list in place.
+func appendVoided(list []string, fp string) []string {
+	out := make([]string, 0, len(list)+1)
+	for _, f := range list {
+		if f != fp && f != "" {
+			out = append(out, f)
+		}
+	}
+	if fp != "" {
+		out = append(out, fp)
+	}
+	if len(out) > api.MaxVoidedFingerprints {
+		out = out[len(out)-api.MaxVoidedFingerprints:]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// IsVoidedFingerprint reports whether fp was voided according to e: either it
+// is in the history, or it is the fingerprint of e itself while e is void
+// (entries voided before the history existed).
+func IsVoidedFingerprint(e api.IdentityEntry, fp string) bool {
+	if fp == "" {
+		return false
+	}
+	if e.Voided && e.Fingerprint == fp {
+		return true
+	}
+	return slices.Contains(e.VoidedFingerprints, fp)
+}
+
+// ReplacePin is the Pin policy shared by every IdentityStore (the hub's
+// ConfigMap store and the in-memory fakes). cur is the stored entry or nil.
+//   - same == true: cur is the pin of the SAME epoch and generation; it stays
+//     (first wins per epoch, voided or not).
+//   - err == ErrFingerprintVoided: entry carries an identity that was voided
+//     before; it is not pinned.
+//   - otherwise next is the entry to store: entry, carrying over the voided
+//     fingerprint history (including cur's own fingerprint when cur is void)
+//     and the conflict history of the device it replaces.
+func ReplacePin(cur *api.IdentityEntry, entry api.IdentityEntry) (next api.IdentityEntry, same bool, err error) {
+	if cur == nil {
+		return entry, false, nil
+	}
+	if cur.EnrollmentGeneration == entry.EnrollmentGeneration && cur.EnrollmentEpoch == entry.EnrollmentEpoch {
+		return api.IdentityEntry{}, true, nil
+	}
+	if IsVoidedFingerprint(*cur, entry.Fingerprint) {
+		return api.IdentityEntry{}, false, ErrFingerprintVoided
+	}
+	next = entry
+	history := cur.VoidedFingerprints
+	if cur.Voided {
+		history = appendVoided(history, cur.Fingerprint)
+	}
+	var merged []string
+	for _, f := range history {
+		merged = appendVoided(merged, f)
+	}
+	for _, f := range entry.VoidedFingerprints {
+		merged = appendVoided(merged, f)
+	}
+	next.VoidedFingerprints = merged
+	next.Conflicts = cur.Conflicts + entry.Conflicts
+	next.LastConflictAt = cur.LastConflictAt
+	if entry.LastConflictAt.After(next.LastConflictAt) {
+		next.LastConflictAt = entry.LastConflictAt
+	}
+	return next, false, nil
+}
+
 // Pin implements IdentityStore. An existing pin of the SAME enrollment epoch
 // and generation is never replaced (first wins per epoch, voided or not); a pin
-// of any other epoch or generation is void and is replaced.
+// of any other epoch or generation is void and is replaced, carrying over the
+// voided fingerprint and conflict history. A voided identity is refused with
+// ErrFingerprintVoided.
 func (s *K8sIdentityStore) Pin(ctx context.Context, entry api.IdentityEntry) (api.IdentityEntry, bool, error) {
 	if !validLabel(entry.Namespace) || !validLabel(entry.Device) {
 		return api.IdentityEntry{}, false, errors.New("hub: invalid identity entry")
 	}
 	current := entry
+	var refused error
 	wrote, err := s.mutate(ctx, entry.Namespace, entry.Device, func(cur *api.IdentityEntry) *api.IdentityEntry {
-		if cur != nil && cur.EnrollmentGeneration == entry.EnrollmentGeneration && cur.EnrollmentEpoch == entry.EnrollmentEpoch {
+		next, same, err := ReplacePin(cur, entry)
+		if err != nil {
+			refused = err
+			return nil
+		}
+		if same {
 			current = *cur
 			return nil
 		}
-		current = entry
-		return &entry
+		current = next
+		return &next
 	})
+	if refused != nil {
+		return api.IdentityEntry{}, false, refused
+	}
 	if err != nil {
 		return api.IdentityEntry{}, false, err
 	}
@@ -168,8 +268,7 @@ func (s *K8sIdentityStore) Void(ctx context.Context, ns, device, reason string, 
 		if cur == nil || cur.Voided {
 			return nil // nothing pinned, or already void
 		}
-		next := *cur
-		next.Voided, next.VoidedReason, next.VoidedAt = true, reason, at
+		next := VoidEntry(*cur, reason, at)
 		return &next
 	})
 }

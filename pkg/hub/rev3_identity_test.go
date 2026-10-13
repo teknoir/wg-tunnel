@@ -350,6 +350,31 @@ func TestUnauthenticatedDeviceCallersGetOneAnswer(t *testing.T) {
 		st, body := r.post(api.DeviceSessionPath, tok, req)
 		wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
 	})
+	t.Run("no pin yet: same answer as a stranger", func(t *testing.T) {
+		// A device in the policy that has never enrolled (fresh window): the
+		// anonymous answer must not tell a stranger that nobody is pinned.
+		r := newRig(t)
+		for name, c := range map[string]*deviceCreds{"the device": r.dev, "a stranger": func() *deviceCreds { s := *r.dev; s.newIdentity(t); return &s }()} {
+			tok, req, _ := c.sessionRequest(t, r.clock.Now())
+			st, body := r.post(api.DeviceSessionPath, tok, req)
+			if st != http.StatusUnauthorized {
+				t.Fatalf("%s: %d %s", name, st, body)
+			}
+			wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
+		}
+	})
+	t.Run("pin that cannot be read is not disclosed either", func(t *testing.T) {
+		r := newRig(t)
+		r.enrollOK()
+		r.ids.mu.Lock()
+		e := r.ids.m[devKey{testNS, testDevice}]
+		e.IdentityPublicKey = "!!not-a-key!!"
+		r.ids.m[devKey{testNS, testDevice}] = e
+		r.ids.mu.Unlock()
+		tok, req, _ := r.dev.sessionRequest(t, r.clock.Now())
+		st, body := r.post(api.DeviceSessionPath, tok, req)
+		wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
+	})
 	t.Run("enroll for an unknown device", func(t *testing.T) {
 		other := newDeviceCreds(t)
 		other.name = "no-such-device"
