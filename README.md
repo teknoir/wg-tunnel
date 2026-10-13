@@ -16,6 +16,35 @@ alternative to the SSH reverse tunnels and stays separate from them.
 
 Design: `plans/wireguard-ztna-tunnel.md` in the Teknoir workspace.
 
+## wg-hub
+
+`pkg/hub` is the broker; `cmd/wg-hub` wires it to Kubernetes with client-go. All
+decision logic sits behind small interfaces (`PolicySource`, `DeviceFlags`,
+`IdentityStore`, `UserAuthenticator`, `SADelegation`, `Authorizer`,
+`TURNMinter`, `Tunnel`), so it is tested with in-memory fakes plus a real
+wireguard-go data plane on loopback. The `k8s_*.go` files hold the client-go
+implementations (ConfigMap informer for policy, metadata-only Device informer,
+identity ConfigMaps with optimistic concurrency, TokenReview, SubjectAccessReview,
+TURN secret).
+
+A device is reachable only while the policy entry is `active`, the Device exists,
+`ztna.teknoir.org/wireguard=enabled` and neither `compromised` nor
+`health-check-failed` is `true`. Every policy or annotation change re-evaluates
+the device at once and tears down its sessions and spliced connections.
+
+| Environment | Meaning | Default |
+|---|---|---|
+| `POD_IP` | advertised WireGuard endpoint host (downward API) | required |
+| `DOMAIN` | derives `TURN_URLS`, `KEYCLOAK_ISSUER` when unset | |
+| `HUB_NAMESPACE` | policy, identity ConfigMaps and delegating SAs | `teknoir-ztna` |
+| `HTTP_ADDR` / `METRICS_ADDR` | outside API / Prometheus | `:8080` / `:9090` |
+| `TURN_URLS` | comma-separated TURN URLs returned to sessions | `turn:turn.<DOMAIN>:3478?transport=udp` |
+| `TURN_SECRET_REF` | `namespace/name` of the Secret holding key `secret` | `stunner-system/stunner-auth-secret` |
+| `KEYCLOAK_ISSUER` / `KEYCLOAK_JWKS_URL` | access-token issuer and key set | `https://auth.<DOMAIN>/auth/realms/master` |
+| `ALLOWED_AZP` | accepted Keycloak `azp` values | `teknoir-cli` |
+| `CLIENT_IP_HEADER` | trusted proxy header with the real client IP (optional) | peer address |
+| `LOG_LEVEL` | slog level | `info` |
+
 ## Libraries
 
 - `pkg/wgkey`: X25519 key generation, wg base64 and wireguard-go hex conversion.
