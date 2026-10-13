@@ -440,3 +440,36 @@ func TestIdentityFingerprintHelper(t *testing.T) {
 		t.Fatal("test helper disagrees with the identity package")
 	}
 }
+
+// Every anonymous failure on the device paths must produce the same bytes: a
+// differing message would tell a stranger whether a device has a policy, a
+// pin, or an open enrollment window.
+func TestUnauthenticatedDeviceBodiesAreIdentical(t *testing.T) {
+	r := newRig(t)
+	r.enrollOK()
+	r.approve()
+	var bodies []string
+
+	unknown := newDeviceCreds(t)
+	unknown.name = "no-such-device"
+	tok, req, _ := unknown.sessionRequest(t, r.clock.Now())
+	_, b := r.post(api.DeviceSessionPath, tok, req)
+	bodies = append(bodies, string(b))
+
+	stranger := *r.dev
+	stranger.newIdentity(t)
+	tok, req, _ = stranger.sessionRequest(t, r.clock.Now())
+	_, b = r.post(api.DeviceSessionPath, tok, req)
+	bodies = append(bodies, string(b))
+
+	fresh := newRig(t) // in the policy, never enrolled
+	tok, req, _ = fresh.dev.sessionRequest(t, fresh.clock.Now())
+	_, b = fresh.post(api.DeviceSessionPath, tok, req)
+	bodies = append(bodies, string(b))
+
+	for i := 1; i < len(bodies); i++ {
+		if bodies[i] != bodies[0] {
+			t.Fatalf("anonymous answer %d differs:\n%s\nvs\n%s", i, bodies[i], bodies[0])
+		}
+	}
+}

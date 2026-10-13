@@ -237,11 +237,11 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	}
 	sub, ok := unverifiedSubject(tok)
 	if !ok {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid token")
+		return 0, nil, unauthenticatedDenial()
 	}
 	ns, device, ok := splitSubject(sub)
 	if !ok {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid token subject")
+		return 0, nil, unauthenticatedDenial()
 	}
 	d.ns, d.device, d.subject = ns, device, sub
 
@@ -254,7 +254,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	now := h.now()
 	claims, err := identity.VerifyEnrollJWT(tok, []byte(pol.RSAPublicCert), sub, now)
 	if err != nil {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid enrollment token")
+		return 0, nil, unauthenticatedDenial()
 	}
 	idPub, err := identity.ParsePublicKey(req.IdentityPublicKey)
 	if err != nil {
@@ -264,7 +264,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		return 0, nil, deny(api.ReasonUnauthenticated, "token identity key does not match request")
 	}
 	if err := identity.VerifyEnrollProof(idPub, sub, claims.ID, req.Proof); err != nil {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid proof of possession")
+		return 0, nil, unauthenticatedDenial()
 	}
 	// Subject limit first, then the replay cache: a subject over its rate must
 	// not be able to fill its replay partition.
@@ -421,11 +421,11 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	}
 	sub, ok := unverifiedSubject(tok)
 	if !ok {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid token")
+		return 0, nil, unauthenticatedDenial()
 	}
 	ns, device, ok := splitSubject(sub)
 	if !ok {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid token subject")
+		return 0, nil, unauthenticatedDenial()
 	}
 	d.ns, d.device, d.subject = ns, device, sub
 
@@ -447,7 +447,7 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	now := h.now()
 	claims, err := identity.VerifyIdentityJWT(tok, pub, sub, now)
 	if err != nil {
-		return 0, nil, deny(api.ReasonUnauthenticated, "invalid identity token")
+		return 0, nil, unauthenticatedDenial()
 	}
 	// Authenticated. A device that is revoked, disabled or unknown to the
 	// policy hears that before anything about its pin.

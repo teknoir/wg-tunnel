@@ -239,7 +239,7 @@ func (h *Hub) reauthDevice(ctx context.Context, tok string, s *session, now time
 	}
 	claims, err := identity.VerifyIdentityJWT(tok, pub, s.subject, now)
 	if err != nil {
-		return deny(api.ReasonUnauthenticated, "invalid identity token")
+		return unauthenticatedDenial()
 	}
 	// A revoked device hears device_revoked, not a statement about its pin.
 	if eff := computeEffective(h.deps.Policy, h.deps.Flags, s.ns, s.device); !eff.Active {
