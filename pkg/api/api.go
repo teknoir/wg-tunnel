@@ -8,6 +8,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -220,6 +221,7 @@ const (
 	ReasonEnrollClosed    = "enroll_closed"    // enrollment window closed (admin must reset enrollment)
 	ReasonEnrollConflict  = "enroll_conflict"  // a different identity is already pinned
 	ReasonSessionLimit    = "session_limit"    // per-subject/per-device session cap reached
+	ReasonPendingApproval = "pending_approval" // identity pinned, waiting for an admin to approve its fingerprint
 	ReasonReplay          = "replay"           // device JWT jti reused
 	ReasonForbidden       = "forbidden"        // user lacks access to the teamspace
 	ReasonDeviceUnknown   = "device_unknown"   // no policy entry
@@ -264,7 +266,38 @@ const (
 	AnnotationHealthCheckFailed = "ztna.teknoir.org/health-check-failed" // "true" | absent
 	AnnotationReason            = "ztna.teknoir.org/reason"              // free text
 	AnnotationReenroll          = "ztna.teknoir.org/reenroll"            // RFC3339 request time; a newer value resets enrollment
+	AnnotationApprovedIdentity  = "ztna.teknoir.org/approved-identity"   // identity fingerprint approved by an admin
 )
+
+// FlagSet is the single parser for boolean device annotations, used by the
+// hub, the flags watcher and device-controller alike.
+func FlagSet(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "true") }
+
+// Flags store, written only by the flags watcher (`wg-hub flags-watcher`, its
+// own ServiceAccount, no ingress), which is the only component allowed to read
+// Device objects. The internet-facing hub reads these ConfigMaps instead of
+// Devices, so it never has access to device keys.
+const (
+	FlagsConfigMapPrefix = "ztna-flags-"            // + <teamspace>.<device>
+	FlagsLabel           = "ztna.teknoir.org/flags" // = "true"
+	FlagsDataKey         = "flags.json"
+)
+
+// FlagsEntry mirrors the security-relevant Device annotations.
+type FlagsEntry struct {
+	Device            string    `json:"device"`
+	Namespace         string    `json:"namespace"`
+	Exists            bool      `json:"exists"`
+	WireGuard         bool      `json:"wireguard"`
+	Compromised       bool      `json:"compromised"`
+	HealthCheckFailed bool      `json:"healthCheckFailed"`
+	ObservedAt        time.Time `json:"observedAt"`
+}
+
+// FlagsConfigMapName returns the flags ConfigMap name for a device.
+func FlagsConfigMapName(teamspace, device string) string {
+	return FlagsConfigMapPrefix + teamspace + "." + device
+}
 
 // Policy states.
 const (
@@ -294,9 +327,20 @@ type PolicyEntry struct {
 	// compromised/health flag is cleared). A pinned identity with a lower
 	// generation is void: the agent must create a NEW identity and enroll.
 	EnrollmentGeneration int64 `json:"enrollmentGeneration"`
+	// EnrollmentEpoch is a random value the controller generates every time it
+	// opens an enrollment window (new generation, re-enable, device recreate).
+	// It never repeats, so a pin is valid only if its epoch AND generation equal
+	// the policy's exactly.
+	EnrollmentEpoch string `json:"enrollmentEpoch"`
 	// EnrollUntil closes the TOFU window for this generation.
 	EnrollUntil time.Time `json:"enrollUntil"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	// ApprovedFingerprint is the identity fingerprint an admin approved in the
+	// UI (annotation AnnotationApprovedIdentity). A pinned identity is usable
+	// for sessions only when its fingerprint equals this value; until then the
+	// hub answers ReasonPendingApproval. This closes the TOFU race against
+	// holders of the (widely exposed) legacy RSA key.
+	ApprovedFingerprint string    `json:"approvedFingerprint,omitempty"`
+	UpdatedAt           time.Time `json:"updatedAt"`
 }
 
 // IdentityEntry is the JSON value stored under IdentityDataKey.
@@ -306,7 +350,14 @@ type IdentityEntry struct {
 	IdentityPublicKey    string    `json:"identityPublicKey"` // base64 raw Ed25519
 	Fingerprint          string    `json:"fingerprint"`
 	EnrollmentGeneration int64     `json:"enrollmentGeneration"`
+	EnrollmentEpoch      string    `json:"enrollmentEpoch"`
 	EnrolledAt           time.Time `json:"enrolledAt"`
+	// Voided is set by the hub when it observes a compromised/health-check
+	// flag for the device: a voided pin is never accepted again (sticky
+	// revocation that does not depend on device-controller).
+	Voided       bool      `json:"voided,omitempty"`
+	VoidedReason string    `json:"voidedReason,omitempty"`
+	VoidedAt     time.Time `json:"voidedAt,omitempty"`
 	// Conflicts counts rejected enrollments with a DIFFERENT key for this
 	// generation (possible key theft); surfaced in the UI.
 	Conflicts      int       `json:"conflicts,omitempty"`
@@ -327,8 +378,12 @@ func IdentityConfigMapName(teamspace, device string) string {
 const (
 	HubNamespace   = "teknoir-ztna"
 	HubServiceName = "wg-hub" // headless; HubEndpoint is the hub pod IP
-	HubHTTPPort    = 8080     // outside-tunnel API (mesh + ingress)
-	HubWGPort      = 51820    // WireGuard UDP; the only STUNner backend port
+	HubHTTPPort    = 8080     // outside-tunnel API reachable via ingress (users, devices)
+	// HubInternalPort is NOT routed by any VirtualService: SA delegation
+	// (OnBehalfOf) and Direct sessions are accepted only here, from pods in
+	// HubNamespace (AuthorizationPolicy).
+	HubInternalPort = 8081
+	HubWGPort       = 51820 // WireGuard UDP; the only STUNner backend port
 	// UserHostPrefix: https://wg.<domain> (443, oauth2-proxy lets teknoir-cli bearer tokens through).
 	UserHostPrefix = "wg"
 	// DeviceHostPrefix: https://wg-device.<domain>:8084 (public gateway, no edge auth; hub authenticates).
