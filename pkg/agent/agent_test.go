@@ -78,6 +78,7 @@ func TestReenrollsWithNewIdentityAfterReset(t *testing.T) {
 	r := newRig(t, fakehub.Options{})
 	_, stop := r.start(r.config())
 	eventually(t, 15*time.Second, "first enrollment", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	r.waitTunnelUp(t, 1)
 	first := append(ed25519.PublicKey(nil), r.hub.PinnedKey(testNS, testDevice)...)
 	if err := stop(); err != nil {
 		t.Fatal(err)
@@ -411,6 +412,7 @@ func TestAgentWithLostIdentityEnrollsWhenTheWindowOpens(t *testing.T) {
 	r := newRig(t, fakehub.Options{})
 	_, stop := r.start(r.config())
 	eventually(t, 15*time.Second, "first enrollment", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	r.waitTunnelUp(t, 1)
 	first := append(ed25519.PublicKey(nil), r.hub.PinnedKey(testNS, testDevice)...)
 	if err := stop(); err != nil {
 		t.Fatal(err)

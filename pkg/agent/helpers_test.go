@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -178,6 +179,19 @@ func (r *rig) start(cfg Config) (a *Agent, stop func() error) {
 	}
 	r.t.Cleanup(func() { _ = stop() })
 	return a, stop
+}
+
+// waitTunnelUp waits until the agent has logged n established sessions, i.e.
+// until its WireGuard handshake with the hub completed. The hub lists a device
+// session as soon as it answers the create request, which is BEFORE the agent
+// has a tunnel: stopping the agent in that window cannot send the in-tunnel
+// close (there is no tunnel yet), so the hub keeps the session until it expires.
+// A test that expects shutdown to close the hub session must wait for this first.
+func (r *rig) waitTunnelUp(t *testing.T, n int) {
+	t.Helper()
+	eventually(t, 15*time.Second, "the agent's tunnel to come up", func() bool {
+		return strings.Count(r.logs.String(), "wireguard session established") >= n
+	})
 }
 
 func (r *rig) clientSession(t *testing.T) *wgclient.Session {
