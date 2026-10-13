@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+.idea/
+.vscode/
+# Never commit key material.
+*.key
+*.pem
+identity.key*
