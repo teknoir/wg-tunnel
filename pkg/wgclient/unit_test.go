@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -32,21 +33,24 @@ func TestOptionsValidate(t *testing.T) {
 	}
 	mod := func(f func(*Options)) Options { o := validClient(); f(&o); return o }
 	cases := map[string]Options{
-		"no hub url":        mod(func(o *Options) { o.HubURL = "" }),
-		"ftp scheme":        mod(func(o *Options) { o.HubURL = "ftp://x" }),
-		"no host":           mod(func(o *Options) { o.HubURL = "https://" }),
-		"userinfo":          mod(func(o *Options) { o.HubURL = "https://u:p@wg.example.com" }),
-		"query":             mod(func(o *Options) { o.HubURL = "https://wg.example.com/?x=1" }),
-		"no credential":     mod(func(o *Options) { o.Credential = nil }),
-		"unknown kind":      mod(func(o *Options) { o.Kind = "robot" }),
-		"client no request": mod(func(o *Options) { o.ClientRequest = nil }),
-		"client no device":  mod(func(o *Options) { o.ClientRequest.Device = "" }),
-		"client no ns":      mod(func(o *Options) { o.ClientRequest.Namespace = "" }),
-		"client port 0":     mod(func(o *Options) { o.ClientRequest.Port = 0 }),
-		"client port big":   mod(func(o *Options) { o.ClientRequest.Port = 70000 }),
-		"both requests":     mod(func(o *Options) { o.DeviceRequest = &api.DeviceSessionRequest{} }),
-		"bad override":      mod(func(o *Options) { o.TURNServerOverride = "a b:3478" }),
-		"device no request": {HubURL: "https://x", Kind: api.KindDevice, Credential: okCred},
+		"no hub url":                  mod(func(o *Options) { o.HubURL = "" }),
+		"plain http, public host":     mod(func(o *Options) { o.HubURL = "http://wg.teknoir.cloud" }),
+		"plain http, lookalike svc":   mod(func(o *Options) { o.HubURL = "http://wg-hub.svc.evil.com:8081" }),
+		"plain http, private address": mod(func(o *Options) { o.HubURL = "http://10.0.0.5:8081" }),
+		"ftp scheme":                  mod(func(o *Options) { o.HubURL = "ftp://x" }),
+		"no host":                     mod(func(o *Options) { o.HubURL = "https://" }),
+		"userinfo":                    mod(func(o *Options) { o.HubURL = "https://u:p@wg.example.com" }),
+		"query":                       mod(func(o *Options) { o.HubURL = "https://wg.example.com/?x=1" }),
+		"no credential":               mod(func(o *Options) { o.Credential = nil }),
+		"unknown kind":                mod(func(o *Options) { o.Kind = "robot" }),
+		"client no request":           mod(func(o *Options) { o.ClientRequest = nil }),
+		"client no device":            mod(func(o *Options) { o.ClientRequest.Device = "" }),
+		"client no ns":                mod(func(o *Options) { o.ClientRequest.Namespace = "" }),
+		"client port 0":               mod(func(o *Options) { o.ClientRequest.Port = 0 }),
+		"client port big":             mod(func(o *Options) { o.ClientRequest.Port = 70000 }),
+		"both requests":               mod(func(o *Options) { o.DeviceRequest = &api.DeviceSessionRequest{} }),
+		"bad override":                mod(func(o *Options) { o.TURNServerOverride = "a b:3478" }),
+		"device no request":           {HubURL: "https://x", Kind: api.KindDevice, Credential: okCred},
 	}
 	for name, o := range cases {
 		if err := o.Validate(); err == nil {
@@ -223,5 +227,108 @@ func TestHandshakeTimeoutOnDeadEndpoint(t *testing.T) {
 	o.HandshakeTimeout = time.Minute
 	if _, err := Create(ctx, o); err == nil {
 		t.Fatal("Create ignored its context")
+	}
+}
+
+func TestPlainHTTPOnlyForInClusterAndLoopback(t *testing.T) {
+	for _, ok := range []string{
+		"http://wg-hub.teknoir-ztna.svc:8081", "http://wg-hub.teknoir-ztna.svc.cluster.local:8081", "http://WG-HUB.teknoir-ztna.svc",
+		"http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080", "https://wg.teknoir.cloud", "https://10.0.0.5:8443",
+	} {
+		o := validClient()
+		o.HubURL = ok
+		if err := o.Validate(); err != nil {
+			t.Errorf("%s rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://wg.teknoir.cloud", "http://wg-hub.svc.evil.com", "http://evilsvc", "http://svc", "http://10.0.0.5:8081",
+		"http://wg.teknoir.cloud:8080/svc", "http://127.0.0.1.evil.com", "http://localhost.evil.com",
+	} {
+		o := validClient()
+		o.HubURL = bad
+		err := o.Validate()
+		if err == nil {
+			t.Errorf("%s accepted: the Keycloak token would travel in the clear", bad)
+		} else if !strings.Contains(err.Error(), "https") {
+			t.Errorf("%s: unhelpful error %v", bad, err)
+		}
+	}
+}
+
+// With the product defaults a single failed renewal on an idle tunnel (the hub
+// sends nothing between renewals) must not end the session.
+func TestDeadTunnelToleratesOneFailedRenewalWithProductDefaults(t *testing.T) {
+	now := time.Now()
+	s := &Session{opts: Options{}, started: now.Add(-10 * time.Minute)}
+	s.resp.RenewAfterSeconds = 60
+	failure := errors.New("context deadline exceeded") // transport level
+
+	// Renewed OK a minute ago; the next renewal just timed out: 60 s of silence
+	// is more than DeadAfter (50 s) but less than a renewal cycle plus a retry.
+	s.lastRenewOK = now.Add(-(60*time.Second + 15*time.Second))
+	if err := s.deadTunnel(failure); err != nil {
+		t.Fatalf("one blip ended an idle session: %v", err)
+	}
+	// Silent for far longer than that: dead.
+	s.lastRenewOK = now.Add(-3 * time.Minute)
+	if err := s.deadTunnel(failure); !errors.Is(err, ErrTunnelDead) {
+		t.Fatalf("got %v, want ErrTunnelDead", err)
+	}
+	// A successful renewal counts as activity, however old the last packet is.
+	s.lastRenewOK = time.Now()
+	if err := s.deadTunnel(failure); err != nil {
+		t.Fatalf("just renewed, yet dead: %v", err)
+	}
+	// Answers from the hub and credential failures say nothing about the tunnel.
+	s.lastRenewOK = time.Time{}
+	if err := s.deadTunnel(&Error{Status: 403, Reason: api.ReasonForbidden}); err != nil {
+		t.Fatalf("hub answer: %v", err)
+	}
+	if err := s.deadTunnel(&credentialError{errors.New("x")}); err != nil {
+		t.Fatalf("credential failure: %v", err)
+	}
+	// An explicit DeadAfter above the floor wins; the floor is never lower than
+	// one renewal cycle.
+	s.opts.DeadAfter = 10 * time.Minute
+	s.started = now.Add(-5 * time.Minute)
+	if err := s.deadTunnel(failure); err != nil {
+		t.Fatalf("DeadAfter ignored: %v", err)
+	}
+	if got := (&Session{opts: Options{DeadAfter: time.Second, RenewTimeout: time.Second, RenewRetry: time.Second}, resp: api.SessionResponse{RenewAfterSeconds: 2}}).deadLimit(); got != 4*time.Second {
+		t.Fatalf("deadLimit %v, want 4s (renewAfter + timeout + retry)", got)
+	}
+}
+
+// A Create that fails (here: the handshake never completes) must release
+// everything it built: WireGuard device, netstack, sockets and goroutines.
+func TestFailedCreateLeaksNothing(t *testing.T) {
+	_, hubPub, _ := wgkey.Generate()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(201)
+		_, _ = w.Write([]byte(`{"sessionId":"s","kind":"client","address":"100.96.0.9","hubAddress":"100.96.0.1","hubPublicKey":"` +
+			hubPub.Base64() + `","hubEndpoint":"127.0.0.1:9","expiresAt":"2099-01-01T00:00:00Z","renewAfterSeconds":60,"mtu":1280}`))
+	}))
+	defer srv.Close()
+	o := validClient()
+	o.HubURL, o.Direct, o.HandshakeTimeout = srv.URL, true, 100*time.Millisecond
+
+	attempt := func() {
+		if _, err := Create(context.Background(), o); !errors.Is(err, ErrHandshakeTimeout) {
+			t.Fatalf("got %v", err)
+		}
+	}
+	attempt() // warm up lazily started runtime goroutines
+	time.Sleep(300 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	for range 5 {
+		attempt()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before+2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines grew from %d to %d over 5 failed Creates", before, runtime.NumGoroutine())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

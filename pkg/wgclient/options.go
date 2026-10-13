@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -34,8 +35,10 @@ type Credential func(ctx context.Context, wgPublicKey string) (string, error)
 // Options configures Create.
 type Options struct {
 	// HubURL is the session API base, e.g. https://wg.teknoir.cloud,
-	// https://wg-device.teknoir.cloud:8084 or http://wg-hub.teknoir-ztna.svc:8080.
-	// Plain http is meant for in-cluster use only; bearer credentials are sent in the clear over it.
+	// https://wg-device.teknoir.cloud:8084 or http://wg-hub.teknoir-ztna.svc:8081.
+	// Plain http is accepted only for in-cluster service names (*.svc,
+	// *.svc.cluster.local), localhost and loopback addresses: bearer
+	// credentials would otherwise cross the network in the clear.
 	HubURL string
 	// Kind is api.KindDevice or api.KindClient.
 	Kind string
@@ -135,10 +138,27 @@ func parseHubURL(raw string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, errors.New("wgclient: HubURL must be http or https")
 	}
+	if u.Scheme == "http" && !plainHTTPAllowed(u.Hostname()) {
+		return nil, errors.New("wgclient: HubURL must use https (plain http is accepted only for in-cluster *.svc names, localhost and loopback addresses)")
+	}
 	if u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("wgclient: HubURL must be scheme://host[:port][/path] without credentials, query or fragment")
 	}
 	return u, nil
+}
+
+// plainHTTPAllowed reports whether bearer credentials may travel over plain
+// http to host: in-cluster service names and loopback only.
+func plainHTTPAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	switch {
+	case host == "localhost", strings.HasSuffix(host, ".localhost"):
+		return true
+	case strings.HasSuffix(host, ".svc"), strings.HasSuffix(host, ".svc.cluster.local"):
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
 }
 
 // hubEndpoint joins the base URL and an API path.

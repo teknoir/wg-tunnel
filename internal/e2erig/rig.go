@@ -36,6 +36,11 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/ssh"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	metafake "k8s.io/client-go/metadata/fake"
 
 	"github.com/teknoir/wg-tunnel/internal/hubtest"
 	"github.com/teknoir/wg-tunnel/internal/turntest"
@@ -78,6 +83,12 @@ type Options struct {
 	// By default the rig approves every identity the agent pins, the way an
 	// admin clicking "Approve identity" in the UI would.
 	ManualApproval bool
+	// FlagsViaWatcher wires the production path of the Device flags: a fake
+	// Device (annotations only) is mirrored by a real hub.FlagsWatcher into
+	// flags ConfigMaps of a fake cluster, which the hub reads through a real
+	// hub.K8sFlagsSource. Change the annotations with Rig.SetDeviceAnnotations
+	// (Rig.Flags is not connected to the hub in this mode).
+	FlagsViaWatcher bool
 }
 
 // Epoch names of the rig's enrollment windows; tests that reset enrollment
@@ -208,6 +219,7 @@ type Rig struct {
 	HubLogs, AgentLogs, ClientLogs *LogBuf
 
 	hostKeysGlob string
+	metaClient   *metafake.FakeMetadataClient
 	secMu        sync.Mutex
 	secrets      map[string]struct{}
 	agentRuns    int
@@ -287,8 +299,12 @@ func New(t testing.TB, opts Options) *Rig {
 	if opts.Hub != nil {
 		opts.Hub(&cfg)
 	}
+	var flags hub.DeviceFlags = r.Flags
+	if opts.FlagsViaWatcher {
+		flags = r.startFlagsWatcher()
+	}
 	h, err := hub.New(cfg, hub.Deps{
-		Policy: r.Policy, Flags: r.Flags, Identity: r.Identity, Users: users, Authz: r.Authz,
+		Policy: r.Policy, Flags: flags, Identity: r.Identity, Users: users, Authz: r.Authz,
 		TURN: hub.NewTURNMinter(func() (string, error) { return TURNSecret, nil },
 			[]string{"turn:" + r.TURN.Addr + "?transport=udp"}, 30*time.Minute, nil),
 	})
@@ -312,6 +328,56 @@ func New(t testing.TB, opts Options) *Rig {
 	r.HubURL = srv.URL
 	Eventually(t, 10*time.Second, "hub ready", h.Ready)
 	return r
+}
+
+// startFlagsWatcher runs the flags watcher against a fake Device and returns
+// the flags source the hub reads.
+func (r *Rig) startFlagsWatcher() hub.DeviceFlags {
+	t := r.T
+	scheme := runtime.NewScheme()
+	must(t, metav1.AddMetaToScheme(scheme))
+	dev := &metav1.PartialObjectMetadata{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "teknoir.org/v1", Kind: "Device"},
+		ObjectMeta: metav1.ObjectMeta{Name: DeviceName, Namespace: NS, Annotations: map[string]string{api.AnnotationWireGuard: "enabled"}},
+	}
+	r.metaClient = metafake.NewSimpleMetadataClient(scheme, dev)
+	cs := fake.NewSimpleClientset()
+	w, err := hub.NewFlagsWatcher(cs, r.metaClient, hub.FlagsWatcherConfig{Namespace: api.HubNamespace, Logger: logger(&LogBuf{})})
+	must(t, err)
+	src, err := hub.NewK8sFlagsSource(cs, api.HubNamespace, logger(&LogBuf{}))
+	must(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	src.Start(ctx)
+	t.Cleanup(func() { cancel(); <-done })
+	Eventually(t, 10*time.Second, "flags to reach the hub", func() bool {
+		e, ok := src.Flags(NS, DeviceName)
+		return src.HasSynced() && ok && e.WireGuard
+	})
+	return src
+}
+
+// SetDeviceAnnotations patches the fake Device's annotations (FlagsViaWatcher
+// only): the given keys are set, the keys with an empty value are removed.
+func (r *Rig) SetDeviceAnnotations(ann map[string]string) {
+	r.T.Helper()
+	if r.metaClient == nil {
+		r.T.Fatal("SetDeviceAnnotations needs Options.FlagsViaWatcher")
+	}
+	patch := map[string]any{}
+	for k, v := range ann {
+		if v == "" {
+			patch[k] = nil
+		} else {
+			patch[k] = v
+		}
+	}
+	body, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": patch}})
+	must(r.T, err)
+	gvr := hub.DeviceGVR
+	_, err = r.metaClient.Resource(gvr).Namespace(NS).Patch(context.Background(), DeviceName, types.MergePatchType, body, metav1.PatchOptions{})
+	must(r.T, err)
 }
 
 func must(t testing.TB, err error) {

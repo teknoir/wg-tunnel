@@ -51,6 +51,9 @@ type Session struct {
 	started  time.Time
 	swapMu   sync.Mutex
 	lastSwap time.Time
+	// lastRenewOK is the time of the last successful renewal: the answer came
+	// through the tunnel, so the tunnel was alive then.
+	lastRenewOK time.Time
 
 	mu      sync.Mutex
 	resp    api.SessionResponse
@@ -120,6 +123,13 @@ func Create(ctx context.Context, opts Options) (*Session, error) {
 	s.address = netip.MustParseAddr(resp.Address)
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if err := s.up(ctx, &priv); err != nil {
+		// The hub already registered the session. If the tunnel came up
+		// (ctx ended right after the handshake) the in-tunnel close frees the
+		// hub's slot at once; without a tunnel there is no way to tell the
+		// hub, which then reaps the session when it expires unrenewed.
+		if s.dev != nil && s.handshook() {
+			s.notifyClose()
+		}
 		s.end(nil)
 		return nil, err
 	}
@@ -351,6 +361,9 @@ func (s *Session) renewLoop() error {
 			return nil
 		}
 		if err == nil {
+			s.swapMu.Lock()
+			s.lastRenewOK = time.Now()
+			s.swapMu.Unlock()
 			s.mu.Lock()
 			s.expires = rr.ExpiresAt
 			if rr.RenewAfterSeconds > 0 {
@@ -380,8 +393,10 @@ func (s *Session) renewLoop() error {
 }
 
 // lastActivity is the latest sign of life of the tunnel: the last WireGuard
-// packet received, the last relay re-allocation (a recovering relay gets the
-// same grace as a fresh one) or the start of the session.
+// packet received, the last successful renewal (the hub never sends
+// keepalives, so on an idle tunnel the renewal response is the only traffic),
+// the last relay re-allocation (a recovering relay gets the same grace as a
+// fresh one) or the start of the session.
 func (s *Session) lastActivity() time.Time {
 	t := s.started
 	if s.bind != nil {
@@ -392,6 +407,9 @@ func (s *Session) lastActivity() time.Time {
 	s.swapMu.Lock()
 	if s.lastSwap.After(t) {
 		t = s.lastSwap
+	}
+	if s.lastRenewOK.After(t) {
+		t = s.lastRenewOK
 	}
 	s.swapMu.Unlock()
 	return t
@@ -410,11 +428,24 @@ func (s *Session) deadTunnel(err error) error {
 		return nil
 	}
 	silent := time.Since(s.lastActivity())
-	if silent <= s.opts.deadAfter() {
+	if silent <= s.deadLimit() {
 		return nil
 	}
 	return fmt.Errorf("%w: no WireGuard packet received for %s and the renewal failed: %v",
 		ErrTunnelDead, silent.Round(time.Second), err)
+}
+
+// deadLimit is how long the tunnel may be silent before a failed renewal ends
+// the session. It is DeadAfter, but never less than what one failed renewal
+// plus its retry needs to elapse after the last successful one (renewAfter +
+// renewTimeout + renewRetry): with the product defaults (60 s renewals, 15 s
+// timeout, 5 s retry, 50 s DeadAfter) a single blip or timeout must not end an
+// idle session that would have recovered.
+func (s *Session) deadLimit() time.Duration {
+	s.mu.Lock()
+	renewAfter := time.Duration(s.resp.RenewAfterSeconds) * time.Second
+	s.mu.Unlock()
+	return max(s.opts.deadAfter(), renewAfter+s.opts.renewTimeout()+s.opts.renewRetry())
 }
 
 // credentialError marks a failure to obtain the bearer credential, which says

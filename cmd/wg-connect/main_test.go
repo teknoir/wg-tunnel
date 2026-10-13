@@ -117,6 +117,9 @@ type rig struct {
 	// atAccept records whether known_hosts already existed when the device's
 	// echo server accepted the first connection.
 	atAccept atomic.Int32 // 0 none, 1 existed, 2 missing
+	// silent makes the device close every connection at once, like a hub
+	// refusal does from the client's point of view (no byte ever arrives).
+	silent atomic.Bool
 }
 
 func newRig(t *testing.T, ho fakehub.Options, withTURN bool) *rig {
@@ -168,6 +171,9 @@ func newRig(t *testing.T, ho fakehub.Options, withTURN bool) *rig {
 			}
 			go func() {
 				defer func() { _ = c.Close() }()
+				if r.silent.Load() {
+					return
+				}
 				_, _ = io.Copy(c, c) // "sshd": echoes
 			}()
 		}
@@ -412,5 +418,34 @@ func TestHubKilledConnectionExitsWhenConnCloses(t *testing.T) {
 	}
 	if res.code == exitOK && res.stderr.String() != "" {
 		t.Fatalf("exit 0 with stderr %q", res.stderr.String())
+	}
+}
+
+// A stream that ends before the device said a byte is a refusal by the hub
+// (offline device, revoked port or access, connection limit): ssh must not be
+// left with a silent exit 0.
+func TestStreamClosedBeforeAnyByteIsAnError(t *testing.T) {
+	r := newRig(t, fakehub.Options{}, true)
+	r.silent.Store(true)
+	var out, errb bytes.Buffer
+	pr, pw := io.Pipe() // ssh keeps its end open while it waits for the banner
+	defer func() { _ = pw.Close() }()
+	done := make(chan int, 1)
+	go func() { done <- run(context.Background(), r.args(), pr, &out, &errb) }()
+	var code int
+	select {
+	case code = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("did not exit")
+	}
+	if code != exitFail {
+		t.Fatalf("exit %d; a refused stream must not look like success", code)
+	}
+	msg := errb.String()
+	if strings.Count(msg, "\n") != 1 || !strings.HasPrefix(msg, "wg-connect: the hub closed the connection before the device answered") {
+		t.Fatalf("stderr = %q", msg)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout %q", out.String())
 	}
 }

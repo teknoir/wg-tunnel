@@ -85,20 +85,32 @@ func (e *fatalError) Error() string { return e.err.Error() }
 
 // hint maps a hub denial to what the operator should do about it.
 var hints = map[string]string{
-	api.ReasonEnrollClosed:   "the enrollment window is closed; an admin must reset enrollment for this device in the Teknoir UI",
-	api.ReasonEnrollConflict: "a different identity is already pinned for this device; an admin must reset enrollment if this is the same device",
-	api.ReasonDeviceRevoked:  "the device is flagged compromised or failed its health check; waiting for an admin to clear the flag",
-	api.ReasonDeviceDisabled: "WireGuard is not enabled for this device",
-	api.ReasonForbidden:      "the hub refused this device",
-	api.ReasonDeviceUnknown:  "the hub has no policy for this device yet",
-	api.ReasonReplay:         "the hub saw a replayed device token",
-	api.ReasonSessionLimit:   "the hub's session limit is reached",
-	api.ReasonPosture:        "the hub rejected this agent's version",
+	api.ReasonEnrollClosed:    "the enrollment window is closed; an admin must reset enrollment for this device in the Teknoir UI",
+	api.ReasonEnrollConflict:  "a different identity is already pinned for this device; an admin must reset enrollment if this is the same device",
+	api.ReasonDeviceRevoked:   "the device is flagged compromised or failed its health check; waiting for an admin to clear the flag",
+	api.ReasonDeviceDisabled:  "WireGuard is not enabled for this device",
+	api.ReasonForbidden:       "the hub refused this device",
+	api.ReasonDeviceUnknown:   "the hub has no policy for this device yet",
+	api.ReasonReplay:          "the hub saw a replayed device token",
+	api.ReasonSessionLimit:    "the hub's session limit is reached",
+	api.ReasonPosture:         "the hub rejected this agent's version",
+	api.ReasonPendingApproval: "an admin must approve this device identity (fingerprint above) in the Teknoir UI",
 }
 
 func (a *Agent) logFailure(err error, wait time.Duration) {
 	if err == nil {
 		err = errors.New("session ended")
+	}
+	if wgclient.ReasonOf(err) == api.ReasonPendingApproval {
+		// Stay enrolled and keep asking: the admin compares this fingerprint
+		// with the one the UI shows for the pinned identity, then approves it.
+		a.mu.Lock()
+		fp := a.loggedFP
+		a.mu.Unlock()
+		a.log.Warn("waiting for admin approval of this device identity",
+			"fingerprint", fp, "retry_in", wait.Round(time.Millisecond).String(),
+			"hint", hints[api.ReasonPendingApproval])
+		return
 	}
 	attrs := []any{"retry_in", wait.Round(time.Millisecond).String(), "error", err.Error()}
 	if reason := wgclient.ReasonOf(err); reason != "" {
@@ -133,6 +145,13 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		switch wgclient.ReasonOf(cerr) {
 		case api.ReasonNotEnrolled:
 			a.log.Info("device identity is not enrolled; enrolling")
+		case api.ReasonUnauthenticated:
+			// The hub shows strangers nothing but "unauthenticated", also for a
+			// device whose pin belongs to another key (a rotated or lost
+			// identity file, or an enrollment window that was reset while this
+			// key never got enrolled). Enrolling is idempotent for the pinned
+			// key and refused with a precise reason for any other.
+			a.log.Info("the hub did not accept the device identity; trying to enroll it")
 		case api.ReasonReenroll:
 			if enrolled {
 				return 0, fmt.Errorf("hub asked to re-enroll right after enrollment: %w", cerr)

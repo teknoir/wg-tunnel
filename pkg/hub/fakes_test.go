@@ -323,6 +323,8 @@ type fakeTunnel struct {
 	adds    int
 	removes int
 	order   []string
+	// dial, when set, handles DialContext.
+	dial func(context.Context, netip.AddrPort) (net.Conn, error)
 }
 
 func newFakeTunnel() *fakeTunnel {
@@ -354,7 +356,10 @@ func (t *fakeTunnel) RemovePeer(pub wgkey.PublicKey) error {
 func (t *fakeTunnel) Listen(netip.AddrPort) (net.Listener, error) {
 	return nil, errors.New("fake tunnel cannot listen")
 }
-func (t *fakeTunnel) DialContext(context.Context, netip.AddrPort) (net.Conn, error) {
+func (t *fakeTunnel) DialContext(ctx context.Context, ap netip.AddrPort) (net.Conn, error) {
+	if t.dial != nil {
+		return t.dial(ctx, ap)
+	}
 	return nil, errors.New("fake tunnel cannot dial")
 }
 func (t *fakeTunnel) peerCount() int {
@@ -371,6 +376,7 @@ const (
 )
 
 type deviceCreds struct {
+	name     string // device name; testDevice when empty
 	rsaKey   *rsa.PrivateKey
 	rsaPEM   []byte // private
 	certPEM  string // public certificate (policy RSAPublicCert)
@@ -417,7 +423,12 @@ func (c *deviceCreds) fingerprint() string {
 	return identity.Fingerprint(c.idPriv.Public().(ed25519.PublicKey))
 }
 
-func (c *deviceCreds) sub() string { return api.DeviceSubject(testNS, testDevice) }
+func (c *deviceCreds) sub() string {
+	if c.name != "" {
+		return api.DeviceSubject(testNS, c.name)
+	}
+	return api.DeviceSubject(testNS, testDevice)
+}
 
 // enrollRequest returns the bearer token and body for an enrollment at `now`.
 func (c *deviceCreds) enrollRequest(t testing.TB, now time.Time) (string, api.EnrollRequest) {

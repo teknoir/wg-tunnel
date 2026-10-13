@@ -140,10 +140,9 @@ func (s *K8sSecretSource) Secret() (string, error) {
 	v, err := s.read()
 
 	s.mu.Lock()
-	switch {
-	case err == nil:
+	if err == nil {
 		s.value, s.fetched, s.lastErr = v, s.now(), nil
-	default:
+	} else {
 		s.lastErr = err
 		if stale != "" {
 			v, err = stale, nil

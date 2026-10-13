@@ -564,15 +564,17 @@ func (h *Hub) authDevice(d *device, tok, ns, name, wgPub string) (int, string) {
 	if d.spec.SkipAuth {
 		return 0, ""
 	}
-	switch {
-	case d.pinned == nil:
+	if d.pinned == nil {
 		return 403, api.ReasonNotEnrolled
-	case d.pinnedGen < d.generation:
-		return 403, api.ReasonReenroll
 	}
+	// Like the real hub: a token that does not verify against the pinned key
+	// is just "unauthenticated"; only the pinned key's owner hears "reenroll".
 	c, err := identity.VerifyIdentityJWT(tok, d.pinned, api.DeviceSubject(ns, name), time.Now())
 	if err != nil || c.WGKey != wgPub {
 		return 401, api.ReasonUnauthenticated
+	}
+	if d.pinnedGen < d.generation {
+		return 403, api.ReasonReenroll
 	}
 	if d.seenJTI[c.ID] {
 		return 401, api.ReasonReplay

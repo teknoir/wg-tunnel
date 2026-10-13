@@ -273,3 +273,169 @@ func TestValidEmail(t *testing.T) {
 		}
 	}
 }
+
+// ---- JWKS outage behaviour ----
+
+// blackHole is a JWKS endpoint that accepts connections and never answers
+// until released.
+type blackHole struct {
+	srv     *httptest.Server
+	hits    atomic.Int32
+	release chan struct{}
+	doc     http.Handler
+}
+
+func newBlackHole(t *testing.T, good http.Handler) *blackHole {
+	t.Helper()
+	b := &blackHole{release: make(chan struct{}), doc: good}
+	b.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.hits.Add(1)
+		select {
+		case <-b.release:
+			b.doc.ServeHTTP(w, r)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(b.release); b.srv.Close() })
+	return b
+}
+
+func TestKeycloakBlackholedJWKSDoesNotSerialiseAuthentication(t *testing.T) {
+	k1 := newKCKey(t, "k1")
+	j := newJWKSServer(t, k1)
+	clock := newFakeClock()
+	v := newKCVerifier(t, j, clock)
+	ctx := context.Background()
+	if _, err := v.Authenticate(ctx, kcToken(t, k1, nil, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keycloak now hangs; the cache is stale.
+	bh := newBlackHole(t, http.NotFoundHandler())
+	v.cfg.JWKSURL = bh.srv.URL
+	v.cfg.HTTPClient = &http.Client{Timeout: 3 * time.Second}
+	v.cfg.StaleWait = 150 * time.Millisecond
+	clock.Advance(11 * time.Minute)
+
+	const callers = 12
+	tokens := make([]string, callers)
+	for i := range tokens {
+		tokens[i] = kcToken(t, k1, nil, clock.Now())
+	}
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := v.Authenticate(ctx, tokens[i])
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a known key must keep working while Keycloak hangs: %v", err)
+		}
+	}
+	// In parallel, each waiting at most StaleWait: nowhere near callers * timeout.
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("%d callers took %v; authentication was serialised behind the hung fetch", callers, took)
+	}
+	if n := bh.hits.Load(); n != 1 {
+		t.Fatalf("%d concurrent fetches; callers must share one", n)
+	}
+	// Later calls do not wait for the hung fetch at all, nor start another.
+	start = time.Now()
+	if _, err := v.Authenticate(ctx, kcToken(t, k1, nil, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 400*time.Millisecond {
+		t.Fatalf("took %v with a fetch in flight", took)
+	}
+	if n := bh.hits.Load(); n != 1 {
+		t.Fatalf("%d fetches", n)
+	}
+}
+
+func TestKeycloakFailedFetchesBackOff(t *testing.T) {
+	k1 := newKCKey(t, "k1")
+	j := newJWKSServer(t, k1)
+	clock := newFakeClock()
+	v := newKCVerifier(t, j, clock)
+	ctx := context.Background()
+	if _, err := v.Authenticate(ctx, kcToken(t, k1, nil, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+	j.fails.Store(true)
+	clock.Advance(11 * time.Minute) // stale
+
+	call := func(kid kcKey) error {
+		_, err := v.Authenticate(ctx, kcToken(t, kid, nil, clock.Now()))
+		return err
+	}
+	hits0 := j.hits.Load()
+	if err := call(k1); err != nil {
+		t.Fatalf("stale known key: %v", err)
+	}
+	waitFor(t, "failed fetch", func() bool { return j.hits.Load() > hits0 })
+	hits1 := j.hits.Load()
+	// Unknown kids and stale keys in a burst: no new fetch within the backoff.
+	unknown := kcKey{kid: "nope", key: k1.key}
+	for range 20 {
+		_ = call(k1)
+		if err := call(unknown); !errors.Is(err, ErrUnavailable) && !errors.Is(err, ErrUnauthenticated) {
+			t.Fatalf("unknown kid during an outage: %v", err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := j.hits.Load(); n != hits1 {
+		t.Fatalf("%d fetches during the backoff; failures must be throttled like successes", n-hits1)
+	}
+	// After the backoff (MinRefresh * 2) one more attempt is made, and when
+	// Keycloak is back the new key set is used.
+	j.fails.Store(false)
+	clock.Advance(3 * time.Second)
+	if err := call(k1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "recovery fetch", func() bool { return j.hits.Load() > hits1 })
+}
+
+func TestKeycloakFetchIgnoresTheCallersContext(t *testing.T) {
+	k1 := newKCKey(t, "k1")
+	j := newJWKSServer(t, k1)
+	clock := newFakeClock()
+	v := newKCVerifier(t, j, clock)
+
+	// The first caller's request is cancelled at once; the fetch it started
+	// must still finish, so the next caller finds the keys.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = v.Authenticate(cctx, kcToken(t, k1, nil, clock.Now()))
+	waitFor(t, "keys cached", func() bool {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		return len(v.keys) == 1
+	})
+	if _, err := v.Authenticate(context.Background(), kcToken(t, k1, nil, clock.Now())); err != nil {
+		t.Fatalf("a cancelled first caller poisoned the cache: %v", err)
+	}
+}
+
+func TestKeycloakTokenIdentity(t *testing.T) {
+	key := newKCKey(t, "k1")
+	j := newJWKSServer(t, key)
+	clock := newFakeClock()
+	v := newKCVerifier(t, j, clock)
+	now := clock.Now()
+	id, err := v.Authenticate(context.Background(), kcToken(t, key, func(c jwt.MapClaims) { c["jti"] = "jti-1" }, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.TokenID != "jti-1" || !id.IssuedAt.Equal(now) {
+		t.Fatalf("identity %+v", id)
+	}
+}

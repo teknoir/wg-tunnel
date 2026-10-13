@@ -47,9 +47,9 @@ type Config struct {
 	// FIN/RST reaches the other side (default 300ms).
 	FlushGrace time.Duration
 
-	MaxSessions         int // default 5000
-	MaxPerNamespace     int // default 200
-	MaxPerSubjectDevice int // default 5
+	MaxSessions         int // new client sessions are refused at this many sessions in total (default 5000); devices only at twice that
+	MaxPerNamespace     int // client sessions per teamspace (default 200); device sessions are exempt
+	MaxPerSubjectDevice int // client sessions of one user per device (default 5)
 	MaxPerSubject       int // client sessions of one user across all devices (default 20)
 	MaxConnsPerSession  int // default 16
 	ReplayCacheSize     int // default 10000
@@ -152,6 +152,7 @@ type Hub struct {
 
 	pendMu  sync.Mutex
 	pending map[devKey]struct{}
+	voiding map[devKey]struct{} // devices whose pin is being voided
 	wake    chan struct{}
 
 	tunnelServing atomic.Bool
@@ -203,6 +204,7 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		perSubj:     map[string]int{},
 		perSubjAll:  map[string]int{},
 		pending:     map[devKey]struct{}{},
+		voiding:     map[devKey]struct{}{},
 		wake:        make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel,
 	}
@@ -301,8 +303,10 @@ func (h *Hub) enforce(k devKey) {
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, k.ns, k.device)
 	if eff.VoidReason != "" {
 		// Sticky revocation: whatever device-controller does or does not see, a
-		// device that was ever flagged needs a NEW identity afterwards.
-		h.voidPin(k, eff.VoidReason)
+		// device that was ever flagged needs a NEW identity afterwards. It runs
+		// beside the enforcer: a slow API server must never delay the teardown
+		// of this or any other device.
+		h.voidPinAsync(k, eff.VoidReason)
 	}
 
 	h.mu.Lock()
@@ -377,6 +381,27 @@ func (h *Hub) enforce(k devKey) {
 // that the agent reconnects and exposes the new set (log and metric label only;
 // not a wire reason).
 const reasonPortsChanged = "ports_changed"
+
+// voidPinAsync starts voidPin unless one is already running for the device.
+func (h *Hub) voidPinAsync(k devKey, reason string) {
+	h.pendMu.Lock()
+	if _, busy := h.voiding[k]; busy {
+		h.pendMu.Unlock()
+		return
+	}
+	h.voiding[k] = struct{}{}
+	h.pendMu.Unlock()
+	h.wg.Add(1) // the enforcer, which calls this, is itself counted: Close cannot be past Wait
+	go func() {
+		defer h.wg.Done()
+		defer func() {
+			h.pendMu.Lock()
+			delete(h.voiding, k)
+			h.pendMu.Unlock()
+		}()
+		h.voidPin(k, reason)
+	}()
+}
 
 // voidPin marks the device's identity pin void. A failure is retried until it
 // works (or the hub stops): the pin must never outlive a flag.

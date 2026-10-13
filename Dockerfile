@@ -33,11 +33,13 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     done
 
 # wg-hub: unprivileged, no TUN device, no capabilities. Listens on UDP 51820
-# (WireGuard), TCP 8080 (session API) and TCP 9090 (metrics).
+# (WireGuard), TCP 8080 (outside session API), TCP 8081 (internal API: service
+# account delegation and direct sessions) and TCP 9090 (metrics). The same
+# binary runs `wg-hub flags-watcher` (metrics and health on 9090).
 FROM ${BASE_IMAGE} AS wg-hub
 COPY --from=build /out/wg-hub /usr/local/bin/wg-hub
 USER 65532:65532
-EXPOSE 8080 9090 51820/udp
+EXPOSE 8080 8081 9090 51820/udp
 ENTRYPOINT ["/usr/local/bin/wg-hub"]
 
 # wg-agent: no shell. The pod's init container runs `wg-agent init` as uid 0

@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -287,8 +288,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 func relayStdio(ctx context.Context, sess *wgclient.Session, conn net.Conn, stdin io.Reader, stdout, stderr io.Writer) int {
 	connDone := make(chan error, 1) // conn -> stdout finished
 	stdinDone := make(chan struct{})
+	var fromDevice atomic.Int64 // bytes the device sent us
 	go func() {
-		_, err := io.Copy(stdout, conn)
+		n, err := io.Copy(stdout, conn)
+		fromDevice.Store(n)
 		connDone <- err
 	}()
 	go func() {
@@ -314,6 +317,14 @@ func relayStdio(ctx context.Context, sess *wgclient.Session, conn net.Conn, stdi
 		}
 		if err != nil {
 			return fail(stderr, exitFail, "connection lost: %s", oneLine(err.Error()))
+		}
+		if fromDevice.Load() == 0 {
+			// The stream ended before the device said a single byte (an ssh
+			// server always speaks first). The hub closes a stream it refuses
+			// (device offline, port or access revoked, connection limit) and
+			// never explains why on the wire; ssh would only report a bare
+			// "Connection closed".
+			return fail(stderr, exitFail, "the hub closed the connection before the device answered (device offline, access or port revoked, or a connection limit was reached)")
 		}
 		return exitOK
 	case <-stdinDone:

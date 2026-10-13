@@ -338,3 +338,84 @@ func TestLogsNeverContainSecrets(t *testing.T) {
 		t.Fatalf("expected log lines missing:\n%s", logs)
 	}
 }
+
+// A pinned identity that nobody approved yet: the agent says so loudly, with
+// its fingerprint for the admin to compare, backs off, stays enrolled (same
+// identity, no re-enrollment) and comes up by itself once approved.
+func TestPendingApprovalIsLoggedAndTheAgentStaysEnrolled(t *testing.T) {
+	r := newRig(t, fakehub.Options{})
+	var pending atomic.Bool
+	pending.Store(true)
+	r.hub.SetOnCreate(func(fakehub.Call) *fakehub.Denial {
+		switch {
+		case r.hub.PinnedKey(testNS, testDevice) == nil:
+			return &fakehub.Denial{Status: 403, Reason: api.ReasonNotEnrolled}
+		case pending.Load():
+			return &fakehub.Denial{Status: 403, Reason: api.ReasonPendingApproval}
+		}
+		return nil
+	})
+	r.start(r.config())
+	eventually(t, 15*time.Second, "repeated pending_approval", func() bool {
+		return strings.Count(r.logs.String(), "waiting for admin approval of this device identity") >= 3
+	})
+	priv, err := identity.LoadOrCreate(r.idDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := identity.Fingerprint(priv.Public().(ed25519.PublicKey))
+	logs := r.logs.String()
+	if !strings.Contains(logs, `"fingerprint":"`+fp+`"`) || !strings.Contains(logs, `"retry_in"`) || !strings.Contains(logs, "approve this device identity") {
+		t.Fatalf("the log must show the fingerprint, the retry delay and what to do:\n%s", logs)
+	}
+	if len(r.hub.SessionIDs(api.KindDevice)) != 0 {
+		t.Fatal("a session exists while approval is pending")
+	}
+	if n := r.hub.Enrollments(testNS, testDevice); n != 1 {
+		t.Fatalf("enrollments = %d; the agent must stay enrolled, not enroll again", n)
+	}
+	if _, err := os.Stat(filepath.Join(r.idDir, identity.PrevKeyFile)); err == nil {
+		t.Fatal("the agent rotated its identity while waiting for approval")
+	}
+
+	pending.Store(false) // the admin approves
+	eventually(t, 15*time.Second, "session after approval", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	if again, _ := identity.LoadOrCreate(r.idDir); !again.Equal(priv) {
+		t.Fatal("identity changed")
+	}
+}
+
+// An identity the hub does not know (the key file was lost or replaced) is
+// answered with a bare "unauthenticated", the same as for a stranger: the agent
+// must try to enroll it rather than retry a session forever.
+func TestAgentWithLostIdentityEnrollsWhenTheWindowOpens(t *testing.T) {
+	r := newRig(t, fakehub.Options{})
+	_, stop := r.start(r.config())
+	eventually(t, 15*time.Second, "first enrollment", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	first := append(ed25519.PublicKey(nil), r.hub.PinnedKey(testNS, testDevice)...)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the first session to close", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 0 })
+	if err := os.RemoveAll(r.idDir); err != nil {
+		t.Fatal(err)
+	}
+	r.hub.SetEnrollOpen(testNS, testDevice, false)
+
+	_, stop2 := r.start(r.config())
+	defer func() { _ = stop2() }()
+	eventually(t, 15*time.Second, "refusals while the window is closed", func() bool {
+		return strings.Count(r.logs.String(), `"reason":"enroll_closed"`) >= 2
+	})
+	if !strings.Contains(r.logs.String(), "trying to enroll it") {
+		t.Fatalf("the agent did not react to the unauthenticated answer:\n%s", r.logs.String())
+	}
+	if len(r.hub.SessionIDs(api.KindDevice)) != 0 {
+		t.Fatal("session without enrollment")
+	}
+	r.hub.ResetEnrollment(testNS, testDevice) // an admin opens a new window
+	eventually(t, 15*time.Second, "enrollment of the new key", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
+	if r.hub.PinnedKey(testNS, testDevice).Equal(first) {
+		t.Fatal("the old key is still pinned")
+	}
+}
