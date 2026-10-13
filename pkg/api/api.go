@@ -269,6 +269,9 @@ const (
 	AnnotationApprovedIdentity  = "ztna.teknoir.org/approved-identity"   // identity fingerprint approved by an admin
 )
 
+// MaxVoidedFingerprints bounds IdentityEntry.VoidedFingerprints.
+const MaxVoidedFingerprints = 32
+
 // FlagSet is the single parser for boolean device annotations, used by the
 // hub, the flags watcher and device-controller alike.
 func FlagSet(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "true") }
@@ -358,6 +361,11 @@ type IdentityEntry struct {
 	Voided       bool      `json:"voided,omitempty"`
 	VoidedReason string    `json:"voidedReason,omitempty"`
 	VoidedAt     time.Time `json:"voidedAt,omitempty"`
+	// VoidedFingerprints is the bounded history (newest last, max
+	// MaxVoidedFingerprints) of every identity ever voided for this device. It
+	// is carried over whenever a pin is replaced, and the hub refuses to pin
+	// any listed fingerprint again, in any epoch.
+	VoidedFingerprints []string `json:"voidedFingerprints,omitempty"`
 	// Conflicts counts rejected enrollments with a DIFFERENT key for this
 	// generation (possible key theft); surfaced in the UI.
 	Conflicts      int       `json:"conflicts,omitempty"`
