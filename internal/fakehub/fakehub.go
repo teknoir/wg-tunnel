@@ -121,6 +121,7 @@ type Hub struct {
 	calls    []Call
 	nextID   int
 	nextIP   int
+	turnPass []string
 }
 
 // New starts a hub; it is stopped by t.Cleanup.
@@ -261,6 +262,13 @@ func (h *Hub) Calls() []Call {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]Call(nil), h.calls...)
+}
+
+// TURNPasswords returns every TURN password the hub issued (for log-leak checks).
+func (h *Hub) TURNPasswords() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.turnPass...)
 }
 
 // SessionIDs lists live sessions of a kind.
@@ -567,6 +575,7 @@ func (h *Hub) mintTURN(s *sess) *api.TURNCredentials {
 		id += "r" + strconv.Itoa(s.rotations)
 	}
 	user, pass, exp := turncred.Generate(h.opts.TURNSecret, s.ns+"/"+id, 30*time.Minute, time.Now())
+	h.turnPass = append(h.turnPass, pass) // caller holds mu
 	return &api.TURNCredentials{URLs: []string{h.opts.TURNURL}, Username: user, Password: pass, ExpiresAt: exp}
 }
 
@@ -652,10 +661,16 @@ func (h *Hub) endSession(s *sess) {
 		}
 	}
 	h.mu.Unlock()
-	_ = h.node.Dev.IpcSet("public_key=" + s.pub.Hex() + "\nremove=true\n")
+	// Close spliced connections BEFORE removing the peer, and give the FINs
+	// time to leave: once the peer is gone nothing reaches the client, whose
+	// TCP connection would then hang until it times out.
 	for _, c := range conns {
 		_ = c.Close()
 	}
+	if len(conns) > 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = h.node.Dev.IpcSet("public_key=" + s.pub.Hex() + "\nremove=true\n")
 	for _, o := range bound {
 		h.endSession(o)
 	}
