@@ -180,10 +180,9 @@ func TestDeviceSessionReplacesPrevious(t *testing.T) {
 	if d, _ := r.h.sessionCounts(); d != 1 {
 		t.Fatalf("device sessions %d", d)
 	}
-	// The old overlay address is quarantined, not reusable at once.
-	if r.h.ipam.InUse() != 1 {
-		t.Fatalf("in use %d", r.h.ipam.InUse())
-	}
+	// The old overlay address is quarantined, not reusable at once. (It is
+	// released right after its peer was removed.)
+	waitFor(t, "old address released", func() bool { return r.h.ipam.InUse() == 1 })
 }
 
 func TestClientSessionHappyPath(t *testing.T) {
@@ -619,9 +618,7 @@ func TestReaperExpiresSessionsAndQuarantinesAddresses(t *testing.T) {
 	}
 	waitFor(t, "peers removed", func() bool { return r.tun.peerCount() == 0 })
 	// The expired device address is not handed out again within the quarantine.
-	if r.h.ipam.InUse() != 0 {
-		t.Fatalf("in use %d", r.h.ipam.InUse())
-	}
+	waitFor(t, "addresses released", func() bool { return r.h.ipam.InUse() == 0 })
 	for range 50 {
 		ip, _ := r.h.ipam.Alloc()
 		if ip.String() == dev.Address {

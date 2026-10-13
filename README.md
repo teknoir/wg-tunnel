@@ -43,7 +43,18 @@ the device at once and tears down its sessions and spliced connections.
 | `KEYCLOAK_ISSUER` / `KEYCLOAK_JWKS_URL` | access-token issuer and key set | `https://auth.<DOMAIN>/auth/realms/master` |
 | `ALLOWED_AZP` | accepted Keycloak `azp` values | `teknoir-cli` |
 | `CLIENT_IP_HEADER` | trusted proxy header with the real client IP (optional) | peer address |
+| `FLUSH_GRACE` | how long a revoked session's WireGuard peer stays after its streams were closed, so the FIN/RST reaches the client and the device | `300ms` |
 | `LOG_LEVEL` | slog level | `info` |
+
+On every teardown the hub started itself (policy or flag change, device
+replacement, maximum age, reaper, a denied renewal) it does this in order:
+detach the session (no new connections or renewals), close its spliced streams
+on both sides, keep the peers for `FLUSH_GRACE`, remove the peer, then release
+the address to quarantine. A client that is still connected therefore sees its
+`Dial`ed connection end within milliseconds. If the tunnel itself dies (peer
+gone, relay lost), `pkg/wgclient` ends the session with `ErrTunnelDead` when a
+renewal fails at the transport level and nothing arrived through WireGuard for
+more than twice the persistent keepalive.
 
 ## Libraries
 
@@ -76,9 +87,42 @@ ssh ProxyCommand: `wg-connect --hub-url U --namespace NS --device D
 --known-hosts-file K [--port 22] [--direct] [--turn-server HOST:PORT] [--ca-file F]`.
 Token files are re-read for every create and renewal; tokens never go in argv or env.
 
+## Images
+
+One `Dockerfile` with two targets, built with CGO off and pinned base images
+(`golang:1.26-alpine`, `gcr.io/distroless/static-debian12:nonroot`, both by
+digest), running as uid 65532. The Go toolchain cross-compiles, so no emulation
+is needed to build for other architectures.
+
+```
+make docker-hub                                   # ghcr.io/teknoir/wg-hub:<version>, linux/amd64, loaded locally
+make docker-agent PLATFORMS=linux/amd64,linux/arm64,linux/arm/v7
+docker run --rm ghcr.io/teknoir/wg-hub:<version> --help
+```
+
+`wg-hub` is published for amd64 and arm64, `wg-agent` for amd64, arm64 and
+arm/v7. The agent's `init` subcommand needs uid 0 (the init container sets
+`runAsUser: 0`); the agent itself runs as 65532. `.github/workflows/build.yml`
+runs `go vet` and `go test -race ./...`, then pushes
+`ghcr.io/teknoir/wg-hub` and `ghcr.io/teknoir/wg-agent` tagged `sha-<7>`,
+`<branch>-<timestamp>`, `<branch>` (and `latest` on main; the git tag itself for tag pushes).
+
 ## Development
 
 `make test` (race detector), `make vet`, `make lint` (golangci-lint v2).
 `internal/turntest` and `internal/wgtest` provide an in-process TURN server and
 WireGuard netstack nodes for tests; `internal/fakehub` is a minimal test double of
 the hub (session, enrollment and renewal API plus a TCP splice) for client-side tests.
+
+`e2e/` runs the whole system in one process (about 15 s): a pion TURN server with
+STUNner-style TURN-REST authentication, the real hub on wireguard-go with the
+in-memory doubles of `internal/hubtest`, the real agent with a generated RSA
+device key and a temporary identity directory, real client sessions with Keycloak
+tokens from a local JWKS server, and a TCP echo server as the fake sshd.
+`internal/e2erig` assembles it; `cmd/wg-connect/e2e_test.go` drives the
+ProxyCommand through it and checks the known_hosts file. Scenarios: enrollment
+and echo over TURN on both legs; device marked compromised (client connection
+fails within 1 s, new sessions `device_revoked`, agent backs off); flag cleared
+with an enrollment reset (new identity fingerprint, access returns); user loses
+access (next connection refused, renewal denied); TURN restart (relays
+recover); log hygiene over all logs.

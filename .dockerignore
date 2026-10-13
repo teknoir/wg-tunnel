@@ -1,0 +1,15 @@
+.git
+.github
+bin
+dist
+*.test
+*.out
+coverage.*
+.idea
+.vscode
+# Never send key material into a build context.
+*.key
+*.pem
+identity.key*
+Dockerfile
+.dockerignore

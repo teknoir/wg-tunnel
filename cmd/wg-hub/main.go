@@ -24,6 +24,20 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "version", "--version":
+			fmt.Println(version.Version)
+			return
+		case "help", "--help", "-h":
+			fmt.Println("wg-hub: WireGuard ZTNA session broker and gateway (" + version.Version + ").\n" +
+				"It takes no arguments; configuration is by environment (POD_IP, DOMAIN, TURN_URLS, KEYCLOAK_ISSUER, ...).\n" +
+				"Usage: wg-hub [version|--help]")
+			return
+		}
+		fmt.Fprintf(os.Stderr, "wg-hub: unexpected argument %q (try --help)\n", os.Args[1])
+		os.Exit(2)
+	}
 	if err := run(); err != nil {
 		slog.New(slog.NewJSONHandler(os.Stderr, nil)).Error("wg-hub failed", "err", err)
 		os.Exit(1)
@@ -110,7 +124,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	flushGrace, err := time.ParseDuration(env("FLUSH_GRACE", "300ms"))
+	if err != nil || flushGrace < 0 {
+		return fmt.Errorf("FLUSH_GRACE must be a non-negative duration such as 300ms: %v", err)
+	}
 	h, err := hub.New(hub.Config{
+		FlushGrace:     flushGrace,
 		Namespace:      hubNS,
 		PodIP:          podIP,
 		WGListenPort:   api.HubWGPort,

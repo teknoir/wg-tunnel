@@ -1,0 +1,105 @@
+name: Build and Push
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      timestamp: ${{ steps.meta.outputs.timestamp }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Timestamp for the image tags
+        id: meta
+        run: echo "timestamp=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+  images:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: wg-hub
+            platforms: linux/amd64,linux/arm64
+          - image: wg-agent
+            platforms: linux/amd64,linux/arm64,linux/arm/v7
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tags
+        id: tags
+        env:
+          TIMESTAMP: ${{ needs.test.outputs.timestamp }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME}"
+          SAFE_REF="${REF//[^A-Za-z0-9._-]/-}"
+          SHA7="${GITHUB_SHA::7}"
+          TAGS="${IMAGE}:sha-${SHA7}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            # A git tag: publish it as is (v1.2.3) and build that version in.
+            VERSION="${SAFE_REF}"
+            TAGS="${TAGS},${IMAGE}:${SAFE_REF}"
+          else
+            VERSION="${SAFE_REF}-${SHA7}"
+            TAGS="${TAGS},${IMAGE}:${SAFE_REF}-${TIMESTAMP},${IMAGE}:${SAFE_REF}"
+            if [ "$REF" = "main" ] || [ "$REF" = "master" ]; then
+              TAGS="${TAGS},${IMAGE}:latest"
+            fi
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.image }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.tags.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
