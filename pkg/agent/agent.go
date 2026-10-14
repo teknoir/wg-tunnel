@@ -61,7 +61,7 @@ func New(cfg Config) (*Agent, error) {
 		sshHost = netip.MustParseAddr(DefaultForwardHost) // a host name cannot be vetted: fall back to loopback
 	}
 	target := &TargetPolicy{
-		ServiceCIDRs: cfg.ServiceCIDRs, ClusterDomain: cfg.ClusterDomain,
+		ServiceCIDRs: cfg.ServiceCIDRs, ClusterCIDRs: cfg.ClusterCIDRs, ClusterDomain: cfg.ClusterDomain,
 		SSHHost: sshHost.Unmap(), SSHPort: cfg.SSHPort,
 		Resolver: cfg.Resolver, NodeIPs: cfg.NodeIPs, AllowTarget: cfg.AllowTarget,
 	}

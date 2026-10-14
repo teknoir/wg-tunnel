@@ -98,7 +98,10 @@ type Config struct {
 	// the k3s default); ClusterDomain the cluster DNS domain (default
 	// cluster.local); SSHPort the sshd port of the implicit ssh service
 	// (default 22; the host is ForwardHost).
-	ServiceCIDRs  []netip.Prefix
+	ServiceCIDRs []netip.Prefix
+	// ClusterCIDRs are the pod networks (default 10.42.0.0/16): external
+	// services pointing into them are refused.
+	ClusterCIDRs  []netip.Prefix
 	ClusterDomain string
 	SSHPort       int
 	// MaxConnsPerService caps concurrent connections of one service (default 128).
@@ -151,6 +154,7 @@ type Config struct {
 //	SSH_HOST_KEYS_GLOB         default /etc/ssh/ssh_host_*_key.pub
 //	FORWARD_HOST               default 127.0.0.1
 //	SERVICE_CIDR               comma-separated k3s service networks, default 10.43.0.0/16
+//	CLUSTER_CIDR               comma-separated k3s pod networks, default 10.42.0.0/16
 //	CLUSTER_DOMAIN             cluster DNS domain, default cluster.local
 //	SSH_PORT                   sshd port of the ssh service, default 22
 //	TURN_SERVER                optional host:port override
@@ -182,6 +186,13 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("agent: SERVICE_CIDR: %w", err)
 		}
 		c.ServiceCIDRs = cidrs
+	}
+	if v := getenv("CLUSTER_CIDR"); v != "" {
+		cidrs, err := ParseServiceCIDRs(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("agent: CLUSTER_CIDR: %w", err)
+		}
+		c.ClusterCIDRs = cidrs
 	}
 	if v := getenv("SSH_PORT"); v != "" {
 		port, err := strconv.Atoi(v)

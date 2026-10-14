@@ -36,16 +36,19 @@ type Resolver interface {
 const (
 	// DefaultServiceCIDR is the k3s default service network.
 	DefaultServiceCIDR = "10.43.0.0/16"
+	// DefaultClusterCIDR is the k3s default pod network.
+	DefaultClusterCIDR = "10.42.0.0/16"
 	// DefaultClusterDomain is the k3s default cluster DNS domain.
 	DefaultClusterDomain = "cluster.local"
 	// DefaultSSHPort is the sshd port the implicit ssh service reaches.
 	DefaultSSHPort = 22
 )
 
-// protectedNodePorts are control-plane ports of a k3s node that no external
-// service may reach on one of the node's own addresses: the API server (6443),
-// kubelet (10250, 10255), etcd (2379, 2380) and the controller manager and
-// scheduler (10257, 10259).
+// protectedNodePorts are control-plane ports of a k3s node: the API server
+// (6443), kubelet (10250, 10255), etcd (2379, 2380) and the controller manager
+// and scheduler (10257, 10259). No external service may use them on ANY
+// address (the other nodes of a multi-node Robot are not known to the agent),
+// and no service of any kind may reach them on one of this node's addresses.
 var protectedNodePorts = map[uint16]bool{6443: true, 10250: true, 10255: true, 2379: true, 2380: true, 10257: true, 10259: true}
 
 // TargetPolicy decides where a service may connect. The agent validates the
@@ -56,10 +59,10 @@ var protectedNodePorts = map[uint16]bool{6443: true, 10250: true, 10255: true, 2
 //   - ssh: fixed to SSHHost:SSHPort (127.0.0.1:22); the spec's target is ignored.
 //   - external: an IP literal; never loopback (except that explicit ssh
 //     target), link-local (169.254/16, fe80::/10), multicast, unspecified,
-//     inside the service CIDR (those must be internal services, where the
-//     kube-system/kubernetes refusals apply), nor one of the node's own
-//     addresses on the control-plane ports (6443, 10250, 10255, 2379, 2380,
-//     10257, 10259).
+//     inside the service CIDR or the pod CIDR (in-cluster targets must be
+//     internal services, where the kube-system/kubernetes refusals apply), and
+//     never on a control-plane port (6443, 10250, 10255, 2379, 2380, 10257,
+//     10259) of ANY address.
 //   - internal: "<svc>.<ns>", resolved to A records only through Resolver using
 //     the fully qualified name <svc>.<ns>.svc.<ClusterDomain>.; every address
 //     must lie inside a service CIDR (so headless services and pod IPs are
@@ -67,7 +70,10 @@ var protectedNodePorts = map[uint16]bool{6443: true, 10250: true, 10255: true, 2
 //     kube-system and default/kubernetes are refused.
 type TargetPolicy struct {
 	// ServiceCIDRs are the cluster's service networks (default 10.43.0.0/16).
-	ServiceCIDRs  []netip.Prefix
+	ServiceCIDRs []netip.Prefix
+	// ClusterCIDRs are the cluster's pod networks (default 10.42.0.0/16);
+	// external services may not point into them.
+	ClusterCIDRs  []netip.Prefix
 	ClusterDomain string
 	// SSHHost and SSHPort are the implicit ssh service's target.
 	SSHHost netip.Addr
@@ -106,6 +112,9 @@ func ParseServiceCIDRs(s string) ([]netip.Prefix, error) {
 func (p *TargetPolicy) applyDefaults() {
 	if len(p.ServiceCIDRs) == 0 {
 		p.ServiceCIDRs = []netip.Prefix{netip.MustParsePrefix(DefaultServiceCIDR)}
+	}
+	if len(p.ClusterCIDRs) == 0 {
+		p.ClusterCIDRs = []netip.Prefix{netip.MustParsePrefix(DefaultClusterCIDR)}
 	}
 	if p.ClusterDomain == "" {
 		p.ClusterDomain = DefaultClusterDomain
@@ -148,6 +157,15 @@ func interfaceIPs() []netip.Addr {
 
 func (p *TargetPolicy) inServiceCIDR(a netip.Addr) bool {
 	for _, c := range p.ServiceCIDRs {
+		if c.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *TargetPolicy) inClusterCIDR(a netip.Addr) bool {
+	for _, c := range p.ClusterCIDRs {
 		if c.Contains(a) {
 			return true
 		}
@@ -223,8 +241,14 @@ func (p *TargetPolicy) resolveExternal(spec api.ServiceSpec) (netip.AddrPort, er
 	if err := p.checkAddr(ap, false); err != nil {
 		return netip.AddrPort{}, err
 	}
+	if protectedNodePorts[ap.Port()] {
+		return netip.AddrPort{}, denied("control-plane port %d is not available to external services", ap.Port())
+	}
 	if p.inServiceCIDR(a) {
 		return netip.AddrPort{}, denied("address is inside the service network; use an internal service")
+	}
+	if p.inClusterCIDR(a) {
+		return netip.AddrPort{}, denied("address is inside the pod network; use an internal service")
 	}
 	return ap, nil
 }

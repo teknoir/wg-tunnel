@@ -76,7 +76,13 @@ func TestExternalTargetRules(t *testing.T) {
 		denied string // substring; empty = allowed
 	}{
 		{"lan host", ext("192.168.1.50", 554), ""},
-		{"lan host on a protected port of ANOTHER host", ext("192.168.1.50", 6443), ""},
+		{"lan host on a protected port of ANOTHER host (a second server node)", ext("192.168.1.50", 6443), "control-plane"},
+		{"a worker node's kubelet", ext("192.168.1.51", 10250), "control-plane"},
+		{"another node's etcd", ext("192.168.1.52", 2379), "control-plane"},
+		{"public address on a control-plane port", ext("203.0.113.7", 6443), "control-plane"},
+		{"a pod address (coredns)", ext("10.42.0.5", 53), "pod network"},
+		{"a pod address on the last network address", ext("10.42.255.254", 80), "pod network"},
+		{"outside the pod network", ext("10.44.0.5", 80), ""},
 		{"public address", ext("203.0.113.7", 443), ""},
 		{"node ssh port is fine", ext("192.168.1.10", 22), ""},
 		{"loopback", ext("127.0.0.1", 8080), "loopback"},
@@ -294,5 +300,27 @@ func TestDialServiceConnects(t *testing.T) {
 	_ = ln.Close()
 	if _, err := p.DialService(context.Background(), spec, time.Second); !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("closed port = %v", err)
+	}
+}
+
+func TestClusterCIDRIsConfigurable(t *testing.T) {
+	c, err := ConfigFromEnv(func(k string) string {
+		return map[string]string{"DEVICE_ID": "d", "NAMESPACE": "n", "DOMAIN": "x.y", "CLUSTER_CIDR": "10.60.0.0/16, fd42::/48"}[k]
+	})
+	if err != nil || len(c.ClusterCIDRs) != 2 {
+		t.Fatalf("%+v %v", c.ClusterCIDRs, err)
+	}
+	if _, err := ConfigFromEnv(func(k string) string {
+		return map[string]string{"DEVICE_ID": "d", "NAMESPACE": "n", "DOMAIN": "x.y", "CLUSTER_CIDR": "nonsense"}[k]
+	}); err == nil {
+		t.Error("a malformed CLUSTER_CIDR was accepted")
+	}
+	p := testPolicy(&fakeResolver{})
+	p.ClusterCIDRs = c.ClusterCIDRs
+	if _, err := p.Resolve(context.Background(), ext("10.60.1.2", 80)); !errors.Is(err, ErrDenied) {
+		t.Errorf("inside the configured pod network: %v", err)
+	}
+	if _, err := p.Resolve(context.Background(), ext("10.42.1.2", 80)); err != nil {
+		t.Errorf("the default pod network is replaced by the configured one: %v", err)
 	}
 }
