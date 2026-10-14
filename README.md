@@ -82,6 +82,7 @@ delegated sessions, the budget is per (service account, email).
 | `CLIENT_IP_HEADER` | trusted proxy header with the real client IP; without it there is no per-IP limit | none |
 | `STATUS_ADDR` | listener for the Backstage live status and admin API (the chart sets `:8082`); off when empty | off |
 | `BACKSTAGE_SA` | full username of the Backstage service account (`system:serviceaccount:<ns>:<name>`), required with `STATUS_ADDR` | |
+| `STATUS_AUDIENCE` | audience of the projected token the Backstage backend presents on the status listener | `teknoir-ztna-status` (`api.StatusTokenAudience`) |
 | `FLUSH_GRACE` | how long a revoked session's WireGuard peer stays after its streams were closed, so the FIN/RST reaches the client and the device | `300ms` |
 | `LOG_LEVEL` | slog level | `info` |
 
@@ -104,16 +105,26 @@ namespace.
 ### Status and admin listener (`STATUS_ADDR`)
 
 A separate port (`api.HubStatusPort`, 8082) for the Backstage backend only; 8081
-is unchanged and no VirtualService routes to it. The caller sends its ordinary
-pod ServiceAccount token. The hub verifies it with a TokenReview WITHOUT
-audiences (the API server's own) and requires the username to equal
-`BACKSTAGE_SA` exactly: a missing or invalid token is 401, any other identity
-403. An AuthorizationPolicy in front admits only the Backstage SA as well.
+is unchanged and no VirtualService routes to it. The caller sends a projected
+ServiceAccount token whose audience is `api.StatusTokenAudience`
+(`teknoir-ztna-status`, overridable with `STATUS_AUDIENCE`), NOT its automounted
+API-server token: the hub runs a TokenReview for that audience only and requires
+the review to confirm it, so a compromised hub (or its logs) never holds a token
+the API server would accept as Backstage. The username must equal `BACKSTAGE_SA`
+exactly: a missing or invalid token (including an API-server token) is 401, any
+other identity 403. An AuthorizationPolicy in front admits only the Backstage SA
+as well. **Deployment:** the Backstage backend pod needs a projected
+`serviceAccountToken` volume with that audience (short `expirationSeconds`) and
+must send that token; until it does, every status call is refused.
 
 - `GET /v1/status/devices/<ns>/<device>` returns `api.DeviceLiveStatus`: whether
   the device is connected and since when, the last WireGuard handshake of its
   peer, transport (`turn`), agent version and capabilities, whether the
-  identity waits for an admin, and its client sessions (subject, service,
+  identity waits for an admin, the hub's own record of the identity pin
+  (`identity`: fingerprint, attested host key and type, enrollment epoch and
+  generation, activation source, voided, conflicts; taken from the identity
+  store, never from the Device CR, whose status device editors can write; the
+  admin actions of Backstage compare against it), and its client sessions (subject, service,
   software, path, since, bytes). `BytesIn` is client to device, `BytesOut` device
   to client; both are counted while the stream runs. `Path` is what the client
   reported on its last renewal (`api.RenewRequest.Path`), `hub` by default.
@@ -121,7 +132,7 @@ audiences (the API server's own) and requires the username to equal
   Unknown device: 404.
 - `POST /v1/admin/sessions/<id>/end` ends a client session like a revocation
   (streams closed, peer removed after the flush grace) and logs a decision
-  `op=admin_end` with the requester from the header `X-Ztna-Requester` (an email,
+  `op=admin_end` with the requester from the header `api.StatusRequesterHeader` (`X-Ztna-Requester`, an email,
   else `unknown`) and the Backstage identity. Device sessions cannot be ended
   here (404).
 
@@ -138,6 +149,16 @@ for that user, dials the agent with the same line (`as` is only logged there),
 and answers the client with one `api.ConnectResponse` line before any byte is
 relayed (`reason` is an `api.Reason*` code on refusal). The quota of such a
 session allows one per service id (32). Renewals take the SA token and no user.
+
+The session is shared by every user of the service, so its connection cap is its
+own (`Config.MaxConnsPerConnSession`, default 256, instead of the 16 of a
+one-user session); the gateway bounds each user (16 open connections, upgraded
+ones included). A WebSocket or an event stream is one connection for hours, so
+the hub authorizes the users of OPEN connections again: on every renewal of the
+gateway session (about once a minute) and every `UserRecheckInterval` (60 s) it
+runs the SubjectAccessReview for each distinct end user that has a connection
+and closes the connections of a user who is denied. An unavailable authorizer
+closes nothing (the next round asks again).
 
 ## Libraries
 
@@ -189,7 +210,24 @@ socket. `NAMESPACE` and `DEVICE_ID` come from its own environment.
   enrolling identity and a nonce it issued to that identity key. It records
   `AttestedHostKey` (`SHA256:<b64>` of the key blob) on the identity. An agent
   that advertises `attest-v1` without a valid attestation is refused
-  (`attest_required`).
+  (`attest_required`). While the policy has a **trusted host key**, an enrollment
+  with no attestation at all is refused too, whatever the agent advertised
+  (`attest_required`): a holder of the legacy enrollment key could otherwise pin
+  an unattested identity that an admin might approve by hand. Manual approval of
+  an unattested identity is therefore impossible until the admin removes the
+  trusted key; an identity pinned before the key was trusted can still be
+  approved, or displaced by an attested enrollment.
+- **Budgets**: enrollment and challenge rate limits, replay partitions and the
+  outstanding-nonce caps (8) are per (device, identity key), with a generous
+  per-device bucket (and 64 nonces) behind them, so a squatter holding the
+  enrollment key drains its own budget and cannot starve the real device. An
+  unattested enrollment of another identity than the pinned one is counted as a
+  conflict even though it is refused.
+- **Re-attestation**: an agent whose identity is pending approval, and that has
+  not delivered an attestation in this process, attests it again every
+  `ReattestInterval` (60 s). The hub accepts it idempotently for the pinned key,
+  so a host key that appeared later or one the admin trusts afterwards activates
+  the pin without any manual step.
 - **Activation rule** (`identityUsable`, one function for session create, renew
   and enforcement): an identity is usable iff it is not voided, its epoch and
   generation are the policy's, and either its fingerprint is the approved one
@@ -214,7 +252,10 @@ address (reachable only from the hub), a connect listener on `api.AgentConnectPo
 and a control listener on `api.AgentControlPort`. The phase-1 per-port listeners
 (`AllowedPorts`) stay. A dialer writes one JSON line (`api.ConnectRequest`,
 at most 1 KiB, 5 s), the agent answers one line (`api.ConnectResponse`) and then
-relays bytes with half-close; at most 16 connections per service (`MaxConnsPerService`).
+relays bytes with half-close; at most 128 connections per service
+(`MaxConnsPerService`, 256 in total) so that one shared web-gateway session
+fits, and per plane-B pair at most 16 (`MaxConnsPerPair`); plane B as a whole
+leaves a quarter of a service's slots to the hub splice.
 
 The agent never dials a host or port taken from the caller: it looks the service
 up in its **current** set (the session response, replaced by the hub's control RPC
@@ -223,14 +264,26 @@ up in its **current** set (the session response, replaced by the hub's control R
 | Kind | Target | Refused |
 |---|---|---|
 | `ssh` (implicit) | `FORWARD_HOST:SSH_PORT` (127.0.0.1:22); the spec is ignored | |
-| `external` | IP literal and port | loopback (the ssh target excepted), 169.254/16, fe80::/10, multicast, unspecified, addresses inside the service CIDR, and the node's own addresses on 6443, 10250, 10255, 2379, 2380, 10257, 10259 |
+| `external` | IP literal and port | loopback (the ssh target excepted), 169.254/16, fe80::/10, multicast, unspecified, addresses inside the service CIDR or the pod CIDR (`CLUSTER_CIDR`, default `10.42.0.0/16`: in-cluster targets must be `internal` services), and the control-plane ports 6443, 10250, 10255, 2379, 2380, 10257, 10259 on ANY address (the other nodes of a multi-node Robot are not known to the agent; internal services additionally refuse the node's own addresses there) |
 | `internal` | `<svc>.<ns>`, resolved as `<svc>.<ns>.svc.<CLUSTER_DOMAIN>.` (A records only) | any address outside `SERVICE_CIDR` (headless services, pod IPs), an answer through a CNAME (ExternalName), `kube-system`, `default/kubernetes` |
 
 `SERVICE_CIDR` (comma-separated, default `10.43.0.0/16`, the k3s default),
-`CLUSTER_DOMAIN` (`cluster.local`) and `SSH_PORT` (`22`) configure it. Internal
+`CLUSTER_CIDR`, `CLUSTER_DOMAIN` (`cluster.local`) and `SSH_PORT` (`22`) configure it.
+Internal services are trusted at the Service level: the agent checks the
+ClusterIP, not the endpoints behind it. The agent's own overlay ports
+(`api.AgentConnectPort`, `api.AgentControlPort`) are never raw ports: the hub drops them
+from `AllowedPorts` and answers `port_not_allowed` to a raw-port client session
+for them (the control port trusts the hub's overlay address). Internal
 services need the pod's cluster DNS (`dnsPolicy: ClusterFirstWithHostNet` for a
 host-network pod). A refusal is `service_denied` on the wire (`internal` for an
 unreachable target, `session_limit` at a cap); the detail is only in the agent's log.
+
+The hub routes a connection to the agent by service id, so it also checks that
+the live agent was TOLD the policy's current definition of the service (what the
+last session response or control push carried): while an edited service has not
+been applied, new connections are refused as `device_offline` (retryable) and no
+plane-B grant is made, instead of reaching the old target. A client session also
+re-checks its service after it was registered, before plane B is granted.
 
 `POST api.ControlGrantsPath` takes a versioned `api.GrantSet` (see `GrantStore` in
 `pkg/agent/grants.go`): `(hubInstance, seq)` ordering, tombstones for removed
@@ -297,7 +350,15 @@ device, found by hole punching, in `pkg/p2p`:
 - **Client**: `Options.P2P` (`wg-connect --p2p`). `Session.DialService` gives
   plane B `api.P2PDialRaceMillis` to establish, dials `deviceB:2224` with the
   `ConnectRequest` preamble and otherwise falls back to the hub splice (`Dial`);
-  after a failure plane B is skipped for 30 s. `Session.Path()` reports
+  after a failure plane B is skipped for 30 s (doubling per failure in a row, at
+  most 5 min); a dial the caller cancelled or timed out is no failure, and the
+  WireGuard handshake a dial failed on stops counting as established.
+  A pong is believed only as the answer to a ping this side sent in the last
+  10 s (once per address it was sent to), so a captured pong cannot be replayed
+  to steer the endpoint. A device session that ends or is replaced drops the
+  clients' pairs on the hub at once (a revocation still pushes one empty grant
+  set while the peer is installed); a client whose pair vanished falls back to the
+  splice. `Session.Path()` reports
   `direct-lan`, `direct` or `hub` and is sent in every renewal. A plane-B problem
   never ends the session.
 
@@ -328,7 +389,11 @@ AuthorizationPolicy admits only the ingress gateway's principal, so
 3. The session of that service is taken from a pool (one per service id,
    created lazily and shared by all users, closed after 15 minutes without
    requests, rebuilt when the hub ends it or the tunnel is found dead).
-4. The request is scrubbed: cookies named `_oauth2*`, `Authorization`,
+4. The request is scrubbed: every platform login cookie (any name containing
+   `oauth2`, such as the real `_teknoir_oauth2_proxy` and its `_csrf` and
+   `_0`/`_1` variants; names starting with `_teknoir`, `KEYCLOAK_`,
+   `AUTH_SESSION_ID`; plus the comma list in `--strip-cookies` / `STRIP_COOKIES`,
+   all case-insensitive), `Authorization`,
    `Proxy-Authorization`, `X-Forwarded-Access-Token`, all `X-Auth-Request-*`,
    oauth2-proxy's `X-Forwarded-User/Email/Groups/Preferred-Username` and
    `X-Ztna-Service` are removed; `X-Forwarded-Host/Proto/For` are set (the
@@ -338,9 +403,12 @@ AuthorizationPolicy admits only the ingress gateway's principal, so
    never shared between users. A connection is authorized when it is opened;
    keep-alive connections are therefore recycled after `ConnMaxAge` (30 s), the
    delay after which a revoked user is checked again. Open WebSockets and
-   streams are not cut by a revocation of the user (the hub cuts them when the
-   session or the device ends).
-6. Responses: `Set-Cookie` named `_oauth2*` is dropped and the `Domain`
+   streams are cut by the hub, which authorizes the users of open connections
+   again at every renewal of the session (see above). A user may hold at most
+   `--max-conns-per-user` (16) connections to a service, upgraded ones
+   included, until they close; the excess waits up to 5 s, then answers 503.
+6. Responses: a `Set-Cookie` with a platform login cookie name (as above) is
+   dropped and the `Domain`
    attribute of the others removed (host-only cookies). WebSockets and
    streaming responses pass through.
 7. Hub refusals become pages: `forbidden` 403, `device_offline` 503, session
