@@ -192,19 +192,86 @@ unreachable target, `session_limit` at a cap); the detail is only in the agent's
 `POST api.ControlGrantsPath` takes a versioned `api.GrantSet` (see `GrantStore` in
 `pkg/agent/grants.go`): `(hubInstance, seq)` ordering, tombstones for removed
 pairs, relative TTLs on the agent's monotonic clock, a changed hub instance drops
-every pair. Plane B itself is not wired yet: grants are accepted and acknowledged
-with empty device parameters, and the `GrantHooks` are where the B peers will be
-added and removed.
+every pair. The `GrantHooks` install and remove the plane-B peers (see below).
 
 Tests that need an external service on a loopback listener use the
 `Config.AllowTarget` test hook (never settable from the environment); the e2e rig
 lets exactly its echo servers through.
 
+### Peer-to-peer (plane B, "P2P-lite")
+
+Plane A (client to hub to device, over TURN) stays the control channel and the
+fallback. Plane B is an end-to-end WireGuard session between a client and a
+device, found by hole punching, in `pkg/p2p`:
+
+- **One UDP socket per side**, with a separate wireguard-go device on a gVisor
+  netstack (MTU `api.P2PMTU`). A demultiplexer in front of the WireGuard bind
+  splits the socket's datagrams into STUN responses (RFC 5389: first bits 00,
+  magic cookie at bytes 4..8, consistent length; no WireGuard message can match),
+  punch probes and WireGuard. Endpoints are raw `ip:port`; roaming does the rest.
+- **Candidates**: host (all up interface addresses, IPv4 and non-link-local IPv6),
+  server-reflexive (STUN Binding to the TURN host, port 3478) and nothing else,
+  at most `api.MaxP2PCandidates`, private first. The agent takes the STUN server
+  from the session's TURN URL (`P2P_STUN` overrides it); the client needs its
+  address before it has a session, so it derives `turn.<domain>:3478` from
+  `https://wg.<domain>` (`Options.P2PSTUN` / `--stun-server` override).
+- **Punching**: both sides send a 38-byte authenticated probe to every candidate
+  of the other every 150 ms (500 ms after 3 s) for up to 20 s. A probe carries a
+  MAC under a key derived from the X25519 secret of the two plane-B keys, so only
+  the pair can make one. The first valid probe from an address moves the
+  WireGuard endpoint there and the **client** (the initiator) starts the
+  handshake. This replaces "cycle the peer endpoint and nudge the keepalive":
+  wireguard-go sends at most one handshake initiation per peer per 5 s
+  (`RekeyTimeout`), so cycling would try one candidate per 5 s. A probe is a hint;
+  nothing trusts an address before a WireGuard handshake completes through it.
+  A responder that loses its session (peer removed and re-added) says so in its
+  probes and the initiator starts over at once.
+- **Addresses**: a session's plane-B address is its plane-A address with the
+  network part replaced (`100.96.x.y` becomes `100.97.x.y`, `p2p.AddrFor`), so
+  the plane-A IPAM and its quarantine cover plane B and no address can be reused
+  while an old pair might still hold it.
+- **Hub**: on a client session request with `P2P` (Keycloak users only, never
+  delegated or direct sessions; a named service; `PolicyEntry.P2P`; an agent with
+  `p2p-v1`, `control-v1` and a plane-B key) the hub validates the offer, adds the
+  pair to the device's **full** grant set (`hubInstance` random per process, `seq`
+  per device session, taken in the same critical section as the membership
+  snapshot), pushes it with a 3 s timeout and returns `SessionResponse.P2P` only
+  if the device acknowledges the pair with the key and address the hub expects.
+  The lease is the grant TTL (`Config.P2PGrantTTL`, default 90 s): each client
+  renewal restarts it and re-pushes once half has passed; the device's renewal
+  response carries the full set (`RenewResponse.Grants`, remaining leases only)
+  as the backstop for a lost push. A client session that ends, a service that
+  goes away, a policy that turns plane B off and a revoked device each push the
+  new set at once.
+- **Agent**: `GrantHooks.Add` installs the peer (`allowed_ip` = the client's /32)
+  and starts probing; `Remove` closes the pair's connections and removes the
+  peer after 250 ms (so the FIN/RST is delivered). The plane-B connect listener
+  on `deviceB:2224` has its own handler: it serves only sources that are the
+  client address of a live grant, only that grant's services, with the same
+  target validation as plane A, per-pair connection caps, and a re-check of the
+  grant after registering. Probe targets never include loopback, link-local or
+  unspecified addresses (a candidate is the client's word).
+- **Client**: `Options.P2P` (`wg-connect --p2p`). `Session.DialService` gives
+  plane B `api.P2PDialRaceMillis` to establish, dials `deviceB:2224` with the
+  `ConnectRequest` preamble and otherwise falls back to the hub splice (`Dial`);
+  after a failure plane B is skipped for 30 s. `Session.Path()` reports
+  `direct-lan`, `direct` or `hub` and is sent in every renewal. A plane-B problem
+  never ends the session.
+
+NAT expectations (measured in `test/natlab`): endpoint-independent mapping on
+both sides punches a direct path; endpoint-dependent mapping on both sides (or
+on one) falls back to the hub. No UPnP, no birthday attack, no hub relay.
+
+Environment of the agent: `P2P=on|off` (default on), `P2P_PORT` (default 0, any),
+`P2P_STUN` (`host:port`). The agent needs only an unprivileged UDP socket and the
+interface listing: `test/smoke-p2p-k3d.sh` runs two probes as uid 65532 with all
+capabilities dropped and a read-only root on the throwaway k3d cluster.
+
 ## wg-connect
 
 ssh ProxyCommand: `wg-connect --hub-url U --namespace NS --device D
 (--sa-token-file F --on-behalf-of EMAIL | --keycloak-token-file F)
---known-hosts-file K [--service ssh | --port 22] [--direct] [--turn-server HOST:PORT] [--ca-file F]`.
+--known-hosts-file K [--service ssh | --port 22] [--direct] [--p2p [--stun-server HOST:PORT]] [--turn-server HOST:PORT] [--ca-file F]`.
 Token files are re-read for every create and renewal; tokens never go in argv or env.
 
 ## Images
@@ -230,6 +297,10 @@ runs `go vet` and `go test -race ./...`, then pushes
 ## Development
 
 `make test` (race detector), `make vet`, `make lint` (golangci-lint v2).
+The NAT lab (Linux network namespaces, needs root, only touches `wgt-*`
+namespaces and interfaces): `go test -c -tags natlab -o /tmp/natlab.test ./test/natlab
+&& sudo /tmp/natlab.test -test.v`; `sudo test/natlab/natlab.sh down` removes it if a run
+was killed. `test/smoke-p2p-k3d.sh` is the k3d smoke test of plane B.
 `internal/turntest` and `internal/wgtest` provide an in-process TURN server and
 WireGuard netstack nodes for tests; `internal/fakehub` is a minimal test double of
 the hub (session, enrollment and renewal API plus a TCP splice) for client-side tests.
