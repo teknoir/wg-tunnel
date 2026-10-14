@@ -118,7 +118,50 @@ namespace.
 (`/etc/teknoir/rsa_private.pem`), `IDENTITY_DIR` (`/var/lib/teknoir/wg-agent`),
 `SSH_HOST_KEYS_GLOB` (`/etc/ssh/ssh_host_*_key.pub`), `FORWARD_HOST` (`127.0.0.1`),
 `TURN_SERVER` (host:port override), `CA_FILE` (extra CAs added to the system
-roots; `/etc/teknoir/roots.pem` if present) and `LOG_LEVEL`.
+roots; `/etc/teknoir/roots.pem` if present), `ATTEST_EXCHANGE` (see below) and `LOG_LEVEL`.
+
+### Host-key attestation and automatic activation
+
+`wg-agent attestor --state /var/lib/teknoir/wg-agent --exchange /run/wg-attest --hostkeys /etc/ssh`
+is a sidecar run as root with **all capabilities dropped** (root owns the 0600
+host keys, so no DAC capability is needed), a read-only `/etc/ssh` and no
+socket. `NAMESPACE` and `DEVICE_ID` come from its own environment.
+
+- The agent (with `ATTEST_EXCHANGE=/run/wg-attest`) asks the hub for a
+  single-use nonce (`api.AttestChallengePath`), writes `request.json`
+  `{nonce, epoch, generation}` into the shared exchange directory and waits up to
+  15 s for `response.json`. The attestor polls once a second, accepts only a
+  regular file of at most 4 KiB owned by uid 65532, reads the identity PUBLIC
+  key from `identity.pub` in the state directory, signs `api.AttestStatement`
+  with the ed25519 host key (RSA host key with `rsa-sha2-512` only when there is
+  no ed25519 one; SSHSIG, `pkg/sshsig`) and writes `response.json` (0644,
+  atomically). One signature per 10 s.
+- The agent verifies the signature locally and sends it in the `EnrollRequest`
+  with capability `attest-v1`. Without `ATTEST_EXCHANGE` it enrolls like a
+  phase-1 agent; against a hub without the challenge endpoint it enrolls without
+  attestation. If the attestor says it cannot sign (no host key), the agent
+  enrolls unattested, and if it does not answer at all the enrollment is retried.
+- The hub verifies the attestation against the CURRENT epoch and generation, the
+  enrolling identity and a nonce it issued to that identity key. It records
+  `AttestedHostKey` (`SHA256:<b64>` of the key blob) on the identity. An agent
+  that advertises `attest-v1` without a valid attestation is refused
+  (`attest_required`).
+- **Activation rule** (`identityUsable`, one function for session create, renew
+  and enforcement): an identity is usable iff it is not voided, its epoch and
+  generation are the policy's, and either its fingerprint is the approved one
+  (`activatedBy: approval`) or `activationMode != "manual"`, `forceManualGeneration
+  < enrollmentGeneration`, `!duplicateHostKey`, `trustedHostKey != ""` and the
+  attested host key equals `trustedHostKey` (`activatedBy: host-key`). The hub
+  records `activatedBy`/`activatedAt` once.
+- **Pin displacement**: an enrollment attested by the trusted host key replaces an
+  existing pin of the same epoch that is not attested by it and not approved by
+  an admin (the displaced fingerprint is voided for good and counted as a
+  conflict).
+
+The state directory is `0711` (the attestor is "other" to it) and `identity.pub`
+is `0644`; `identity.key` stays `0600`. The exchange directory must be writable
+by uid 65532 and by root without capabilities, e.g. a default `emptyDir` (0777).
+`test/smoke-attestor.sh` checks all of this under the device capability set.
 
 ## wg-connect
 
