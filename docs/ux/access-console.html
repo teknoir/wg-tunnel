@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WireGuard access console</title>
+<meta name="description" content="Static prototype of the redesigned WireGuard access console for a Teknoir device (ZTNA phase 2). Not product code.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#000000; --panel:#1C1C1C;
+  --blue:#3B61BF; --purple:#9B357D; --orange:#ED6D36; --green:#1DB954;
+  --red:#FA4E4E; --yellow:#E0AD1B; --white:#FFFFFF; --off:#E0DED9; --silver:#808080; --gray:#3A3A3A;
+  --line:rgba(255,255,255,.10); --line2:rgba(255,255,255,.07);
+  --mono:"ABCDiatypeMono-Regular","JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--white);font-family:var(--mono);font-size:13px;-webkit-font-smoothing:antialiased}
+body{min-height:100vh;overflow-x:hidden;
+  background:
+    radial-gradient(900px 600px at 100% 0%, rgba(59,97,191,.18), transparent 60%),
+    radial-gradient(800px 600px at 0% 100%, rgba(155,53,125,.16), transparent 60%),
+    #000;
+  background-attachment:fixed}
+button,input,select,textarea{font-family:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--off);outline-offset:2px}
+a{color:var(--off)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+/* ---------- product chrome (facsimile, quiet) ---------- */
+.app{display:grid;grid-template-columns:48px 1fr;min-height:100vh}
+.rail{border-right:1px solid var(--blue);background:#000;display:flex;flex-direction:column;align-items:center;padding-top:8px;gap:22px}
+.logo{width:30px;height:30px;display:grid;gap:3px;transform:skewX(-30deg);margin-bottom:10px}
+.logo i{display:block;height:6px}
+.rail .ic{width:18px;height:16px;border:2px solid #cfcfcf;opacity:.85}
+.main{min-width:0}
+.topbar{height:50px;border-bottom:1px solid var(--blue);display:flex;align-items:center;justify-content:space-between;padding:0 24px}
+.topbar .t{letter-spacing:.14em;font-size:14px}
+.topbar .org{text-align:right;font-size:13px}
+.topbar .org small{display:block;font-size:9px;letter-spacing:.14em;color:var(--silver)}
+.ehead{height:40px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;font-size:11px;color:var(--off);border-bottom:1px solid var(--line2)}
+.tabs{display:flex;gap:4px;padding:0 16px;border-bottom:1px solid var(--blue);overflow-x:auto;scrollbar-width:none}
+.tabs a{padding:10px 12px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--silver);text-decoration:none;white-space:nowrap;border-bottom:2px solid transparent}
+.tabs a[aria-current]{color:var(--white);border-bottom-color:var(--blue);background:rgba(59,97,191,.12)}
+.content{position:relative;padding:24px;max-width:1448px}
+.content::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);
+  background-size:40px 40px;mask-image:radial-gradient(circle at 50% 0%,#000 60%,transparent 100%)}
+
+/* ---------- HUD primitives ---------- */
+.panel{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));border:1px solid var(--line);padding:16px;--acc:var(--blue)}
+.tk{position:absolute;width:10px;height:10px;border:0 solid var(--acc);pointer-events:none}
+.tk.a{top:-1px;left:-1px;border-top-width:2px;border-left-width:2px}
+.tk.b{top:-1px;right:-1px;border-top-width:2px;border-right-width:2px}
+.tk.c{bottom:-1px;left:-1px;border-bottom-width:2px;border-left-width:2px}
+.tk.d{bottom:-1px;right:-1px;border-bottom-width:2px;border-right-width:2px}
+.lbl{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--silver)}
+.ph{font-size:15px;font-weight:500;color:var(--white);margin:0}
+.phrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.phrow .count{color:var(--silver);font-weight:400;margin-left:8px}
+.muted{color:var(--silver)}
+.body{font-size:12px;line-height:18px;color:var(--off)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px;margin-top:16px}
+.s12{grid-column:span 12}.s8{grid-column:span 8}.s4{grid-column:span 4}
+.stack{display:grid;gap:16px;align-content:start}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 16px;border-radius:0;border:1px solid rgba(255,255,255,.35);background:transparent;color:var(--off);font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap}
+.btn:hover:not(:disabled){background:rgba(255,255,255,.06)}
+.btn.primary{background:var(--white);color:#000;border-color:var(--white)}
+.btn.primary:hover:not(:disabled){background:var(--off)}
+.btn.green{background:var(--green);color:#000;border-color:var(--green)}
+.btn.danger{background:var(--red);color:#000;border-color:var(--red)}
+.btn.danger-o{color:var(--red);border-color:var(--red)}
+.btn.text{border-color:transparent;padding:0 8px}
+.btn.text.danger-t{color:var(--red)}
+.btn.sm{height:28px;padding:0 10px;font-size:12px}
+.btn:disabled{opacity:.38;cursor:not-allowed}
+.btn.acc{width:100%;background:var(--acc);border-color:var(--acc);color:var(--on-acc,#fff)}
+.iconbtn{width:28px;height:28px;display:inline-grid;place-items:center;border:1px solid transparent;background:transparent;cursor:pointer;color:var(--silver)}
+.iconbtn:hover{border-color:var(--line);color:var(--white)}
+.iconbtn.red{color:var(--red)}
+svg{display:block}
+
+/* ---------- header ---------- */
+.shell{padding:20px}
+.shrow{display:flex;align-items:center;gap:18px}
+.iconbox{width:56px;height:56px;flex-shrink:0;display:grid;place-items:center;background:rgba(255,255,255,.04);border:1px solid var(--acc);box-shadow:0 0 18px color-mix(in srgb,var(--acc) 33%,transparent);color:var(--acc)}
+.shtitle{flex:1;min-width:0}
+.shtitle .sup{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--silver);margin-bottom:4px}
+.shtitle h1{font-size:26px;font-weight:700;line-height:1;margin:0}
+.shtitle .sub{font-size:12px;color:var(--silver);margin-top:8px}
+.stats{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap;justify-content:flex-end}
+.stat{text-align:right;min-width:0}
+.stat .v{font-size:15px;font-weight:500;line-height:20px;white-space:nowrap}
+.stat .lbl{margin-top:3px}
+.live{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:12px;font-size:12px;color:var(--silver)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--green);margin-right:6px;vertical-align:1px}
+.dot.pulse{animation:pulse 1.8s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(29,185,84,.6)}70%{box-shadow:0 0 0 7px rgba(29,185,84,0)}100%{box-shadow:0 0 0 0 rgba(29,185,84,0)}}
+.live.stale{color:var(--yellow)}
+.live.stale .dot{background:transparent;border:1.5px solid var(--yellow)}
+
+/* ---------- identity: the bold element ---------- */
+.idgrid{display:grid;grid-template-columns:minmax(0,1fr) 270px;gap:32px}
+.verdict{border-left:4px solid var(--vc);padding:2px 0 2px 16px;margin-bottom:24px}
+.verdict h3{margin:0;font-size:20px;font-weight:500;line-height:26px;color:var(--vc)}
+.verdict p{margin:6px 0 0;font-size:13px;line-height:20px;color:var(--off);max-width:78ch}
+.cmp{display:flex;gap:16px}
+.cmp-labels{display:grid;grid-template-rows:36px 26px 36px;width:150px;flex-shrink:0}
+.cmp-labels div{display:flex;align-items:center;font-size:12px;color:var(--silver);line-height:15px}
+.legend{display:none;font-size:12px;color:var(--silver);margin-bottom:10px}
+.units{display:flex;flex-wrap:wrap;gap:8px 8px;min-width:0}
+.u{display:grid;grid-template-rows:36px 26px 36px;--i:0}
+.g{display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:500;line-height:1;padding:0 7px;min-width:62px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.03);color:var(--white);white-space:pre}
+.conn{position:relative;display:grid;place-items:center}
+.u.match .g{border-color:rgba(29,185,84,.55)}
+.u.match .conn::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;margin-left:-1px;background:var(--green);transform-origin:top;animation:draw .22s ease-out both;animation-delay:calc(var(--i) * 35ms)}
+.u.miss .g{border-color:var(--red);background:rgba(250,78,78,.13)}
+.u.miss .conn span{color:var(--red);font-size:17px;font-weight:700;animation:fade .2s ease-out both;animation-delay:calc(var(--i) * 35ms)}
+.g .d{text-decoration:underline;text-decoration-color:var(--red);text-decoration-thickness:2px;text-underline-offset:5px;color:#ffd6d6}
+.u.pend .g.bot{border-style:dashed;border-color:rgba(255,255,255,.22);background:transparent;color:transparent}
+.u.pend .conn::before{content:"";position:absolute;top:3px;bottom:3px;left:50%;border-left:2px dashed var(--gray)}
+.u.dim{opacity:.45}
+@keyframes draw{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.cmpsum{margin-top:14px;font-size:13px;color:var(--vc);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.cmpsum .muted{font-size:12px}
+.facts{border-left:1px solid var(--line);padding-left:24px;display:grid;gap:14px;align-content:start}
+.facts .v{font-size:13px;color:var(--white);margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.facts .v.warn{color:var(--orange)}
+.mono-s{font-size:12px;color:var(--off)}
+details.why{margin-top:18px;max-width:80ch}
+details.why summary{cursor:pointer;font-size:12px;color:var(--off);list-style:none;display:inline-flex;align-items:center;gap:6px}
+details.why summary::before{content:"";width:0;height:0;border-left:5px solid var(--silver);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .15s}
+details.why[open] summary::before{transform:rotate(90deg)}
+details.why p{font-size:12px;line-height:18px;color:var(--silver);margin:8px 0 0 11px}
+.paste{margin-top:22px;display:grid;gap:8px;max-width:860px}
+.paste label{font-size:12px;color:var(--off)}
+.field{width:100%;height:36px;padding:0 10px;background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.25);border-radius:0;font-size:12px;color:var(--white)}
+.field:focus{border-color:var(--off);outline:none}
+.field:focus-visible{outline:2px solid var(--off);outline-offset:2px}
+.field.err{border-color:var(--red)}
+.cmd{display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.55);border:1px solid var(--line);padding:0 4px 0 10px;min-height:34px;font-size:12px;color:var(--off);min-width:0}
+.cmd code{flex:1;min-width:0;padding:7px 0;line-height:17px;overflow-wrap:anywhere;font-family:var(--mono)}
+.cmd code::before{content:"$ ";color:var(--silver)}
+.cmd.url code::before{content:""}
+.hint{font-size:12px;line-height:18px;color:var(--silver)}
+.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px;align-items:center}
+.note-y{color:var(--yellow);font-size:12px;line-height:18px;margin:-12px 0 20px 20px}
+
+/* ---------- services ---------- */
+.svcgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.svc{display:flex;flex-direction:column;gap:14px;padding:16px}
+.svc .top{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.sq{width:9px;height:9px;background:var(--acc);flex-shrink:0}
+.svc .name{font-size:15px;font-weight:500;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kind{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--silver);white-space:nowrap}
+.tag{font-size:11px;padding:2px 7px;border:1px solid var(--silver);color:var(--off);white-space:nowrap}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.kv .v{margin-top:4px;font-size:13px;overflow-wrap:anywhere}
+.svc .desc{font-size:12px;color:var(--silver);margin-top:-4px}
+.svc .act{margin-top:auto;display:grid;gap:8px}
+.svc.empty{border-style:dashed;--acc:var(--gray);justify-content:center}
+.svcnote{font-size:12px;margin:-4px 0 14px;color:var(--vc,var(--orange))}
+
+/* ---------- table ---------- */
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--silver);font-weight:400;text-align:left;padding:9px 10px;border-bottom:2px solid var(--blue);background:rgba(255,255,255,.03);white-space:nowrap}
+td{padding:11px 10px;border-bottom:1px solid var(--line2);vertical-align:middle;white-space:nowrap}
+tbody tr:hover{background:rgba(255,255,255,.04);box-shadow:inset 3px 0 0 var(--blue)}
+td.num,th.num{text-align:right}
+.chip{display:inline-block;font-size:11px;padding:2px 8px;border:1px solid var(--c);color:var(--c2,var(--off));white-space:nowrap}
+.you{color:var(--silver);margin-left:6px}
+.emptyrow{padding:22px 10px;color:var(--silver);font-size:12px}
+
+/* ---------- connection ---------- */
+.setting{display:grid;grid-template-columns:1fr auto;gap:4px 14px;padding:12px 0;border-top:1px solid var(--line2)}
+.setting:first-of-type{border-top:0}
+.setting .n{font-size:13px;color:var(--white)}
+.setting .h{grid-column:1/-1;font-size:12px;line-height:18px;color:var(--silver);max-width:60ch}
+.setting .saving{font-size:11px;color:var(--silver);align-self:center}
+.sw{width:38px;height:20px;border:1px solid rgba(255,255,255,.35);background:transparent;position:relative;cursor:pointer;padding:0}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:12px;height:12px;background:var(--silver);transition:left .15s}
+.sw[aria-checked=true]{background:rgba(224,222,217,.18);border-color:var(--off)}
+.sw[aria-checked=true]::after{left:21px;background:var(--off)}
+.sw:disabled{opacity:.45;cursor:not-allowed}
+.seg{display:inline-flex;border:1px solid rgba(255,255,255,.35)}
+.seg button{height:28px;padding:0 10px;border:0;background:transparent;font-size:12px;cursor:pointer;color:var(--off)}
+.seg button[aria-checked=true]{background:var(--off);color:#000}
+.seg button:disabled{cursor:not-allowed;opacity:.6}
+.link{display:grid;gap:4px;padding-bottom:12px}
+.link .v{font-size:13px;line-height:19px}
+
+/* ---------- trust ---------- */
+.trustrow{display:flex;gap:24px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+.flags{font-size:12px;line-height:19px;color:var(--off);max-width:62ch}
+.flags .r{color:var(--red)}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap}
+
+/* ---------- toast ---------- */
+.toasts{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:40;display:grid;gap:10px;width:min(680px,calc(100vw - 32px))}
+.toast{position:relative;background:#0d0d0d;border:1px solid var(--line);padding:12px 12px 12px 16px;display:flex;gap:12px;align-items:flex-start;font-size:12px;line-height:18px;color:var(--off);animation:fade .18s ease-out}
+.toast.err{border-left:3px solid var(--red)}
+.toast.ok{border-left:3px solid var(--green)}
+.toast p{margin:0;flex:1}
+.toast b{color:var(--white);font-weight:500}
+
+/* ---------- dialog ---------- */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:50;display:grid;place-items:center;padding:16px}
+.modal{width:min(560px,100%);max-height:calc(100vh - 32px);overflow:auto;background:linear-gradient(180deg,#1f1f1f,#141414);border:1px solid var(--line);padding:20px;position:relative;--acc:var(--blue)}
+.modal h2{font-size:13px;font-weight:500;letter-spacing:.12em;text-transform:uppercase;margin:0 0 16px}
+.kinds{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:18px}
+.kindopt{position:relative;text-align:left;border:1px solid var(--line);background:rgba(255,255,255,.02);padding:12px;cursor:pointer;--acc:transparent}
+.kindopt[aria-checked=true]{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.22)}
+.kindopt .t{font-size:13px;font-weight:500;color:var(--white);display:flex;gap:8px;align-items:center}
+.kindopt .t .sq{background:var(--k)}
+.kindopt .h{font-size:11px;line-height:16px;color:var(--silver);margin-top:6px}
+.fld{display:grid;gap:6px;margin-bottom:14px;align-content:start}
+.fld > label,.fld .fl{font-size:12px;color:var(--off)}
+.fld .help{font-size:11px;line-height:16px;color:var(--silver)}
+.fld .msg{font-size:11px;line-height:16px;color:var(--red)}
+.fld .msg.warn{color:var(--yellow)}
+.row2{display:grid;grid-template-columns:2fr 1fr;gap:12px}
+.picker{border:1px solid rgba(255,255,255,.25);background:rgba(0,0,0,.5)}
+.picker .field{border:0;border-bottom:1px solid var(--line)}
+.picker ul{list-style:none;margin:0;padding:0;max-height:170px;overflow:auto}
+.picker li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--line2)}
+.picker li:hover{background:rgba(255,255,255,.04)}
+.picker li[aria-selected=true]{background:rgba(59,97,191,.16);box-shadow:inset 3px 0 0 var(--blue)}
+.picker li .n{font-size:13px}
+.picker li .ns{font-size:11px;color:var(--silver)}
+.picker li .p{font-size:11px;color:var(--off);grid-row:1/3;grid-column:2;align-self:center}
+.check{display:flex;gap:10px;align-items:flex-start;font-size:12px;color:var(--off);cursor:pointer}
+.check input{margin:2px 0 0;accent-color:var(--blue);width:15px;height:15px}
+.mact{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:20px}
+
+/* ---------- empty / loading ---------- */
+.emptystate{display:flex;gap:18px;align-items:center;padding:28px 24px}
+.emptystate h2{margin:0;font-size:15px;font-weight:700}
+.emptystate p{margin:6px 0 0;font-size:12px;line-height:18px;color:var(--silver);max-width:70ch}
+.sk{height:14px;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.1),rgba(255,255,255,.05));background-size:200% 100%;animation:sk 1.4s linear infinite;margin:10px 0}
+@keyframes sk{from{background-position:200% 0}to{background-position:0 0}}
+
+/* ---------- prototype switcher (not product UI) ---------- */
+.proto{position:fixed;right:12px;bottom:12px;z-index:60;background:#000;border:1px dashed #555;padding:5px 8px;font-size:11px;color:var(--silver);display:flex;gap:8px;align-items:center;max-width:calc(100vw - 24px)}
+.proto select{font-size:11px;background:#000;color:var(--off);border:1px solid #333;padding:2px 4px}
+
+/* ---------- responsive ---------- */
+@media (max-width:1199px){
+  .svcgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .s8,.s4{grid-column:span 12}
+  .idgrid{grid-template-columns:1fr}
+  .facts{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:16px;grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}
+}
+@media (max-width:899px){
+  .content{padding:16px}
+  .shrow{flex-wrap:wrap}
+  .shright{flex-basis:100%;border-top:1px solid var(--line);padding-top:14px}
+  .stats{width:100%;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));justify-content:stretch;gap:12px}
+  .stat .v{white-space:normal}
+  .units{gap:6px}
+  .g{font-size:16px;min-width:0;padding:0 5px}
+  .stat{text-align:left}
+  .live{justify-content:flex-start}
+  .cmp-labels{display:none}
+  .legend{display:block}
+  .col-client{display:none}
+  .kinds{grid-template-columns:1fr}
+}
+@media (max-width:640px){ .svcgrid{grid-template-columns:1fr} .rail{display:none} .app{grid-template-columns:1fr} }
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail" aria-label="Main">
+    <div class="logo" aria-hidden="true"><i style="background:#ED6D36"></i><i style="background:#9B357D"></i><i style="background:#3B61BF"></i></div>
+    <span class="ic" aria-hidden="true"></span><span class="ic" aria-hidden="true"></span><span class="ic" aria-hidden="true"></span><span class="ic" aria-hidden="true"></span><span class="ic" aria-hidden="true"></span>
+  </nav>
+  <div class="main">
+    <header class="topbar"><div class="t">&lsaquo;&nbsp; RTX2000-ADA-128GB-SE</div><div class="org"><small>TEKNOIR-DEMO</small>Organization Top</div></header>
+    <div class="ehead"><span>RESOURCE &mdash; DEVICE &mdash; RTX2000-ADA-128GB-SE</span><span><b>Owner:</b> teknoir-demo/owner</span></div>
+    <nav class="tabs" aria-label="Device">
+      <a href="#">Overview</a><a href="#">Monitoring</a><a href="#">Configuration</a><a href="#">Settings</a><a href="#">Tunneling</a><a href="#" aria-current="page">WireGuard</a><a href="#">Metadata</a><a href="#">Downloads</a>
+    </nav>
+    <main class="content" id="content" aria-live="off"></main>
+  </div>
+</div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<div id="dlgroot"></div>
+<div class="proto" id="proto" aria-label="Prototype controls"></div>
+
+<script>
+const DEV='rtx2000-ada-128gb-se', DOMAIN='teknoir.cloud';
+const FP={
+  anchor:'eb+w4rp2udRHYG3bzElINPBaTBHesFLnS0nqMHo8W80',
+  other:'tcH7Lvxta0Z0wv3MSM4BtDo7fAN2PAwzVd4Ame4PjHM',
+  wgid:'ju0/FUShfUhTCdqgJqc8xwgPK8SAYZy8yeZ82RmojFw',
+  newid:'RbCkSkLvciC0LWPGUSmvCNZSpRi7yhBJ2h4nj0yyb/8'
+};
+const PASTED_TYPO='{"time":"2026-10-14T15:44:02Z","level":"INFO","msg":"device identity","fingerprint":"SHA256:RbCkSkLvciC0LWPGUSmvCNZ5pRi7yhBJ2h4nj0yyb/8"}';
+const C={green:'#1DB954',blue:'#3B61BF',purple:'#9B357D',orange:'#ED6D36',red:'#FA4E4E',yellow:'#E0AD1B',silver:'#808080',gray:'#3A3A3A'};
+const KIND={ssh:{acc:C.green,on:'#000',label:'SSH'},internal:{acc:C.blue,on:'#fff',label:'k3s service'},external:{acc:C.purple,on:'#fff',label:'Device network'}};
+const ALL_SERVICES=[
+  {id:'ssh',kind:'ssh',target:'127.0.0.1:22',protocol:'TCP'},
+  {id:'grafana',kind:'internal',target:'grafana.monitoring:3000',protocol:'HTTP, in browser',url:'https://wgs-k3v9q2m7x4d1h8n6c5ta.'+DOMAIN,desc:'Device dashboards'},
+  {id:'postgres',kind:'internal',target:'postgres.historian:5432',protocol:'TCP',desc:'Historian database'},
+  {id:'openclaw',kind:'external',target:'127.0.0.1:31789',protocol:'HTTP, in browser',url:'https://wgs-p8r2w6y1z3b5n7m9q4ce.'+DOMAIN,desc:'OpenClaw console'},
+  {id:'camera-dock-2',kind:'external',target:'192.168.10.64:554',protocol:'TCP',desc:'Loading dock camera, RTSP'},
+  {id:'open-notebook',kind:'external',target:'127.0.0.1:30502',protocol:'HTTP',pending:true}
+];
+const SESSIONS=[
+  {user:'anders.aslund@teknoir.ai',you:true,svc:'ssh',kind:'ssh',client:'tnctl',path:'Direct (LAN)',since:'12 min',abs:'15:37',down:'4.1 MB',up:'220 kB'},
+  {user:'claude-agent@teknoir.cloud',svc:'grafana',kind:'internal',client:'Browser',path:'Through hub',since:'3 min',abs:'15:46',down:'18.6 MB',up:'41 kB'},
+  {user:'ops-oncall@teknoir.ai',svc:'postgres',kind:'internal',client:'tnctl',path:'Relayed',since:'41 min',abs:'15:08',down:'312 MB',up:'2.3 MB'}
+];
+const DEVICE_K3S_SERVICES=[
+  {n:'grafana',ns:'monitoring',ports:['3000/TCP http']},
+  {n:'influxdb2',ns:'historian',ports:['8086/TCP http']},
+  {n:'historian-api',ns:'historian',ports:['8080/TCP http','9090/TCP metrics']},
+  {n:'mosquitto',ns:'teknoir',ports:['1883/TCP mqtt']},
+  {n:'postgres',ns:'historian',ports:['5432/TCP']},
+  {n:'nvr-web',ns:'nvr',ports:['8000/TCP http']}
+];
+
+/* ---- states ---- */
+const STATES={
+  active:{label:'Active + direct',state:'Active',sc:C.green,path:'Direct (LAN)',sessions:SESSIONS,act:'Automatic',ac:C.green,id:'auto',services:ALL_SERVICES,svcAvail:true,link:'up',flags:null},
+  waiting:{label:'Waiting for approval',state:'Waiting for approval',sc:C.orange,path:'—',sessions:[],act:'No host key yet',ac:C.orange,id:'waiting',services:ALL_SERVICES.slice(0,1),svcAvail:false,svcNote:'Services open once the device identity is approved.',link:'up',flags:null},
+  mismatch:{label:'Host key mismatch',state:'Blocked',sc:C.red,path:'—',sessions:[],act:'Host key mismatch',ac:C.red,id:'mismatch',services:ALL_SERVICES,svcAvail:false,svcNote:'Services stay closed while the host key does not match.',svcNoteC:C.red,link:'up',flags:null},
+  revoked:{label:'Revoked',state:'Revoked',sc:C.red,path:'—',sessions:[],emptySessions:'No sessions. All sessions ended when access was revoked.',act:'Automatic',ac:C.silver,id:'revoked',services:ALL_SERVICES,svcAvail:false,svcNote:'Access is revoked. Services are unreachable until an admin clears the flags.',svcNoteC:C.red,link:'up',flags:'compromised'},
+  offline:{label:'Device offline',state:'Device offline',sc:C.yellow,path:'—',sessions:[],emptySessions:'No sessions while the device is offline.',act:'Automatic',ac:C.green,id:'offline',services:ALL_SERVICES,svcAvail:false,svcNote:'The device is offline. Services are unreachable until it reconnects.',svcNoteC:C.yellow,link:'down',flags:null},
+  stale:{label:'Stale + error toast',base:'active',stale:true},
+  loading:{label:'Loading',loading:true},
+  off:{label:'Off',state:'Off',sc:C.silver,path:'—',sessions:[],act:'—',ac:C.silver,off:true},
+  dialog:{label:'Add service dialog',base:'active',dialog:true}
+};
+let cur='active', admin=true, pasteVal=PASTED_TYPO, animate=true;
+const sw={wg:true,p2p:true,mode:'auto',term:true};
+
+function resolve(k){const s=STATES[k];return s.base?Object.assign({},STATES[s.base],s,{label:s.label}):s}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ticks=()=>'<span class="tk a"></span><span class="tk b"></span><span class="tk c"></span><span class="tk d"></span>';
+const ICON={
+  key:'<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7.5" cy="12" r="3.5"/><path d="M11 12h10M17 12v3M20 12v2"/></svg>',
+  copy:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11"/><path d="M5 15V4h11"/></svg>',
+  open:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6"/></svg>',
+  trash:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+  term:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>',
+  plus:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>',
+  refresh:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>',
+  x:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>'
+};
+const copyBtn=(text,label)=>`<button class="iconbtn" data-copy="${esc(text)}" aria-label="${esc(label||'Copy')}" title="${esc(label||'Copy')}">${ICON.copy}</button>`;
+const cmd=(text,cls='')=>`<div class="cmd ${cls}"><code>${esc(text)}</code>${copyBtn(text,'Copy command')}</div>`;
+
+/* ---- header ---- */
+function header(s){
+  const live=s.stale
+    ? `<div class="live stale"><span><span class="dot"></span>Stale, last update 2 min ago. Retrying in 5 s.</span><button class="btn sm" data-act="refresh">${ICON.refresh}Refresh</button></div>`
+    : s.loading ? `<div class="live"><span>Loading live status…</span></div>`
+    : `<div class="live"><span><span class="dot pulse" aria-hidden="true"></span>Live, updated 2 s ago</span></div>`;
+  const st=(v,l,c,t)=>`<div class="stat"${t?` title="${esc(t)}"`:''}><div class="v" style="color:${c||'#fff'}">${esc(v)}</div><div class="lbl">${l}</div></div>`;
+  const stats=s.loading?st('—','State')+st('—','Path')+st('—','Sessions')+st('—','Activation')
+    :st(s.state,'State',s.sc)+st(s.path,'Path','#fff',s.pathTitle)+st(String(s.sessions.length),'Sessions')+st(s.act,'Activation',s.ac);
+  return `<section class="panel shell" style="--acc:${s.loading?C.blue:s.sc}" aria-label="WireGuard access summary">${ticks()}
+    <div class="shrow">
+      <div class="iconbox" aria-hidden="true">${ICON.key}</div>
+      <div class="shtitle"><div class="sup">Device · ${DEV.toUpperCase()}</div><h1>WireGuard access</h1><div class="sub">Reach services on this device without exposing it to the internet</div></div>
+      <div class="shright"><div class="stats" aria-live="polite">${stats}</div>${live}</div>
+    </div></section>`;
+}
+
+/* ---- comparison (bold element) ---- */
+function chunks(s){return (s||'').match(/.{1,4}/g)||[]}
+function compareFig(top,bottom,labels,opt={}){
+  const T=chunks(top), B=bottom==null?[]:chunks(bottom);
+  let match=0, units='', sr='';
+  // Character-level marks only help when most groups match (a typo or a truncated paste).
+  // A different key changes every group, so underlining every character adds noise.
+  const anyMatch=T.some((t,i)=>B[i]===t);
+  T.forEach((t,i)=>{
+    const b=B[i];
+    let cls='pend', bot='    ', mark='', topH=esc(t);
+    if(b!==undefined && b.length){
+      if(b===t){cls='match';match++;bot=esc(b)}
+      else{
+        cls='miss';mark='<span aria-hidden="true">≠</span>';
+        if(anyMatch){bot=[...b].map((ch,j)=>ch===t[j]?esc(ch):`<span class="d">${esc(ch)}</span>`).join('');
+        topH=[...t].map((ch,j)=>ch===b[j]?esc(ch):`<span class="d">${esc(ch)}</span>`).join('');}
+        else bot=esc(b);
+      }
+    }
+    sr+=`<li>Group ${i+1}: ${esc(t)}, ${cls==='match'?'match':cls==='miss'?'differs':'not compared'}</li>`;
+    units+=`<div class="u ${cls}${opt.dim?' dim':''}" style="--i:${animate?i:0}" aria-hidden="true"><div class="g">${topH}</div><div class="conn">${mark}</div><div class="g bot">${bot}</div></div>`;
+  });
+  const n=T.length;
+  return {match,n,html:`<figure class="cmpfig" style="margin:0" aria-label="Fingerprint comparison, ${match} of ${n} groups match">
+    <div class="legend">Top: ${esc(labels[0])}. Bottom: ${esc(labels[1])}.</div>
+    <div class="cmp"><div class="cmp-labels" aria-hidden="true"><div>${esc(labels[0])}</div><div></div><div>${esc(labels[1])}</div></div>
+    <div class="units">${units}</div></div><ul class="sr">${sr}</ul></figure>`};
+}
+function parsePasted(v){
+  if(!v)return '';
+  let m=v.split('SHA256:'); let s=m.length>1?m[m.length-1]:v.replace(/\s+/g,'');
+  s=s.replace(/\s+/g,''); const k=s.match(/^[A-Za-z0-9+/]*/); return k?k[0].slice(0,43):'';
+}
+
+/* ---- identity ---- */
+function identity(s){
+  const facts=(rows)=>`<div class="facts">${rows.map(([l,v,cls])=>`<div><div class="lbl">${l}</div><div class="v ${cls||''}">${v}</div></div>`).join('')}</div>`;
+  const wgFact=['WireGuard identity',`<span class="mono-s">SHA256:${FP.wgid.slice(0,8)}…${FP.wgid.slice(-4)}</span>${copyBtn('SHA256:'+FP.wgid,'Copy WireGuard identity fingerprint')}`];
+  const why=`<details class="why"><summary>What this proves</summary><p>Only root on the device can read its SSH host key, so a match shows that the software enrolling is running on the same machine Teknoir saw before. It doesn't protect you if someone already has root on the device, and devices cloned from one image share host keys. In those cases, switch activation to Manual.</p></details>`;
+  let verdict, fig, side, extra='', vc;
+  const right=`<a href="#" class="hint" style="color:var(--off)">How activation works</a>`;
+  if(s.id==='auto'||s.id==='revoked'||s.id==='offline'){
+    vc=s.id==='revoked'?C.red:C.green;
+    const c=compareFig(FP.anchor,FP.anchor,['Seen through tunnel','Signed by device'],{dim:s.id==='revoked'});
+    if(s.id==='revoked'){
+      verdict=`<h3>Access revoked</h3><p>Marked compromised by anders.aslund@teknoir.ai 14 min ago: “Unknown process listening on port 8443.” The identity below still matches, but nobody can connect until an admin clears the flag.</p>`;
+    } else {
+      verdict=`<h3>Activated automatically</h3><p>The device proved it holds the SSH host key Teknoir saw through the SSH tunnel on 12 Oct at 09:14.</p>`;
+    }
+    if(s.id==='offline') extra=`<p class="note-y">The device hasn't been connected to the hub since 15:02 (12 min ago). What you see is its last known state.</p>`;
+    fig=c.html+`<div class="cmpsum"><span${s.id==='revoked'?' style="color:var(--silver)"':''}>${c.match} of ${c.n} groups match</span><span class="muted">Host key SHA256:${FP.anchor.slice(0,8)}… (ed25519)</span></div>`+why;
+    side=facts([['Anchor source','SSH tunnel, 12 Oct'],['Attested','4 min ago'],['Enrollment conflicts','0'],wgFact,['Enrollment','#2, today 15:44']]);
+  } else if(s.id==='waiting'){
+    vc=C.orange;
+    const pv=parsePasted(pasteVal);
+    const c=compareFig(FP.newid,pv,['Presented to Teknoir','From the device log']);
+    const diff=pv? c.n-c.match:0;
+    const ok=pv.length===43&&c.match===c.n;
+    verdict=`<h3>Waiting for approval</h3><p>This device has no SSH host key on record yet, so it can't prove itself automatically. Compare the fingerprint it presented with the one it prints in its log, then approve. Later re-enrollments of this device activate automatically.</p>`;
+    let sum=!pv?`<span class="muted" style="color:var(--silver)">Nothing to compare yet</span>`
+      : ok?`<span style="color:${C.green}">${c.n} of ${c.n} groups match</span>`
+      : `<span style="color:${C.red}">${diff} ${diff===1?'group differs':'groups differ'}. Check for a typo or copy the line again.</span>`;
+    const approve=admin
+      ? `<button class="btn green" data-act="approve" ${ok?'':'disabled aria-describedby="apphint"'}>Approve identity</button>${ok?'':`<span class="hint" id="apphint">${pv?'Approval needs every group to match.':'Paste the device’s fingerprint to enable approval.'}</span>`}`
+      : `<span class="hint">A teamspace admin approves new device identities. Send them this page.</span>`;
+    fig=`<div id="cmpbox">${c.html}<div class="cmpsum">${sum}</div></div>
+      <div class="paste">
+        <div class="hint">On the device, run this and copy the fingerprint it prints:</div>
+        ${cmd("sudo kubectl logs deploy/wg-agent | grep 'device identity'")}
+        <label for="paste" style="margin-top:8px">Paste the fingerprint from the device log</label>
+        <input id="paste" class="field" value="${esc(pasteVal)}" placeholder="SHA256:… or the whole log line" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="actions" id="approveRow">${approve}</div>
+      <p class="hint" style="margin:18px 0 0;max-width:80ch">Or skip the comparison: turn on the SSH tunnel on the <a href="#">Tunneling tab</a>. Teknoir then records the device's host key and activates it without a manual comparison.</p>`;
+    side=facts([['Anchor source','None yet'],['Presented','2 min ago'],['Enrollment conflicts','0'],['Enrollment','#1, today 15:44'],['Activation mode','Automatic after first approval']]);
+  } else if(s.id==='mismatch'){
+    vc=C.red;
+    const c=compareFig(FP.anchor,FP.other,['Seen through tunnel','Signed by device']);
+    verdict=`<h3>Host key mismatch. Access is blocked.</h3><p>The device signed its enrollment with a different SSH host key than the one Teknoir saw through the tunnel on 12 Oct. Either the host keys were changed (an OS reinstall or image rebuild), or another machine is using this device's credentials.</p>`;
+    fig=c.html+`<div class="cmpsum"><span${s.id==='revoked'?' style="color:var(--silver)"':''}>${c.match} of ${c.n} groups match</span><span class="muted">A different key changes every group. Never accept a partial match.</span></div>
+      <div class="actions">
+        <button class="btn" data-act="keep">Keep blocked</button>
+        <button class="btn danger-o" data-act="compromise">Mark compromised</button>
+        ${admin?`<button class="btn" data-act="reset">Reset enrollment</button><button class="btn text danger-t" data-act="anchor">Update anchor</button>`:`<span class="hint">Resetting enrollment or trusting a new host key needs a teamspace admin.</span>`}
+      </div>`;
+    side=facts([['Anchor source','SSH tunnel, 12 Oct'],['Attested','1 min ago'],['Enrollment conflicts','0'],wgFact.map((x,i)=>i?x.replace(FP.wgid.slice(0,8),'Qm4tR2xa'):x),['Enrollment','#3, today 15:58']]);
+  }
+  return `<section class="panel s12" style="--acc:${vc};--vc:${vc}" aria-labelledby="idh">${ticks()}
+    <div class="phrow"><h2 class="ph" id="idh">Identity</h2>${right}</div>
+    <div class="idgrid"><div style="min-width:0"><div class="verdict">${verdict}</div>${extra}${fig}</div>${side}</div></section>`;
+}
+
+/* ---- services ---- */
+function serviceCard(v,avail){
+  const k=KIND[v.kind];
+  const dis=avail?'':'disabled';
+  let act='';
+  if(v.kind==='ssh'){
+    act=(sw.term?`<button class="btn acc" ${dis}>${ICON.term}Open terminal</button>`:'')+cmd(`tnctl ssh --wireguard ${DEV}`);
+  } else if(v.pending){
+    act=`<div class="hint">Usually ready within 10 seconds.</div>`+cmd(`tnctl port-forward --wireguard ${DEV} ${v.id}`);
+  } else if(v.url){
+    act=`<button class="btn acc" ${dis}>${ICON.open}Open</button>`+cmd(v.url,'url');
+  } else {
+    act=cmd(`tnctl port-forward --wireguard ${DEV} ${v.id}`);
+  }
+  return `<article class="panel svc" style="--acc:${k.acc};--on-acc:${k.on}">${ticks()}
+    <div class="top"><span class="sq"></span><span class="name">${esc(v.id)}</span>${v.pending?'<span class="tag">Applying…</span>':`<span class="kind">${k.label}</span>`}
+      ${v.kind!=='ssh'&&admin!==null?`<button class="iconbtn red" aria-label="Remove ${esc(v.id)}" title="Remove service">${ICON.trash}</button>`:''}</div>
+    <div class="kv"><div><div class="lbl">Target</div><div class="v">${esc(v.target)}</div></div><div><div class="lbl">Protocol</div><div class="v">${esc(v.protocol)}</div></div></div>
+    ${v.desc?`<div class="desc">${esc(v.desc)}</div>`:''}
+    <div class="act">${act}</div></article>`;
+}
+function services(s){
+  const list=s.services;
+  const cards=list.map(v=>serviceCard(v,s.svcAvail)).join('');
+  const empty=list.length===1?`<article class="panel svc empty">${ticks()}<p class="body" style="margin:0">Add a service to reach a web app or a port on this device. Use a k3s service for apps in the device's cluster, or an address for things on its network, like a camera.</p><div><button class="btn" data-act="add">${ICON.plus}Add service</button></div></article>`:'';
+  return `<section class="panel s12" style="--acc:${C.gray}" aria-labelledby="svch">${ticks()}
+    <div class="phrow"><h2 class="ph" id="svch">Services<span class="count">${list.length}</span></h2><button class="btn" data-act="add">${ICON.plus}Add service</button></div>
+    ${s.svcNote?`<p class="svcnote" style="--vc:${s.svcNoteC||C.orange}">${s.svcNote}</p>`:''}
+    <div class="svcgrid">${cards}${empty}</div>
+    ${list.length>1?`<p class="hint" style="margin:14px 0 0">tnctl port-forward prints the local port it listens on. Put a port before the service ID to choose it, for example <code>8080:postgres</code>.</p>`:''}</section>`;
+}
+
+/* ---- sessions ---- */
+const PATHC={'Direct (LAN)':C.green,'Direct':C.green,'Relayed':C.blue,'Relayed (strict NAT)':C.blue,'Through hub':C.silver};
+function sessions(s){
+  const rows=s.sessions.map(r=>`<tr><td>${esc(r.user)}${r.you?'<span class="you">you</span>':''}</td>
+    <td><span class="sq" style="--acc:${KIND[r.kind].acc};display:inline-block;margin-right:8px"></span>${esc(r.svc)}</td>
+    <td class="col-client">${r.client}</td>
+    <td><span class="chip" style="--c:${PATHC[r.path]}">${r.path}</span></td>
+    <td title="Since ${r.abs}">${r.since}</td>
+    <td class="num">${r.down} ↓&nbsp; ${r.up} ↑</td>
+    ${admin?`<td class="num"><button class="btn sm text danger-t" data-act="end" data-user="${esc(r.user)}" data-svc="${esc(r.svc)}">End</button></td>`:''}</tr>`).join('');
+  const empty=s.emptySessions||'No one is connected. Sessions appear here within 5 seconds of someone opening a service.';
+  return `<section class="panel" style="--acc:${C.blue}" aria-labelledby="sesh">${ticks()}
+    <div class="phrow"><h2 class="ph" id="sesh">Live sessions<span class="count">${s.sessions.length}</span></h2></div>
+    <div class="tablewrap"><table><thead><tr><th>User</th><th>Service</th><th class="col-client">Client</th><th>Path</th><th>Since</th><th class="num">Data</th>${admin?'<th class="num"><span class="sr">Actions</span></th>':''}</tr></thead>
+    <tbody>${rows||`<tr><td colspan="7" class="emptyrow">${empty}</td></tr>`}</tbody></table></div></section>`;
+}
+
+/* ---- connection ---- */
+function connection(s){
+  const d=!admin?'disabled':'';
+  const linkTxt=s.link==='up'?`Connected to the hub. 38 ms, last handshake 4 s ago.`:`<span style="color:${C.yellow}">Not connected since 15:02.</span>`;
+  const nat=sw.p2p?`Possible from most networks. The device's NAT keeps the same port for every peer.`:`Off. All traffic goes through the hub.`;
+  const swb=(key,label)=>`<button class="sw" role="switch" aria-checked="${sw[key]}" aria-label="${label}" data-sw="${key}" ${d}></button>`;
+  return `<section class="panel" style="--acc:${C.blue}" aria-labelledby="conh">${ticks()}
+    <div class="phrow"><h2 class="ph" id="conh">Connection</h2></div>
+    <div class="link"><div class="lbl">Device link</div><div class="v">${linkTxt}</div></div>
+    <div class="link"><div class="lbl">Direct connections</div><div class="v">${nat}</div></div>
+    <div style="margin-top:6px">
+    <div class="setting"><span class="n">WireGuard access</span>${swb('wg','WireGuard access')}</div>
+    <div class="setting"><span class="n">Direct connections (peer to peer)</span>${swb('p2p','Direct connections')}
+      <span class="h">Off: all traffic goes through the hub, which checks access on every connection. Slower, but access changes apply at once.</span></div>
+    <div class="setting"><span class="n">Activation</span>
+      <div class="seg" role="radiogroup" aria-label="Activation mode"><button role="radio" aria-checked="${sw.mode==='auto'}" data-mode="auto" ${d}>Automatic</button><button role="radio" aria-checked="${sw.mode==='manual'}" data-mode="manual" ${d}>Manual</button></div>
+      <span class="h">Automatic: a new device identity is activated when the device proves it holds the SSH host key Teknoir already knows. Manual: an admin approves every new identity.</span></div>
+    <div class="setting"><span class="n">Web terminal</span>${swb('term','Web terminal')}<span class="h">Lets people open an SSH terminal in the browser.</span></div>
+    ${!admin?'<p class="hint" style="margin:8px 0 0">Only teamspace admins can change these.</p>':''}
+    </div></section>`;
+}
+
+/* ---- trust ---- */
+function trust(s){
+  const flagged=!!s.flags;
+  const txt=flagged
+    ? `<span class="r">Compromised:</span> marked by anders.aslund@teknoir.ai 14 min ago. “Unknown process listening on port 8443.”<br><span class="muted">WireGuard access is blocked and all sessions ended. The device itself keeps running.</span>`
+    : `No flags set. <span class="muted">Last change: flags cleared by anders.aslund@teknoir.ai on 12 Oct (“Testing”).</span>`;
+  const editor=`<button class="btn danger-o" data-act="compromise" ${flagged?'disabled':''}>Mark compromised</button><button class="btn danger-o" data-act="health" ${flagged?'disabled':''}>Mark health check failed</button>`;
+  const adm=admin?(flagged?`<button class="btn primary" data-act="clear">Clear flags</button>`:'')+`<button class="btn" data-act="reset">Reset enrollment</button>`:'';
+  return `<section class="panel" style="--acc:${flagged?C.red:C.gray}" aria-labelledby="trh">${ticks()}
+    <div class="phrow"><h2 class="ph" id="trh">Trust</h2></div>
+    <div class="trustrow"><p class="flags" style="margin:0">${txt}</p>
+    <div class="btnrow">${flagged?adm:editor+adm}</div></div>
+    ${!admin?'<p class="hint" style="margin:12px 0 0">Clearing flags and resetting enrollment need a teamspace admin.</p>':''}
+  </section>`;
+}
+
+/* ---- off + loading ---- */
+function offState(){
+  return `<div class="grid"><section class="panel s12 emptystate" style="--acc:${C.silver}">${ticks()}
+    <div class="iconbox" style="width:48px;height:48px;--acc:${C.silver}" aria-hidden="true">${ICON.key}</div>
+    <div style="flex:1"><h2>WireGuard access is off for this device</h2><p>Turn it on to reach SSH and the services you add here through an encrypted tunnel, without opening ports on the device. The SSH tunnel on the Tunneling tab is not affected.</p></div>
+    ${admin?`<button class="btn primary" data-act="turnon">Turn on WireGuard</button>`:`<span class="hint">Ask a teamspace admin to turn it on.</span>`}
+  </section></div>`;
+}
+function loadingState(){
+  const sk=(w)=>`<div class="sk" style="width:${w}"></div>`;
+  return `<div class="grid"><section class="panel s12" style="--acc:${C.gray}">${ticks()}<h2 class="ph">Identity</h2>${sk('40%')}${sk('70%')}${sk('90%')}${sk('90%')}</section>
+  <section class="panel s12" style="--acc:${C.gray}">${ticks()}<h2 class="ph">Services</h2>${sk('30%')}${sk('60%')}</section></div>`;
+}
+
+/* ---- dialog ---- */
+const dlg={kind:'internal',sel:'influxdb2',q:'',id:'influxdb2-historian-api',proto:'http',publish:true,ip:'',port:'',touched:{id:true}};
+function idMsg(id){
+  if(!id)return 'Enter an ID.';
+  if(id==='ssh')return 'ssh is reserved for the device’s SSH service.';
+  if(!/^[a-z][a-z0-9-]*$/.test(id))return 'Use lowercase letters, digits and dashes, starting with a letter.';
+  if(id.length>20)return `Use at most 20 characters (${id.length} now).`;
+  if(ALL_SERVICES.some(v=>v.id===id))return `This device already has a service called ${id}.`;
+  return '';
+}
+function ipMsg(ip){
+  if(!ip)return 'Enter an IP address.';
+  if(/[a-z]/i.test(ip))return 'Enter an IP address. Services don’t use host names, so a changed DNS record can’t redirect them.';
+  const p=ip.split('.');if(p.length!==4||p.some(x=>!/^\d{1,3}$/.test(x)||+x>255))return 'Enter an IPv4 address like 192.168.10.64.';
+  return '';
+}
+function portMsg(p){if(!p)return 'Enter a port.';if(!/^\d+$/.test(p)||+p<1||+p>65535)return 'Enter a port from 1 to 65535.';return ''}
+function dialogHtml(){
+  const svc=DEVICE_K3S_SERVICES.find(x=>x.n===dlg.sel);
+  const list=DEVICE_K3S_SERVICES.filter(x=>!dlg.q||(x.n+x.ns).includes(dlg.q));
+  const im=idMsg(dlg.id), ipm=dlg.kind==='external'&&dlg.touched.ip?ipMsg(dlg.ip):'', pm=dlg.kind==='external'&&dlg.touched.port?portMsg(dlg.port):'';
+  const valid=!im&&(dlg.kind==='internal'?!!svc:!ipMsg(dlg.ip)&&!portMsg(dlg.port));
+  const kindTile=(k,t,h)=>`<button class="kindopt" role="radio" aria-checked="${dlg.kind===k}" data-kind="${k}" style="--k:${KIND[k].acc};--acc:${dlg.kind===k?KIND[k].acc:'transparent'}">${dlg.kind===k?ticks():''}<span class="t"><span class="sq"></span>${t}</span><span class="h" style="display:block">${h}</span></button>`;
+  const target=dlg.kind==='internal'?`
+    <div class="fld"><span class="fl" id="pickl">k3s service</span>
+      <div class="picker"><input class="field" id="q" placeholder="Filter by name or namespace" value="${esc(dlg.q)}" aria-label="Filter services">
+      <ul role="listbox" aria-labelledby="pickl">${list.map(x=>`<li role="option" tabindex="0" aria-selected="${x.n===dlg.sel}" data-sel="${x.n}"><span class="n">${x.n}</span><span class="ns">${x.ns}</span><span class="p">${x.ports.join(', ')}</span></li>`).join('')||'<li class="ns">No match.</li>'}</ul></div></div>
+    <div class="fld"><label for="port">Port</label><select id="port" class="field">${(svc?svc.ports:[]).map(p=>`<option>${p}</option>`).join('')}</select></div>`
+  :`<div class="row2"><div class="fld"><label for="ip">IP address</label><input id="ip" class="field ${ipm?'err':''}" placeholder="192.168.10.64" value="${esc(dlg.ip)}" ${ipm?'aria-invalid="true" aria-describedby="ipm"':''}>${ipm?`<span class="msg" id="ipm">${ipm}</span>`:''}</div>
+     <div class="fld"><label for="eport">Port</label><input id="eport" class="field ${pm?'err':''}" placeholder="554" inputmode="numeric" value="${esc(dlg.port)}" ${pm?'aria-invalid="true" aria-describedby="pm"':''}>${pm?`<span class="msg" id="pm">${pm}</span>`:''}</div></div>`;
+  return `<div class="scrim" data-act="closebg"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlgt">${ticks()}
+    <h2 id="dlgt">Add service</h2>
+    <div class="kinds" role="radiogroup" aria-label="Kind of service">
+      ${kindTile('internal','k3s service','An app in the device’s cluster, reached by its Service name.')}
+      ${kindTile('external','Device network address','Something on the device’s network, like a camera or a local web UI.')}
+    </div>
+    ${target}
+    <div class="fld"><label for="sid">ID</label><input id="sid" class="field ${im?'err':''}" value="${esc(dlg.id)}" spellcheck="false" ${im?'aria-invalid="true" aria-describedby="sidm"':''}>
+      ${im?`<span class="msg" id="sidm">${im}</span>`:'<span class="help">Used in tnctl commands and the browser address.</span>'}</div>
+    <div class="fld"><span class="fl" id="protol">Protocol</span><div class="seg" role="radiogroup" aria-labelledby="protol" style="width:max-content"><button role="radio" aria-checked="${dlg.proto==='http'}" data-proto="http">HTTP</button><button role="radio" aria-checked="${dlg.proto==='tcp'}" data-proto="tcp">TCP</button></div></div>
+    ${dlg.proto==='http'?`<div class="fld"><label class="check"><input type="checkbox" id="pub" ${dlg.publish?'checked':''}><span>Publish in the browser<span class="help" style="display:block;margin-top:3px">Gives signed-in teamspace members an address like https://wgs-….${DOMAIN}.</span></span></label></div>`:''}
+    <div class="fld"><label for="desc">Description <span class="muted">(optional)</span></label><input id="desc" class="field" placeholder="What people will find here"></div>
+    <div class="mact"><button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="addok" ${valid?'':'disabled'}>Add service</button></div>
+  </div></div>`;
+}
+function openDialog(){document.body.style.overflow='hidden';document.getElementById('dlgroot').innerHTML=dialogHtml();const f=document.querySelector('.modal .kindopt[aria-checked=true]');f&&f.focus({preventScroll:true})}
+function rerenderDialog(focusId){const a=document.activeElement, id=focusId||(a&&a.id), pos=a&&a.selectionStart;document.getElementById('dlgroot').innerHTML=dialogHtml();if(id){const e=document.getElementById(id);if(e){e.focus({preventScroll:true});try{e.setSelectionRange(pos,pos)}catch(_){}}}}
+function closeDialog(){document.body.style.overflow='';document.getElementById('dlgroot').innerHTML='';if(cur==='dialog'){setState('active',false)}}
+
+/* ---- toasts ---- */
+function toast(kind,html){
+  const t=document.createElement('div');t.className='toast '+kind;
+  t.innerHTML=`<p>${html}</p><button class="iconbtn" aria-label="Dismiss">${ICON.x}</button>`;
+  t.querySelector('button').onclick=()=>t.remove();
+  document.getElementById('toasts').appendChild(t);
+  if(kind==='ok')setTimeout(()=>t.remove(),5000);
+}
+
+/* ---- render ---- */
+function render(){
+  const s=resolve(cur);
+  const el=document.getElementById('content');
+  if(s.loading){el.innerHTML=header(s)+loadingState();return}
+  if(s.off){el.innerHTML=header(s)+offState();return}
+  el.innerHTML=header(s)+`<div class="grid">${identity(s)}${services(s)}
+    <div class="s8 stack">${sessions(s)}${trust(s)}</div><div class="s4 stack">${connection(s)}</div></div>`;
+}
+function setState(k,push=true){
+  cur=k;animate=true;document.getElementById('toasts').innerHTML='';
+  if(k==='waiting')pasteVal=PASTED_TYPO;
+  render();
+  const s=resolve(k);
+  document.getElementById('dlgroot').innerHTML='';document.body.style.overflow='';
+  if(s.dialog)openDialog();
+  if(s.stale)toast('err','<b>Couldn’t refresh:</b> GET /api/teknoir-entity/devices/teknoir-demo/rtx2000-ada-128gb-se/ztna returned 503: hub status unavailable (dial tcp 10.43.12.7:8081: connect: connection refused). Showing what was known 2 min ago.');
+  if(push)history.replaceState(null,'','#'+k+(admin?'':',member'));
+  proto();
+}
+function proto(){
+  document.getElementById('proto').innerHTML=`<label>Prototype <select id="pstate">${Object.keys(STATES).map(k=>`<option value="${k}" ${k===cur?'selected':''}>${STATES[k].label}</option>`).join('')}</select></label>
+  <label>as <select id="prole"><option value="admin" ${admin?'selected':''}>admin</option><option value="member" ${admin?'':'selected'}>member</option></select></label>`;
+}
+
+/* ---- events ---- */
+document.addEventListener('click',e=>{
+  const b=e.target.closest('button,[data-sel],[data-act=closebg]');
+  if(!b)return;
+  if(b.dataset.copy!==undefined){navigator.clipboard&&navigator.clipboard.writeText(b.dataset.copy).catch(()=>{});b.setAttribute('aria-label','Copied');b.title='Copied';b.style.color=C.green;setTimeout(()=>{b.style.color='';b.title='Copy'},1200);return}
+  if(b.dataset.sw){if(b.disabled)return;sw[b.dataset.sw]=!sw[b.dataset.sw];b.setAttribute('aria-checked',sw[b.dataset.sw]);const sv=document.createElement('span');sv.className='saving';sv.textContent='Saving…';b.before(sv);setTimeout(()=>{sv.remove();animate=false;render()},700);return}
+  if(b.dataset.mode){sw.mode=b.dataset.mode;animate=false;render();return}
+  if(b.dataset.kind){dlg.kind=b.dataset.kind;if(dlg.kind==='external'){dlg.id='';dlg.proto='tcp'}else{dlg.id='influxdb2';dlg.proto='http'}rerenderDialog();return}
+  if(b.dataset.proto){dlg.proto=b.dataset.proto;rerenderDialog();return}
+  if(b.dataset.sel){dlg.sel=b.dataset.sel;dlg.id=b.dataset.sel.slice(0,20);rerenderDialog();return}
+  const a=b.dataset.act;
+  if(a==='closebg'){if(e.target===b)closeDialog();return}
+  if(a==='add'){openDialog();return}
+  if(a==='close'){closeDialog();return}
+  if(a==='addok'){const id=dlg.id;closeDialog();toast('ok',`<b>${esc(id)} added.</b> It’s ready in a few seconds.`);return}
+  if(a==='approve'){b.disabled=true;b.textContent='Approving…';setTimeout(()=>{setState('active');toast('ok','<b>Identity approved.</b> The device connects within a few seconds.')},900);return}
+  if(a==='keep'){toast('ok','<b>Device stays blocked.</b>');return}
+  if(a==='end'){toast('ok',`<b>Session ended.</b> ${esc(b.dataset.user)} lost the ${esc(b.dataset.svc)} connection.`);return}
+  if(a==='refresh'){toast('err','<b>Couldn’t refresh:</b> still 503 from the hub status endpoint. Retrying every 10 s.');return}
+});
+document.addEventListener('change',e=>{
+  const t=e.target;
+  if(t.id==='pstate'){setState(t.value);return}
+  if(t.id==='prole'){admin=t.value!=='member';animate=false;render();if(resolve(cur).dialog)openDialog();history.replaceState(null,'','#'+cur+(admin?'':',member'));proto();return}
+});
+document.addEventListener('input',e=>{
+  const t=e.target;
+  if(t.id==='paste'){pasteVal=t.value;animate=true;const s=resolve(cur);const tmp=document.createElement('div');tmp.innerHTML=identity(s);
+    document.getElementById('cmpbox').innerHTML=tmp.querySelector('#cmpbox').innerHTML;document.getElementById('approveRow').innerHTML=tmp.querySelector('#approveRow').innerHTML;return}
+  if(t.id==='sid'){dlg.id=t.value;rerenderDialog('sid');return}
+  if(t.id==='q'){dlg.q=t.value;rerenderDialog('q');return}
+  if(t.id==='ip'){dlg.ip=t.value;dlg.touched.ip=true;rerenderDialog('ip');return}
+  if(t.id==='eport'){dlg.port=t.value;dlg.touched.port=true;rerenderDialog('eport');return}
+  if(t.id==='pub'){dlg.publish=t.checked;return}
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&document.querySelector('.scrim'))closeDialog();
+  if((e.key==='Enter'||e.key===' ')&&e.target.dataset&&e.target.dataset.sel){e.preventDefault();e.target.click()}
+});
+(function init(){
+  const h=(location.hash||'#active').slice(1).split(',');
+  if(h.includes('member'))admin=false;
+  setState(STATES[h[0]]?h[0]:'active',false);
+})();
+</script>
+</body>
+</html>

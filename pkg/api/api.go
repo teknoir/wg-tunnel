@@ -89,6 +89,11 @@ type EnrollRequest struct {
 	IdentityPublicKey string  `json:"identityPublicKey"`
 	Proof             string  `json:"proof"`
 	Posture           Posture `json:"posture"`
+	// Capabilities the agent supports (CapAttest => an unattested enrollment
+	// from this agent is shown as suspicious).
+	Capabilities []string `json:"capabilities,omitempty"`
+	// HostKeyAttestations (CapAttest) over AttestStatement for this identity.
+	HostKeyAttestations []HostKeyAttestation `json:"hostKeyAttestations,omitempty"`
 }
 
 // EnrollProofMessage is the byte string the identity key signs at enrollment.
@@ -131,8 +136,12 @@ type TURNCredentials struct {
 // DeviceSessionRequest is posted by wg-agent. WGPublicKey is base64 (wg format),
 // freshly generated per session and never persisted.
 type DeviceSessionRequest struct {
-	WGPublicKey string  `json:"wgPublicKey"`
-	Posture     Posture `json:"posture"`
+	WGPublicKey string `json:"wgPublicKey"`
+	// Capabilities (Cap*) the agent supports; absent = phase-1 agent.
+	Capabilities []string `json:"capabilities,omitempty"`
+	// P2PWGPublicKey is the agent's plane-B key for this device session (CapP2P).
+	P2PWGPublicKey string  `json:"p2pWgPublicKey,omitempty"`
+	Posture        Posture `json:"posture"`
 	// SSHHostKeys are the device's sshd host public keys in authorized_keys
 	// format ("ssh-ed25519 AAAA..."), read by the agent from /etc/ssh/*.pub.
 	// The hub hands them to clients so ssh runs with StrictHostKeyChecking=yes.
@@ -155,6 +164,11 @@ type ClientSessionRequest struct {
 	// Direct asks for direct UDP to HubEndpoint (in-cluster clients); no TURN
 	// credentials are minted.
 	Direct bool `json:"direct,omitempty"`
+	// Service is the service ID (phase 2). Empty = Port 22 = "ssh".
+	Service string `json:"service,omitempty"`
+	// P2P is set by clients that can do plane B (tnctl); the hub answers with
+	// SessionResponse.P2P if the device accepted the pair.
+	P2P *P2POffer `json:"p2p,omitempty"`
 }
 
 // SessionResponse is returned on 201 Created for both session kinds.
@@ -180,6 +194,11 @@ type SessionResponse struct {
 	// Client sessions: dial HubAddress:SplicePort; the hub splices to Device:TargetPort.
 	SplicePort int `json:"splicePort,omitempty"`
 	TargetPort int `json:"targetPort,omitempty"`
+	// Device sessions (CapServices): the device's services.
+	Services []ServiceSpec `json:"services,omitempty"`
+	// Client sessions: the granted service and, if any, the plane-B grant.
+	Service string    `json:"service,omitempty"`
+	P2P     *P2PGrant `json:"p2p,omitempty"`
 	// Client sessions: the device's SSH host keys as reported by its
 	// identity-authenticated agent. Clients write them to a known_hosts file
 	// under HostKeyAlias = KnownHostsAlias(ns, device).
@@ -222,6 +241,10 @@ const (
 	ReasonEnrollConflict  = "enroll_conflict"  // a different identity is already pinned
 	ReasonSessionLimit    = "session_limit"    // per-subject/per-device session cap reached
 	ReasonPendingApproval = "pending_approval" // identity pinned, waiting for an admin to approve its fingerprint
+	ReasonServiceUnknown  = "service_unknown"  // requested service is not defined for the device
+	ReasonServiceDenied   = "service_denied"   // service target refused by validation on the agent
+	ReasonP2PUnavailable  = "p2p_unavailable"  // device cannot do plane B (capability, opt-out, timeout)
+	ReasonAttestRequired  = "attest_required"  // agent advertised CapAttest but sent no valid attestation
 	ReasonReplay          = "replay"           // device JWT jti reused
 	ReasonForbidden       = "forbidden"        // user lacks access to the teamspace
 	ReasonDeviceUnknown   = "device_unknown"   // no policy entry
@@ -323,6 +346,23 @@ type PolicyEntry struct {
 	Reasons   []string `json:"reasons,omitempty"`
 	// Note is the free-text reason entered by the operator in the UI.
 	Note string `json:"note,omitempty"`
+	// Services (phase 2) the device exposes; only delivered to CapServices
+	// agents. AllowedPorts stays [22] for phase-1 agents.
+	Services []ServiceSpec `json:"services,omitempty"`
+	// P2P is false when the device opted out (AnnotationP2P=disabled).
+	P2P bool `json:"p2p"`
+	// ActivationMode is "automatic" or "manual". ForceManualGeneration >= the
+	// current generation forces manual activation (set when a compromised or
+	// health flag was cleared, until an admin re-enables automatic).
+	ActivationMode        string `json:"activationMode,omitempty"`
+	ForceManualGeneration int64  `json:"forceManualGeneration,omitempty"`
+	// TrustedHostKey is the SHA256 fingerprint of the device's ed25519 SSH host
+	// key that an admin trusted (out-of-band comparison). Automatic activation
+	// requires an attestation by exactly this key. DuplicateHostKey is set when
+	// the same key is trusted for more than one device (cloned image): then
+	// automatic activation is refused.
+	TrustedHostKey   string `json:"trustedHostKey,omitempty"`
+	DuplicateHostKey bool   `json:"duplicateHostKey,omitempty"`
 	// RSAPublicCert (PEM) verifies ENROLLMENT JWTs only.
 	RSAPublicCert string `json:"rsaPublicCert"`
 	AllowedPorts  []int  `json:"allowedPorts"`
@@ -366,6 +406,14 @@ type IdentityEntry struct {
 	// is carried over whenever a pin is replaced, and the hub refuses to pin
 	// any listed fingerprint again, in any epoch.
 	VoidedFingerprints []string `json:"voidedFingerprints,omitempty"`
+	// Attestation (CapAttest): the SSH host key that signed this identity's
+	// AttestStatement ("SHA256:<b64>", key type), and the agent's capabilities.
+	AttestedHostKey     string   `json:"attestedHostKey,omitempty"`
+	AttestedHostKeyType string   `json:"attestedHostKeyType,omitempty"`
+	AgentCapabilities   []string `json:"agentCapabilities,omitempty"`
+	// ActivatedBy is ActivatedByApproval or ActivatedByHostKey once usable.
+	ActivatedBy string    `json:"activatedBy,omitempty"`
+	ActivatedAt time.Time `json:"activatedAt,omitempty"`
 	// Conflicts counts rejected enrollments with a DIFFERENT key for this
 	// generation (possible key theft); surfaced in the UI.
 	Conflicts      int       `json:"conflicts,omitempty"`
@@ -413,3 +461,217 @@ const (
 	SAAnnotationNamespace = "ztna.teknoir.org/namespace"
 	SAAnnotationDevice    = "ztna.teknoir.org/device"
 )
+
+// ---------------------------------------------------------------------------
+// Phase 2 (plans/ztna-phase2.md): services, hub->agent control, peer-to-peer,
+// host-key attestation, live status.
+// ---------------------------------------------------------------------------
+
+// Agent capabilities, advertised in DeviceSessionRequest.Capabilities. The hub
+// uses a phase-2 feature with an agent only if the agent advertises it; phase-1
+// agents get exactly the phase-1 behaviour (ssh on port 22 only).
+const (
+	CapServices = "services-v1" // connect listener on AgentConnectPort with ConnectRequest preamble
+	CapControl  = "control-v1"  // control listener on AgentControlPort (hub -> agent RPC)
+	CapAttest   = "attest-v1"   // host-key attestation at enrollment
+	CapP2P      = "p2p-v1"      // direct end-to-end WireGuard (plane B)
+)
+
+// Overlay ports on the agent (plane A, reachable only from the hub: the
+// agent's only A peer is the hub).
+const (
+	AgentConnectPort = 2224 // ConnectRequest line, then raw bytes to the service target
+	AgentControlPort = 2225 // HTTP: ControlGrantsPath, ControlServicesPath
+	// HubStatusPort serves read-only live status and admin actions to the
+	// Backstage backend only (TokenReview username must equal the configured
+	// Backstage ServiceAccount; separate AuthorizationPolicy). Never routed.
+	HubStatusPort = 8082
+)
+
+// Device annotations added in phase 2. All ztna.teknoir.org/* annotations are
+// writable only by the Backstage backend (after its admin checks) and
+// device-controller (ValidatingAdmissionPolicy on devices.teknoir.org).
+const (
+	AnnotationServices       = "ztna.teknoir.org/services"         // JSON []ServiceSpec (admin)
+	AnnotationP2P            = "ztna.teknoir.org/p2p"              // "disabled" | absent = enabled
+	AnnotationActivation     = "ztna.teknoir.org/activation"       // "manual" | absent = automatic (admin)
+	AnnotationTrustedHostKey = "ztna.teknoir.org/trusted-host-key" // "SHA256:<b64>" of the device ed25519 SSH host key (admin)
+)
+
+// Service kinds.
+const (
+	ServiceKindSSH      = "ssh"      // 127.0.0.1:22, implicit, always present
+	ServiceKindExternal = "external" // IP:port on the device's networks
+	ServiceKindInternal = "internal" // k3s Service <name>.<namespace>:port on the device
+	ServiceSSHID        = "ssh"
+	ProtocolTCP         = "tcp"
+	ProtocolHTTP        = "http"
+	MaxServices         = 32
+)
+
+// ServiceSpec is one reachable service on a device. ID is a DNS label (<=20).
+// Target: for external an IP literal (no DNS); for internal "<svc>.<namespace>"
+// (resolved by the agent to an A record inside the service CIDR only; CNAMEs and
+// ExternalName refused; namespaces kube-system and default/kubernetes refused).
+// Validated by device-controller and re-validated by the agent on every dial.
+type ServiceSpec struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"`
+	Target      string `json:"target,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	Protocol    string `json:"protocol"`
+	Web         bool   `json:"web,omitempty"` // published as a browser URL (http only)
+	Description string `json:"description,omitempty"`
+}
+
+// ConnectRequest is the single JSON line a dialer writes to the agent's
+// connect listener (plane A from the hub, plane B from a granted client).
+// As is the end user on whose behalf a delegating in-cluster client (web
+// gateway) connects; the hub sets it, the agent only logs it.
+type ConnectRequest struct {
+	Service string `json:"service"`
+	As      string `json:"as,omitempty"`
+}
+
+// ConnectResponse is the single JSON line the agent answers before relaying
+// bytes (OK) or closing (Reason set).
+type ConnectResponse struct {
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// Control RPC paths on http://<device overlay IP>:AgentControlPort.
+const (
+	ControlGrantsPath   = "/v1/control/grants"   // POST GrantSet -> GrantAck
+	ControlServicesPath = "/v1/control/services" // POST ServicesUpdate -> 204
+)
+
+// Grant authorizes one client's plane-B peer on the device. TTL is relative:
+// the agent expires it on its monotonic clock from receipt (device clocks are
+// not trusted). Services lists service IDs the pair may reach.
+type Grant struct {
+	PairID            string   `json:"pairId"`
+	ClientWGPublicKey string   `json:"clientWgPublicKey"`
+	ClientAddress     string   `json:"clientAddress"` // plane-B /32
+	ClientCandidates  []string `json:"clientCandidates,omitempty"`
+	Services          []string `json:"services"`
+	TTLSeconds        int      `json:"ttlSeconds"`
+}
+
+// GrantSet is the full desired grant list (not a delta). The agent applies it
+// only if (HubInstance, Seq) is newer than the last applied set; a changed
+// HubInstance drops all pairs first. Removed PairIDs are tombstoned by the agent
+// and never re-added.
+type GrantSet struct {
+	HubInstance string  `json:"hubInstance"`
+	Seq         uint64  `json:"seq"`
+	Grants      []Grant `json:"grants"`
+}
+
+// GrantAck returns the device's plane-B parameters for the pairs it accepted.
+type GrantAck struct {
+	DeviceWGPublicKey string   `json:"deviceWgPublicKey"`
+	DeviceAddress     string   `json:"deviceAddress"` // plane-B /32
+	DeviceCandidates  []string `json:"deviceCandidates"`
+	Accepted          []string `json:"accepted"` // pair IDs
+}
+
+// ServicesUpdate pushes the device's current services (policy changed).
+type ServicesUpdate struct {
+	Services []ServiceSpec `json:"services"`
+}
+
+// P2P plane B addressing (separate from plane A).
+const (
+	P2PPrefix         = "100.97.0.0/16"
+	P2PMTU            = 1280
+	MaxP2PCandidates  = 8
+	DefaultGrantTTL   = 90 // seconds
+	P2PDialRaceMillis = 2500
+)
+
+// P2POffer is sent by a client that can do plane B.
+type P2POffer struct {
+	WGPublicKey string   `json:"wgPublicKey"`
+	Candidates  []string `json:"candidates"` // "ip:port", host + server-reflexive, <= MaxP2PCandidates
+}
+
+// P2PGrant is returned to the client when the device accepted the pair.
+type P2PGrant struct {
+	PairID            string   `json:"pairId"`
+	ClientAddress     string   `json:"clientAddress"`
+	DeviceAddress     string   `json:"deviceAddress"`
+	DeviceWGPublicKey string   `json:"deviceWgPublicKey"`
+	DeviceCandidates  []string `json:"deviceCandidates"`
+	TTLSeconds        int      `json:"ttlSeconds"`
+}
+
+// Host-key attestation (CapAttest). The agent fetches a single-use nonce, the
+// attestor sidecar signs the statement with the device's SSH host key (SSHSIG,
+// namespace AttestNamespace), filling namespace/device from its own config.
+const (
+	AttestChallengePath = "/v1/device/attest-challenge" // POST, Bearer enroll JWT -> AttestChallenge
+	AttestNamespace     = "teknoir-ztna-attest-v1@teknoir.ai"
+	AttestStatementTag  = "teknoir-ztna-attest-v1"
+)
+
+// AttestChallenge binds an attestation to this enrollment window.
+type AttestChallenge struct {
+	Nonce                string    `json:"nonce"`
+	EnrollmentEpoch      string    `json:"enrollmentEpoch"`
+	EnrollmentGeneration int64     `json:"enrollmentGeneration"`
+	ExpiresAt            time.Time `json:"expiresAt"`
+}
+
+// AttestStatement returns the exact bytes the host key signs.
+func AttestStatement(namespace, device, identityFingerprint, epoch string, generation int64, nonce string) []byte {
+	return []byte(fmt.Sprintf("%s\n%s/%s\n%s\n%s\n%d\n%s", AttestStatementTag, namespace, device, identityFingerprint, epoch, generation, nonce))
+}
+
+// HostKeyAttestation is one SSHSIG signature (base64 of the binary SSHSIG blob,
+// which embeds the public key) over AttestStatement.
+type HostKeyAttestation struct {
+	Nonce     string `json:"nonce"`
+	Signature string `json:"signature"`
+}
+
+// Activation sources recorded on the identity entry.
+const (
+	ActivatedByApproval = "approval" // admin approved the identity fingerprint
+	ActivatedByHostKey  = "host-key" // attested SSH host key equals the trusted host key
+)
+
+// Live status (HubStatusPort, Backstage backend only).
+const (
+	StatusDevicePath    = "/v1/status/devices/" // GET /v1/status/devices/<ns>/<device> -> DeviceLiveStatus
+	AdminEndSessionPath = "/v1/admin/sessions/" // POST /v1/admin/sessions/<id>/end
+	PathDirectLAN       = "direct-lan"
+	PathDirect          = "direct"
+	PathHub             = "hub"
+)
+
+// DeviceLiveStatus is the hub's live view of one device.
+type DeviceLiveStatus struct {
+	Connected       bool                `json:"connected"`
+	ConnectedSince  time.Time           `json:"connectedSince,omitempty"`
+	LastHandshake   time.Time           `json:"lastHandshake,omitempty"`
+	Transport       string              `json:"transport,omitempty"` // "turn" | "direct-udp"
+	AgentVersion    string              `json:"agentVersion,omitempty"`
+	Capabilities    []string            `json:"capabilities,omitempty"`
+	NAT             string              `json:"nat,omitempty"` // "easy" | "hard" | "unknown"
+	Sessions        []ClientSessionInfo `json:"sessions"`
+	IdentityPending bool                `json:"identityPending"`
+}
+
+// ClientSessionInfo is one client session as shown in the console. Subject is
+// redacted by the Backstage backend for non-admin viewers.
+type ClientSessionInfo struct {
+	ID       string    `json:"id"`
+	Subject  string    `json:"subject"`
+	Service  string    `json:"service"`
+	Software string    `json:"software"` // tnctl | web-terminal | web-gateway
+	Path     string    `json:"path"`     // PathDirectLAN | PathDirect | PathHub
+	Since    time.Time `json:"since"`
+	BytesIn  int64     `json:"bytesIn"`
+	BytesOut int64     `json:"bytesOut"`
+}
