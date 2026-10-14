@@ -5,6 +5,7 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -23,46 +24,57 @@ func InitDir(dir string, uid int) error {
 		return errors.New("agent init: --uid must not be negative")
 	}
 	dir = filepath.Clean(dir)
-	if fi, err := os.Lstat(dir); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("agent init: %s is a symlink; refusing to use it", dir)
+	fi, err := os.Lstat(dir)
+	switch {
+	case err == nil && fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("agent init: %s is a symlink; refusing to use it", dir)
+	case err == nil:
+		// Already prepared by an earlier run (the init container runs on every
+		// pod start): a 0700 directory owned by uid. Root in the init container
+		// has no CAP_DAC_READ_SEARCH, so it could not even open it again.
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && fi.IsDir() &&
+			int(st.Uid) == uid && int(st.Gid) == uid && fi.Mode().Perm() == 0o700 {
+			return nil
 		}
-	} else if errors.Is(err, os.ErrNotExist) {
+	case errors.Is(err, os.ErrNotExist):
 		if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 			return fmt.Errorf("agent init: %w", err)
 		}
 		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("agent init: %w", err)
 		}
-	} else {
+	default:
 		return fmt.Errorf("agent init: %w", err)
 	}
 
-	// Open without following symlinks and change the directory through the
-	// descriptor, so nothing can be swapped in between the check and the chown.
+	// Open without following symlinks and do everything through the
+	// descriptor: nothing can be swapped in between the check and the chown,
+	// and the listing below still works after the chmod even though root here
+	// has no CAP_DAC_READ_SEARCH (the permission check happened at open).
 	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("agent init: opening %s (is it a symlink or not a directory?): %w", dir, err)
 	}
-	defer func() { _ = syscall.Close(fd) }()
-	if err := syscall.Fchown(fd, uid, uid); err != nil {
-		return fmt.Errorf("agent init: chown %s: %w", dir, err)
-	}
-	if err := syscall.Fchmod(fd, 0o700); err != nil {
-		return fmt.Errorf("agent init: chmod %s: %w", dir, err)
-	}
+	f := os.NewFile(uintptr(fd), dir)
+	defer func() { _ = f.Close() }()
 	// Files left by an earlier root-owned run must be readable by the agent.
-	entries, err := os.ReadDir(dir)
+	entries, err := f.ReadDir(-1)
 	if err != nil {
-		return fmt.Errorf("agent init: %w", err)
+		return fmt.Errorf("agent init: listing %s: %w", dir, err)
 	}
 	for _, e := range entries {
 		if !e.Type().IsRegular() {
 			continue
 		}
-		if err := os.Lchown(filepath.Join(dir, e.Name()), uid, uid); err != nil {
+		if err := unix.Fchownat(fd, e.Name(), uid, uid, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return fmt.Errorf("agent init: chown %s: %w", e.Name(), err)
 		}
+	}
+	if err := syscall.Fchown(fd, uid, uid); err != nil {
+		return fmt.Errorf("agent init: chown %s: %w", dir, err)
+	}
+	if err := syscall.Fchmod(fd, 0o700); err != nil {
+		return fmt.Errorf("agent init: chmod %s: %w", dir, err)
 	}
 	return nil
 }

@@ -88,6 +88,12 @@ jobs:
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Smoke test wg-agent init under the device capability set
+        if: matrix.image == 'wg-agent'
+        run: |
+          docker buildx build --load --target wg-agent -t wg-agent:smoke .
+          bash test/smoke-agent-init.sh wg-agent:smoke
+
       - uses: docker/build-push-action@v6
         with:
           context: .
