@@ -227,3 +227,73 @@ func (a *Authz) Set(email, ns string, ok bool) {
 	a.allowed[email+"|"+ns] = ok
 	a.mu.Unlock()
 }
+
+// SA is a hub.SADelegation (and hub.DelegateVerifier): delegating service
+// accounts of the hub namespace, each bound to one device.
+type SA struct {
+	mu       sync.Mutex
+	tokens   map[string]string    // token -> service account name
+	bindings map[string][2]string // name -> namespace, device
+}
+
+var (
+	_ hub.SADelegation     = (*SA)(nil)
+	_ hub.DelegateVerifier = (*SA)(nil)
+)
+
+func NewSA() *SA { return &SA{tokens: map[string]string{}, bindings: map[string][2]string{}} }
+
+// Add registers a service account token bound to (ns, device).
+func (s *SA) Add(token, name, ns, device string) {
+	s.mu.Lock()
+	s.tokens[token] = name
+	s.bindings[name] = [2]string{ns, device}
+	s.mu.Unlock()
+}
+
+func (s *SA) Verify(ctx context.Context, token, ns, device, onBehalfOf string) (hub.SAIdentity, error) {
+	if !hub.ValidEmail(onBehalfOf) {
+		return hub.SAIdentity{}, hub.ErrForbidden
+	}
+	return s.VerifyDelegate(ctx, token, ns, device)
+}
+
+func (s *SA) VerifyDelegate(_ context.Context, token, ns, device string) (hub.SAIdentity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name, ok := s.tokens[token]
+	if !ok {
+		return hub.SAIdentity{}, hub.ErrUnauthenticated
+	}
+	if s.bindings[name] != [2]string{ns, device} {
+		return hub.SAIdentity{}, hub.ErrForbidden
+	}
+	return hub.SAIdentity{Name: name}, nil
+}
+
+// StatusAuth is a hub.StatusAuthenticator: bearer tokens of service accounts
+// and the usernames the API server would report for them.
+type StatusAuth struct {
+	mu    sync.Mutex
+	users map[string]string
+}
+
+var _ hub.StatusAuthenticator = (*StatusAuth)(nil)
+
+func NewStatusAuth() *StatusAuth { return &StatusAuth{users: map[string]string{}} }
+
+// Add registers a token for username.
+func (s *StatusAuth) Add(token, username string) {
+	s.mu.Lock()
+	s.users[token] = username
+	s.mu.Unlock()
+}
+
+func (s *StatusAuth) Authenticate(_ context.Context, token string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.users[token]; ok {
+		return u, nil
+	}
+	return "", hub.ErrUnauthenticated
+}

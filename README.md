@@ -10,6 +10,9 @@ alternative to the SSH reverse tunnels and stays separate from them.
   immediately when a device is flagged.
 - `cmd/wg-agent`: device agent. It uses an on-device Ed25519 identity, opens
   connections from the device side over TURN, and exposes only the allowed ports.
+- `cmd/wg-gateway`: web gateway of a device (second container of the per-device
+  `wgt-` pod): an HTTP reverse proxy that publishes the device's web services to
+  browsers through the ingress, over the tunnel.
 - `cmd/wg-connect`: stdio proxy for `ssh -o ProxyCommand=...` (WG web terminal).
 - `pkg/wgclient`: client library used by `tnctl ssh --wireguard`.
 - `pkg/api`: the wire contract (standard library only).
@@ -77,6 +80,8 @@ delegated sessions, the budget is per (service account, email).
 | `KEYCLOAK_ISSUER` / `KEYCLOAK_JWKS_URL` | access-token issuer and key set | `https://auth.<DOMAIN>/auth/realms/master` |
 | `ALLOWED_AZP` | accepted Keycloak `azp` values | `teknoir-cli` |
 | `CLIENT_IP_HEADER` | trusted proxy header with the real client IP; without it there is no per-IP limit | none |
+| `STATUS_ADDR` | listener for the Backstage live status and admin API (the chart sets `:8082`); off when empty | off |
+| `BACKSTAGE_SA` | full username of the Backstage service account (`system:serviceaccount:<ns>:<name>`), required with `STATUS_ADDR` | |
 | `FLUSH_GRACE` | how long a revoked session's WireGuard peer stays after its streams were closed, so the FIN/RST reaches the client and the device | `300ms` |
 | `LOG_LEVEL` | slog level | `info` |
 
@@ -95,6 +100,44 @@ plus its retry) since the last packet or the last successful renewal.
 (`/healthz`, `/readyz`, `/metrics`); it needs get/list/watch on Devices
 (cluster-wide, metadata only) and create/update/delete on ConfigMaps in the hub
 namespace.
+
+### Status and admin listener (`STATUS_ADDR`)
+
+A separate port (`api.HubStatusPort`, 8082) for the Backstage backend only; 8081
+is unchanged and no VirtualService routes to it. The caller sends its ordinary
+pod ServiceAccount token. The hub verifies it with a TokenReview WITHOUT
+audiences (the API server's own) and requires the username to equal
+`BACKSTAGE_SA` exactly: a missing or invalid token is 401, any other identity
+403. An AuthorizationPolicy in front admits only the Backstage SA as well.
+
+- `GET /v1/status/devices/<ns>/<device>` returns `api.DeviceLiveStatus`: whether
+  the device is connected and since when, the last WireGuard handshake of its
+  peer, transport (`turn`), agent version and capabilities, whether the
+  identity waits for an admin, and its client sessions (subject, service,
+  software, path, since, bytes). `BytesIn` is client to device, `BytesOut` device
+  to client; both are counted while the stream runs. `Path` is what the client
+  reported on its last renewal (`api.RenewRequest.Path`), `hub` by default.
+  A gateway session lists the users with an open connection, comma separated.
+  Unknown device: 404.
+- `POST /v1/admin/sessions/<id>/end` ends a client session like a revocation
+  (streams closed, peer removed after the flush grace) and logs a decision
+  `op=admin_end` with the requester from the header `X-Ztna-Requester` (an email,
+  else `unknown`) and the Backstage identity. Device sessions cannot be ended
+  here (404).
+
+### Delegated gateway sessions (`software: web-gateway`)
+
+The web gateway holds one delegated session per web service, not per user. It
+creates a client session on the internal API with its service account token,
+`software: web-gateway`, `direct: true` and NO `onBehalfOf`; the hub verifies the
+token and the SA's device binding (`DelegateVerifier`) and marks the session
+`perConn`. Each spliced connection then starts with one `api.ConnectRequest`
+line to the hub (`{"service":"web","as":"alice@example.com"}`): the service must
+be the session's, `as` a lowercase email. The hub runs the SubjectAccessReview
+for that user, dials the agent with the same line (`as` is only logged there),
+and answers the client with one `api.ConnectResponse` line before any byte is
+relayed (`reason` is an `api.Reason*` code on refusal). The quota of such a
+session allows one per service id (32). Renewals take the SA token and no user.
 
 ## Libraries
 
@@ -200,6 +243,51 @@ Tests that need an external service on a loopback listener use the
 `Config.AllowTarget` test hook (never settable from the environment); the e2e rig
 lets exactly its echo servers through.
 
+## wg-gateway
+
+`pkg/gateway` is the proxy, `cmd/wg-gateway` its main. Flags:
+`--hub-url http://wg-hub.<ns>.svc.cluster.local:8081 --namespace NS --device D
+--sa-token-file /var/run/ztna/token --listen :8090` (`--idle-timeout`, `--log-level`).
+
+The ingress (oauth2-proxy via ext_authz, then the per-service VirtualService)
+routes a service host to port 8090 and sets `X-Ztna-Service: <id>`; an
+AuthorizationPolicy admits only the ingress gateway's principal, so
+`X-Auth-Request-Email` is trusted. Per request:
+
+1. no valid `X-Auth-Request-Email`: 403; `X-Ztna-Service` not a valid service
+   id: 404; the upstream is never derived from the request.
+2. CSRF: unsafe methods (anything but GET/HEAD/OPTIONS) and WebSocket upgrades
+   need `Origin` equal to `https://<Host>`, else 403.
+3. The session of that service is taken from a pool (one per service id,
+   created lazily and shared by all users, closed after 15 minutes without
+   requests, rebuilt when the hub ends it or the tunnel is found dead).
+4. The request is scrubbed: cookies named `_oauth2*`, `Authorization`,
+   `Proxy-Authorization`, `X-Forwarded-Access-Token`, all `X-Auth-Request-*`,
+   oauth2-proxy's `X-Forwarded-User/Email/Groups/Preferred-Username` and
+   `X-Ztna-Service` are removed; `X-Forwarded-Host/Proto/For` are set (the
+   ingress's `X-Forwarded-For` chain is kept and extended); `Host` is kept.
+5. Every upstream connection is dialled with `Session.DialAs(ctx, email)` and
+   carries one user: the Transports are per (service, user), so a connection is
+   never shared between users. A connection is authorized when it is opened;
+   keep-alive connections are therefore recycled after `ConnMaxAge` (30 s), the
+   delay after which a revoked user is checked again. Open WebSockets and
+   streams are not cut by a revocation of the user (the hub cuts them when the
+   session or the device ends).
+6. Responses: `Set-Cookie` named `_oauth2*` is dropped and the `Domain`
+   attribute of the others removed (host-only cookies). WebSockets and
+   streaming responses pass through.
+7. Hub refusals become pages: `forbidden` 403, `device_offline` 503, session
+   limits 503 with `Retry-After`, an unknown service 404, anything else 502 (a
+   small HTML page for browsers, text otherwise; reason codes are not shown).
+
+Logs are one JSON line per request (method, path without query, service, user,
+status, bytes, outcome); headers, cookies and tokens are never logged.
+`/healthz` and `/readyz` (token file readable) answer only requests WITHOUT
+`X-Ztna-Service`, so a device application's own `/healthz` is still proxied.
+
+Known parity risk with the legacy tunnels: the device's JavaScript runs on a
+host that is same-site with Backstage.
+
 ## wg-connect
 
 ssh ProxyCommand: `wg-connect --hub-url U --namespace NS --device D
@@ -209,7 +297,7 @@ Token files are re-read for every create and renewal; tokens never go in argv or
 
 ## Images
 
-One `Dockerfile` with two targets, built with CGO off and pinned base images
+One `Dockerfile` with three targets (`wg-hub`, `wg-agent`, `wg-gateway`), built with CGO off and pinned base images
 (`golang:1.26-alpine`, `gcr.io/distroless/static-debian12:nonroot`, both by
 digest), running as uid 65532. The Go toolchain cross-compiles, so no emulation
 is needed to build for other architectures.
@@ -220,11 +308,11 @@ make docker-agent PLATFORMS=linux/amd64,linux/arm64,linux/arm/v7
 docker run --rm ghcr.io/teknoir/wg-hub:<version> --help
 ```
 
-`wg-hub` is published for amd64 and arm64, `wg-agent` for amd64, arm64 and
-arm/v7. The agent's `init` subcommand needs uid 0 (the init container sets
+`wg-hub` and `wg-gateway` are published for amd64 and arm64, `wg-agent` for
+amd64, arm64 and arm/v7. The agent's `init` subcommand needs uid 0 (the init container sets
 `runAsUser: 0`); the agent itself runs as 65532. `.github/workflows/build.yml`
 runs `go vet` and `go test -race ./...`, then pushes
-`ghcr.io/teknoir/wg-hub` and `ghcr.io/teknoir/wg-agent` tagged `sha-<7>`,
+`ghcr.io/teknoir/wg-hub`, `wg-agent` and `wg-gateway` tagged `sha-<7>`,
 `<branch>-<timestamp>`, `<branch>` (and `latest` on main; the git tag itself for tag pushes).
 
 ## Development
@@ -245,4 +333,7 @@ and echo over TURN on both legs; device marked compromised (client connection
 fails within 1 s, new sessions `device_revoked`, agent backs off); flag cleared
 with an enrollment reset (new identity fingerprint, access returns); user loses
 access (next connection refused, renewal denied); TURN restart (relays
-recover); log hygiene over all logs.
+recover); log hygiene over all logs. `e2e/gateway_test.go`: a browser-like request
+through the real web gateway, hub, agent and an HTTP app (scrubbing both ways, CSRF,
+WebSocket, a second user on the shared session, per-connection access loss, live status,
+admin end and recovery, idle close).

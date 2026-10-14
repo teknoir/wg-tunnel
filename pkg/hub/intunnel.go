@@ -163,10 +163,17 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		}
 		tokenExp = u.ExpiresAt
 	case authSA:
-		if h.deps.SA == nil {
+		var (
+			sa  SAIdentity
+			err error
+		)
+		if dv, ok := h.deps.SA.(DelegateVerifier); s.perConn && ok {
+			sa, err = dv.VerifyDelegate(ctx, tok, s.ns, s.device)
+		} else if s.perConn || h.deps.SA == nil {
 			return 0, nil, deny(api.ReasonForbidden, "delegation is not enabled")
+		} else {
+			sa, err = h.deps.SA.Verify(ctx, tok, s.ns, s.device, s.subject)
 		}
-		sa, err := h.deps.SA.Verify(ctx, tok, s.ns, s.device, s.subject)
 		if err != nil {
 			return 0, nil, asDenial(err)
 		}
@@ -183,13 +190,15 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		return 0, nil, deny(eff.Reason, eff.Detail)
 	}
 	if s.kind == api.KindClient {
-		allowed, err := h.deps.Authz.CanExec(ctx, s.subject, s.ns)
-		if err != nil {
-			h.log.Error("authorization check failed", "ns", s.ns, "err", err)
-			return 0, nil, denyUnavailable("authorization backend unavailable")
-		}
-		if !allowed {
-			return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+		if !s.perConn { // a perConn session's users are authorized per connection
+			allowed, err := h.deps.Authz.CanExec(ctx, s.subject, s.ns)
+			if err != nil {
+				h.log.Error("authorization check failed", "ns", s.ns, "err", err)
+				return 0, nil, denyUnavailable("authorization backend unavailable")
+			}
+			if !allowed {
+				return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+			}
 		}
 		if den := h.serviceDenialLive(s, eff.Policy); den != nil {
 			return 0, nil, den
@@ -204,6 +213,9 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		exp = lim
 	}
 	s.mu.Lock()
+	if p := req.Path; s.kind == api.KindClient && (p == api.PathDirectLAN || p == api.PathDirect || p == api.PathHub) {
+		s.path = p // client-reported, informational
+	}
 	if !tokenExp.IsZero() {
 		s.tokenExpiry = tokenExp
 	}

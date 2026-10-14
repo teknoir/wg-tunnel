@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
@@ -66,6 +67,18 @@ type session struct {
 	// agentSvc: the device agent spoke services-v1 when this client session
 	// was created (used when the device is offline).
 	agentSvc bool
+	// perConn marks a delegated session whose end user is asserted per
+	// connection (the web gateway): subject is empty and every spliced
+	// connection names its user in a preamble line (ConnectRequest.As), which
+	// the hub authorizes with a SubjectAccessReview before dialling the device.
+	perConn bool
+	// posture is the self-reported posture of the session creator (status only).
+	posture api.Posture
+	// path is the client-reported data path (api.Path*, guarded by mu); "" = hub.
+	path string
+	// bytesIn / bytesOut count the bytes spliced for a client session: In goes
+	// client -> device, Out device -> client (live status).
+	bytesIn, bytesOut atomic.Int64
 
 	// ended is protected by Hub.mu.
 	ended bool
@@ -97,6 +110,9 @@ func (s *session) key() devKey { return devKey{s.ns, s.device} }
 // Delegated sessions are keyed by the service account AND the asserted email,
 // so one terminal token cannot multiply its budget by naming other members.
 func (s *session) limitKey() string {
+	if s.perConn {
+		return "sa-gateway:" + s.saName
+	}
 	if s.authKind == authSA {
 		return "sa:" + s.saName + "|" + s.subject
 	}
@@ -105,6 +121,9 @@ func (s *session) limitKey() string {
 
 // subjectLabel is the log form of the subject.
 func (s *session) subjectLabel() string {
+	if s.perConn {
+		return "sa:" + s.saName
+	}
 	if s.authKind == authSA {
 		return s.subject + " via sa:" + s.saName
 	}
@@ -219,7 +238,9 @@ func (s *session) closeConns() int {
 type spliceConn struct {
 	client, dev net.Conn
 	cs, ds      *session
-	once        sync.Once
+	// as is the end user of a connection of a perConn session ("" otherwise).
+	as   string
+	once sync.Once
 }
 
 func (c *spliceConn) close() {

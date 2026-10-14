@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: all test vet lint tidy check docker-hub docker-agent docker
+.PHONY: all test vet lint tidy check docker-hub docker-agent docker-gateway docker
 
 all: check
 
@@ -26,7 +26,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PLATFORMS ?= linux/amd64
 DOCKER_FLAGS ?= --load
 
-docker: docker-hub docker-agent
+docker: docker-hub docker-agent docker-gateway
 
 docker-hub:
 	docker buildx build --target wg-hub --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) \
@@ -35,3 +35,7 @@ docker-hub:
 docker-agent:
 	docker buildx build --target wg-agent --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) \
 		-t $(REGISTRY)/wg-agent:$(VERSION) $(DOCKER_FLAGS) .
+
+docker-gateway:
+	docker buildx build --target wg-gateway --platform $(PLATFORMS) --build-arg VERSION=$(VERSION) \
+		-t $(REGISTRY)/wg-gateway:$(VERSION) $(DOCKER_FLAGS) .

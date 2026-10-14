@@ -62,6 +62,13 @@ const (
 	TURNSecret = "e2e-turn-shared-secret-DO-NOT-LOG"
 	kcIssuer   = "https://auth.e2e.test/auth/realms/master"
 	kcKID      = "e2e-key-1"
+	// BackstageSA is the username the status listener expects; BackstageToken
+	// and GatewayToken are the (test) service account tokens of the Backstage
+	// backend and of the web gateway of the rig's device.
+	BackstageSA    = "system:serviceaccount:teknoir-system:backstage"
+	BackstageToken = "e2e-backstage-sa-token-DO-NOT-LOG"
+	GatewayToken   = "e2e-gateway-sa-token-DO-NOT-LOG"
+	GatewaySAName  = "wgt-vdev-1"
 )
 
 // Options tune a rig. The zero value is fine for most scenarios.
@@ -211,14 +218,21 @@ type Rig struct {
 	T    testing.TB
 	Opts Options
 
-	TURN     *turntest.Server
-	Hub      *hub.Hub
-	HubURL   string
-	Policy   *hubtest.Policy
-	Flags    *hubtest.Flags
-	Identity *hubtest.Identity
-	Authz    *hubtest.Authz
-	Echo     *Echo
+	TURN   *turntest.Server
+	Hub    *hub.Hub
+	HubURL string
+	// InternalURL is the hub's internal API (service-account delegation and
+	// direct sessions; the web gateway uses it) and StatusURL the status and
+	// admin listener of the Backstage backend (BackstageToken authenticates).
+	InternalURL string
+	StatusURL   string
+	SA          *hubtest.SA
+	StatusAuth  *hubtest.StatusAuth
+	Policy      *hubtest.Policy
+	Flags       *hubtest.Flags
+	Identity    *hubtest.Identity
+	Authz       *hubtest.Authz
+	Echo        *Echo
 	// Web is a second echo server, the target of the external test services.
 	// The agent refuses loopback targets; the rig lets exactly the echo
 	// servers through with the agent's AllowTarget test hook (the hub, the
@@ -261,6 +275,7 @@ func New(t testing.TB, opts Options) *Rig {
 	r := &Rig{
 		T: t, Opts: opts,
 		Policy: hubtest.NewPolicy(), Flags: hubtest.NewFlags(), Identity: hubtest.NewIdentity(), Authz: hubtest.NewAuthz(),
+		SA: hubtest.NewSA(), StatusAuth: hubtest.NewStatusAuth(),
 		HubLogs: &LogBuf{}, AgentLogs: &LogBuf{}, ClientLogs: &LogBuf{},
 		secrets: map[string]struct{}{},
 	}
@@ -316,8 +331,12 @@ func New(t testing.TB, opts Options) *Rig {
 	r.Authz.Set(AliceEmail, NS, true)
 	r.Authz.Set(BobEmail, NS, true)
 
+	r.StatusAuth.Add(BackstageToken, BackstageSA)
+	r.SA.Add(GatewayToken, GatewaySAName, NS, DeviceName)
+	r.AddSecret(BackstageToken)
+	r.AddSecret(GatewayToken)
 	cfg := hub.Config{
-		PodIP: "127.0.0.1", Logger: logger(r.HubLogs), RenewAfter: opts.RenewAfter,
+		PodIP: "127.0.0.1", Logger: logger(r.HubLogs), RenewAfter: opts.RenewAfter, BackstageSA: BackstageSA,
 		IPRate: 1000, IPBurst: 1000, SubjectRate: 1000, SubjectBurst: 1000,
 		GlobalRate: 100000, GlobalBurst: 100000,
 	}
@@ -329,7 +348,7 @@ func New(t testing.TB, opts Options) *Rig {
 		flags = r.startFlagsWatcher()
 	}
 	h, err := hub.New(cfg, hub.Deps{
-		Policy: r.Policy, Flags: flags, Identity: r.Identity, Users: users, Authz: r.Authz,
+		Policy: r.Policy, Flags: flags, Identity: r.Identity, Users: users, Authz: r.Authz, SA: r.SA, Status: r.StatusAuth,
 		TURN: hub.NewTURNMinter(func() (string, error) { return TURNSecret, nil },
 			[]string{"turn:" + r.TURN.Addr + "?transport=udp"}, 30*time.Minute, nil),
 	})
@@ -351,6 +370,12 @@ func New(t testing.TB, opts Options) *Rig {
 	srv := httptest.NewServer(r.recording(h.Handler()))
 	t.Cleanup(srv.Close)
 	r.HubURL = srv.URL
+	isrv := httptest.NewServer(r.recording(h.InternalHandler()))
+	t.Cleanup(isrv.Close)
+	r.InternalURL = isrv.URL
+	ssrv := httptest.NewServer(h.StatusHandler())
+	t.Cleanup(ssrv.Close)
+	r.StatusURL = ssrv.URL
 	Eventually(t, 10*time.Second, "hub ready", h.Ready)
 	return r
 }
@@ -550,6 +575,32 @@ func (r *Rig) allowLoopback(ap netip.AddrPort) bool {
 // device-controller does when the annotation changes).
 func (r *Rig) SetServices(specs ...api.ServiceSpec) {
 	r.Policy.Update(NS, DeviceName, func(p *api.PolicyEntry) { p.Services = specs })
+}
+
+// WebApp is an HTTP server the rig's web services can point at.
+type WebApp struct {
+	Port int
+	srv  *http.Server
+}
+
+// StartWebApp serves handler on a loopback port that the agent's target rules
+// let through (the test hook that otherwise refuses loopback), and returns it.
+func (r *Rig) StartWebApp(handler http.Handler) *WebApp {
+	r.T.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must(r.T, err)
+	app := &WebApp{Port: ln.Addr().(*net.TCPAddr).Port, srv: &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}}
+	go func() { _ = app.srv.Serve(ln) }()
+	r.T.Cleanup(func() { _ = app.srv.Close() })
+	r.allowMu.Lock()
+	r.allowLoop[uint16(app.Port)] = true
+	r.allowMu.Unlock()
+	return app
+}
+
+// WebAppService is an external http web service that reaches app.
+func (r *Rig) WebAppService(id string, app *WebApp) api.ServiceSpec {
+	return api.ServiceSpec{ID: id, Kind: api.ServiceKindExternal, Target: "127.0.0.1", Port: app.Port, Protocol: api.ProtocolHTTP, Web: true}
 }
 
 // WebService is an external http service that reaches the Web echo server.
