@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,5 +176,70 @@ func TestP2PPairsAreDroppedWhenTheDeviceSessionIsReplaced(t *testing.T) {
 	}
 	if pairs := p.h.P2PPairs(testNS, testDevice); len(pairs) != 0 {
 		t.Errorf("the renewal resurrected pairs %v", pairs)
+	}
+}
+
+// While the agent has not applied a redefined service, a connection to it is
+// refused (retryable) instead of reaching the old target (review finding 21).
+func TestSpliceRefusesAServiceTheAgentHasNotApplied(t *testing.T) {
+	agent := &svcAgent{}
+	w := newSvcRig(t, capsFull, []api.ServiceSpec{webSvc}, agent)
+	// Fresh agent, same definition: works.
+	cli, _ := w.serviceClient(aliceToken, "web")
+	c, err := dialSplice(cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo(t, c, "before")
+	_ = c.Close()
+
+	agent.setCtl(http.StatusInternalServerError) // the control push will not land
+	moved := webSvc
+	moved.Target = "192.168.1.99"
+	withServices(w.rig, moved)
+	waitFor(t, "the old client session to end", func() bool { return w.h.sessionByAddr(cli.addr) == nil })
+	cli2, _ := w.serviceClient(aliceToken, "web") // resolved from the NEW policy
+	before := len(agent.connects())
+	c2, err := dialSplice(cli2)
+	if err == nil {
+		_ = c2.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if n, rerr := c2.Read(make([]byte, 1)); rerr == nil || n != 0 {
+			t.Fatalf("a connection reached the agent with the old definition (%d, %v)", n, rerr)
+		}
+		_ = c2.Close()
+	}
+	if after := len(agent.connects()); after != before {
+		t.Fatalf("the agent was dialled for an unapplied definition (%d -> %d)", before, after)
+	}
+	if !strings.Contains(w.logs.String(), "has not applied this service definition") {
+		t.Errorf("no decision logged:\n%s", w.logs.String())
+	}
+}
+
+// A client session whose service was redefined between the policy lookup and
+// the registration is not given a plane-B grant (review finding 22): the
+// post-admit check runs the service check again.
+func TestClientSessionRechecksTheServiceAfterAdmission(t *testing.T) {
+	p := newP2PRig(t, capsP2P)
+	pol := p.policy
+	pol.Services = []api.ServiceSpec{webSvc}
+	p.setPolicy(pol)
+	moved := webSvc
+	moved.Port = 9999
+	// Change the policy at the moment the session is admitted (after the
+	// resolution of the service, before the grant is made).
+	p.h.testHookAfterAdmit = func() {
+		pol2 := p.policy
+		pol2.Services = []api.ServiceSpec{moved}
+		p.setPolicy(pol2)
+	}
+	o, _ := offer(t)
+	_, st, body := p.p2pClient(aliceToken, "web", o)
+	p.h.testHookAfterAdmit = nil
+	if st == http.StatusCreated {
+		t.Fatalf("a session for a redefined service was created: %s", body)
+	}
+	if pairs := p.h.P2PPairs(testNS, testDevice); len(pairs) != 0 {
+		t.Fatalf("a pair was granted for the stale service: %v", pairs)
 	}
 }

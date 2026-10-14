@@ -99,6 +99,29 @@ func serviceDenial(s *session, pol api.PolicyEntry, agentKnown, devSvc bool) *de
 	return nil
 }
 
+// agentServes reports whether the live device session dev's agent was told the
+// definition spec of a policy service. The hub routes a connection to the agent
+// by service id only, so after an edit of the policy (a service retargeted or
+// removed) the agent would keep serving the OLD target until the control push
+// lands. Until then connections to a redefined service are refused (retryable)
+// instead of reaching a target the admin just took away.
+func agentServes(dev *session, spec api.ServiceSpec) bool {
+	cur, ok := svc.Find(dev.servicesOf(), spec.ID)
+	return ok && svc.Equivalent(cur, spec)
+}
+
+// agentServiceDenial is the check agentServes backs for one client session: nil
+// for ssh, legacy ports and phase-1 agents (which have no services).
+func agentServiceDenial(s, dev *session) *denial {
+	if s.service == "" || s.service == api.ServiceSSHID || !dev.hasCap(api.CapServices) {
+		return nil
+	}
+	if !agentServes(dev, s.svcSpec) {
+		return deny(api.ReasonDeviceOffline, "the device agent has not applied this service definition yet")
+	}
+	return nil
+}
+
 // serviceDenialLive is serviceDenial against the device's live session, or
 // against what the client session was created with when the device is offline.
 func (h *Hub) serviceDenialLive(s *session, pol api.PolicyEntry) *denial {

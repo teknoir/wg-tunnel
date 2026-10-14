@@ -845,9 +845,20 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	}
 	// Close the window between the checks above and the registration: a flag
 	// flip or a device session ending in between must not leave this session up.
-	if again := computeEffective(h.deps.Policy, h.deps.Flags, ns, device); !again.Active {
+	if h.testHookAfterAdmit != nil {
+		h.testHookAfterAdmit()
+	}
+	again := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)
+	if !again.Active {
 		h.endSession(s, again.Reason)
 		return 0, nil, deny(again.Reason, again.Detail)
+	}
+	// The service may have been removed or redefined since it was resolved
+	// (the enforcer did not see this session yet): plane B bypasses the hub's
+	// per-connection checks, so it is checked again before anything is granted.
+	if den := h.serviceDenialLive(s, again.Policy); den != nil {
+		h.endSession(s, den.reason)
+		return 0, nil, den
 	}
 	liveDev := h.deviceSession(ns, device)
 	if liveDev == nil {
@@ -857,7 +868,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	// Plane B is an add-on: whatever happens to it, the splice stays.
 	var grant *api.P2PGrant
 	if req.P2P != nil {
-		grant = h.offerP2P(ctx, s, liveDev, computeEffective(h.deps.Policy, h.deps.Flags, ns, device).Policy, offerKey, offerCands)
+		grant = h.offerP2P(ctx, s, liveDev, again.Policy, offerKey, offerCands)
 	}
 	return http.StatusCreated, &api.SessionResponse{
 		SessionID: id, Kind: api.KindClient, Address: s.ip.String(),

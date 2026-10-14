@@ -134,6 +134,10 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		closeDenied(den.reason, den.msg)
 		return
 	}
+	if den := agentServiceDenial(s, dev); den != nil {
+		closeDenied(den.reason, den.msg)
+		return
+	}
 	dc, den := h.dialAgent(cctx, s, dev, subject)
 	if den != nil {
 		closeDenied(den.reason, den.msg)

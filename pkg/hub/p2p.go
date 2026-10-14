@@ -122,6 +122,8 @@ func (h *Hub) p2pUnavailable(s, dev *session, pol api.PolicyEntry) string {
 		return "the agent has no plane B"
 	case !dev.hasCap(api.CapControl):
 		return "the agent has no control channel"
+	case agentServiceDenial(s, dev) != nil:
+		return "the agent has not applied the service definition yet"
 	}
 	return ""
 }

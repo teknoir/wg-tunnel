@@ -190,6 +190,10 @@ type Hub struct {
 	// recheck wakes the user re-authorization worker (gateway renewals).
 	recheck chan struct{}
 
+	// testHookAfterAdmit, when set (tests), runs in handleClientSession right
+	// after the session was registered.
+	testHookAfterAdmit func()
+
 	tunnelServing atomic.Bool
 	ctx           context.Context
 	cancel        context.CancelFunc
