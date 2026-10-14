@@ -63,8 +63,17 @@ type Config struct {
 	MaxPerSubjectDevice int // client sessions of one user per device (default 5)
 	MaxPerSubject       int // client sessions of one user across all devices (default 20)
 	MaxConnsPerSession  int // default 16
-	ReplayCacheSize     int // default 10000
-	ReplayPerSubject    int // replay entries per subject (default 128)
+	// MaxConnsPerConnSession caps the spliced connections of a perConn
+	// (web gateway) session, which is shared by every user of the service
+	// (default 256); the gateway bounds each user (16) below it.
+	MaxConnsPerConnSession int
+	ReplayCacheSize        int // default 10000
+	ReplayPerSubject       int // replay entries per subject (default 128)
+
+	// UserRecheckInterval is how often the users of open web-gateway
+	// connections are authorized again (default 60 s); every renewal of a
+	// gateway session triggers it too.
+	UserRecheckInterval time.Duration
 
 	// Rate limits: tokens per second and burst, per source IP and per subject,
 	// applied to enroll and session-create requests before any allocation.
@@ -106,6 +115,7 @@ func (c *Config) applyDefaults() {
 	dur(&c.FlushGrace, 300*time.Millisecond)
 	dur(&c.P2PGrantTTL, api.DefaultGrantTTL*time.Second)
 	dur(&c.P2PPushTimeout, 3*time.Second)
+	dur(&c.UserRecheckInterval, 60*time.Second)
 	num(&c.MaxSessions, 5000)
 	num(&c.MaxPerNamespace, 200)
 	num(&c.MaxPerSubjectDevice, 5)
@@ -113,6 +123,7 @@ func (c *Config) applyDefaults() {
 	num(&c.ReplayPerSubject, 128)
 	num(&c.GlobalBurst, 200)
 	num(&c.MaxConnsPerSession, 16)
+	num(&c.MaxConnsPerConnSession, 256)
 	num(&c.ReplayCacheSize, 10000)
 	num(&c.IPBurst, 40)
 	num(&c.SubjectBurst, 10)
@@ -172,6 +183,8 @@ type Hub struct {
 	pending map[devKey]struct{}
 	voiding map[devKey]struct{} // devices whose pin is being voided
 	wake    chan struct{}
+	// recheck wakes the user re-authorization worker (gateway renewals).
+	recheck chan struct{}
 
 	tunnelServing atomic.Bool
 	ctx           context.Context
@@ -230,13 +243,15 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		pending:     map[devKey]struct{}{},
 		voiding:     map[devKey]struct{}{},
 		wake:        make(chan struct{}, 1),
+		recheck:     make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel,
 	}
 	deps.Policy.Subscribe(h.notify)
 	deps.Flags.Subscribe(h.notify)
-	h.wg.Add(2)
+	h.wg.Add(3)
 	go h.enforcer()
 	go h.reaper()
+	go h.userRechecker()
 	return h, nil
 }
 
@@ -533,3 +548,60 @@ func (h *Hub) sessionCounts() (devices, clients int) {
 
 // MetricsHandler serves the Prometheus metrics.
 func (h *Hub) MetricsHandler() http.Handler { return h.met.handler() }
+
+// userRechecker re-authorizes the users of open web-gateway connections. A
+// gateway session carries many users over one WireGuard peer and a user is
+// authorized when a connection is opened; a WebSocket or an event stream lives
+// for hours, so without this a removed or disabled user would keep it until the
+// session ends. It runs on every renewal of a gateway session and on a timer.
+func (h *Hub) userRechecker() {
+	defer h.wg.Done()
+	t := time.NewTicker(h.cfg.UserRecheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-t.C:
+		case <-h.recheck:
+		}
+		h.mu.Lock()
+		var gws []*session
+		for _, s := range h.byID {
+			if s.perConn {
+				gws = append(gws, s)
+			}
+		}
+		h.mu.Unlock()
+		for _, s := range gws {
+			h.recheckUsers(s)
+		}
+	}
+}
+
+// recheckUsers runs the SubjectAccessReview again for every distinct user with
+// an open connection on the gateway session s and closes the connections of
+// the users that are denied now. An unavailable authorizer changes nothing
+// (the next round asks again).
+func (h *Hub) recheckUsers(s *session) {
+	for _, user := range s.connUsers() {
+		if h.ctx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
+		allowed, err := h.deps.Authz.CanExec(ctx, user, s.ns)
+		cancel()
+		if err != nil {
+			h.log.Error("re-authorizing a gateway user failed", "ns", s.ns, "err", err)
+			continue
+		}
+		if allowed {
+			continue
+		}
+		if n := s.closeConnsOf(user); n > 0 {
+			h.met.revocations.WithLabelValues(api.ReasonForbidden).Inc()
+			h.logRevoke(s.key(), api.ReasonForbidden, "user lost access to the teamspace", s.id,
+				slog.String("user", user), slog.Int("connections_closed", n))
+		}
+	}
+}

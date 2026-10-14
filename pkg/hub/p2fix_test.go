@@ -1,0 +1,81 @@
+package hub
+
+import (
+	"errors"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/teknoir/wg-tunnel/pkg/api"
+)
+
+// A gateway (perConn) session is shared by every user of the web service, so
+// it gets its own, larger cap than a one-user session (review finding 4).
+func TestGatewaySessionHasItsOwnConnectionCap(t *testing.T) {
+	agent := &svcAgent{}
+	w := newSvcRig(t, capsFull, []api.ServiceSpec{webSvc}, agent, func(c *Config) {
+		c.MaxConnsPerSession, c.MaxConnsPerConnSession = 2, 5
+	})
+	w.sa.add(gwToken, "wgt-cam-1", testNS, testDevice)
+	w.authz.set(bobEmail, testNS, true)
+	cli, _ := gwSession(w, "web")
+	var open []net.Conn
+	t.Cleanup(func() {
+		for _, c := range open {
+			_ = c.Close()
+		}
+	})
+	for i := range 5 { // well past the plain cap of 2
+		user := aliceEmail
+		if i%2 == 1 {
+			user = bobEmail
+		}
+		c, ans, err := dialAs(cli, "web", user)
+		if err != nil || !ans.OK {
+			t.Fatalf("connection %d: %v %+v", i, err, ans)
+		}
+		open = append(open, c)
+	}
+	_, ans, err := dialAs(cli, "web", aliceEmail)
+	if err != nil || ans.OK || ans.Reason != api.ReasonSessionLimit {
+		t.Fatalf("connection 6: %v %+v, want session_limit", err, ans)
+	}
+}
+
+// A user who loses access keeps no open WebSocket or stream: the next renewal
+// of the gateway session authorizes every user with an open connection again
+// (review finding 17).
+func TestGatewayRenewalClosesConnectionsOfRevokedUsers(t *testing.T) {
+	agent := &svcAgent{}
+	w := newSvcRig(t, capsFull, []api.ServiceSpec{webSvc}, agent)
+	w.sa.add(gwToken, "wgt-cam-1", testNS, testDevice)
+	w.authz.set(bobEmail, testNS, true)
+	cli, resp := gwSession(w, "web")
+	ca, ans, err := dialAs(cli, "web", aliceEmail)
+	if err != nil || !ans.OK {
+		t.Fatalf("alice: %v %+v", err, ans)
+	}
+	cb, ans, err := dialAs(cli, "web", bobEmail)
+	if err != nil || !ans.OK {
+		t.Fatalf("bob: %v %+v", err, ans)
+	}
+	echo(t, ca, "a")
+	echo(t, cb, "b")
+
+	w.authz.set(bobEmail, testNS, false)
+	code, out := w.tunnelPost(api.RenewPath, resp.Address, gwToken, api.RenewRequest{Posture: api.Posture{Software: "web-gateway"}})
+	if code != 200 {
+		t.Fatalf("renew: %d %s", code, out)
+	}
+	waitFor(t, "bob's connection to close", func() bool {
+		_ = cb.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, err := cb.Read(make([]byte, 1))
+		var ne net.Error
+		return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+	})
+	// Alice, still authorized, is untouched, and so is the session.
+	echo(t, ca, "still here")
+	if w.h.sessionByAddr(cli.addr) == nil {
+		t.Fatal("the gateway session ended")
+	}
+}

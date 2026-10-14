@@ -826,3 +826,58 @@ func TestKeepAliveConnectionsAreRecycled(t *testing.T) {
 		t.Errorf("dials = %v", got)
 	}
 }
+
+// One user cannot take the shared session: the per-user slots are held for the
+// life of every connection (upgraded ones included) and shared by all of the
+// user's transports (review finding 4).
+func TestPerUserConnectionCap(t *testing.T) {
+	old := semWait
+	semWait = 50 * time.Millisecond
+	t.Cleanup(func() { semWait = old })
+	r := newRig(t, http.HandlerFunc(echoHeaders))
+	r.do("GET", "/", alice, "web", nil, nil) // creates the session
+	fs := r.session("web", 0)
+	e := &entry{sems: map[string]chan struct{}{}}
+	sem := e.sem(alice, 2)
+	if e.sem(alice, 99) != sem {
+		t.Fatal("the semaphore of a user is not shared")
+	}
+	trA, trB := newTransport(fs, alice, sem), newTransport(fs, alice, sem) // e.g. a retired and a fresh transport
+	c1, err := trA.DialContext(context.Background(), "tcp", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := trB.DialContext(context.Background(), "tcp", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = trB.DialContext(context.Background(), "tcp", "x")
+	var de *wgclient.DialError
+	if !errors.As(err, &de) || de.Reason != api.ReasonSessionLimit {
+		t.Fatalf("third dial: %v, want session_limit", err)
+	}
+	// Another user is unaffected.
+	if c, err := newTransport(fs, bob, e.sem(bob, 2)).DialContext(context.Background(), "tcp", "x"); err != nil {
+		t.Fatalf("bob: %v", err)
+	} else {
+		_ = c.Close()
+	}
+	_ = c1.Close()
+	_ = c1.Close() // closing twice frees one slot only
+	c3, err := trB.DialContext(context.Background(), "tcp", "x")
+	if err != nil {
+		t.Fatalf("after a close: %v", err)
+	}
+	_ = c2.Close()
+	_ = c3.Close()
+	if len(sem) != 0 {
+		t.Errorf("%d slots leaked", len(sem))
+	}
+	// A failed dial gives its slot back.
+	fs.mu.Lock()
+	fs.dialFn = func(string) error { return errors.New("boom") }
+	fs.mu.Unlock()
+	if _, err := trA.DialContext(context.Background(), "tcp", "x"); err == nil || len(sem) != 0 {
+		t.Errorf("failed dial: err %v, %d slots held", err, len(sem))
+	}
+}

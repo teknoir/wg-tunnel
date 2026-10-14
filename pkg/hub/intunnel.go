@@ -190,7 +190,14 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		return 0, nil, deny(eff.Reason, eff.Detail)
 	}
 	if s.kind == api.KindClient {
-		if !s.perConn { // a perConn session's users are authorized per connection
+		if s.perConn {
+			// A perConn session's users are authorized per connection and,
+			// for the connections that stay open, again now (asynchronously).
+			select {
+			case h.recheck <- struct{}{}:
+			default:
+			}
+		} else {
 			allowed, err := h.deps.Authz.CanExec(ctx, s.subject, s.ns)
 			if err != nil {
 				h.log.Error("authorization check failed", "ns", s.ns, "err", err)

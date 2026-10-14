@@ -53,6 +53,7 @@ type entry struct {
 	active  int
 	lastUse time.Time
 	up      map[string]*upstream
+	sems    map[string]chan struct{}
 	dead    bool
 }
 
@@ -95,7 +96,7 @@ func (p *pool) acquire(ctx context.Context, svc string) (*entry, error) {
 			}
 		}
 		if e == nil {
-			e = &entry{svc: svc, ready: make(chan struct{}), up: map[string]*upstream{}, lastUse: p.now()}
+			e = &entry{svc: svc, ready: make(chan struct{}), up: map[string]*upstream{}, sems: map[string]chan struct{}{}, lastUse: p.now()}
 			p.m[svc] = e
 			p.wg.Add(1)
 			go p.build(e)
@@ -179,6 +180,22 @@ func (p *pool) release(e *entry) {
 	e.mu.Unlock()
 }
 
+// sem returns the connection semaphore of (e, user): at most limit open
+// connections of one user to the service, counting upgraded (WebSocket) and
+// streaming ones until they close, which MaxConnsPerHost does not. The
+// semaphore outlives the user's transports (a retired transport's busy
+// connections still hold slots).
+func (e *entry) sem(user string, limit int) chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ch := e.sems[user]
+	if ch == nil {
+		ch = make(chan struct{}, limit)
+		e.sems[user] = ch
+	}
+	return ch
+}
+
 // transport returns the transport of (e, user), creating it on first use. A
 // transport older than maxAge is retired for new requests (its idle
 // connections are closed at once, busy ones when they go idle): a connection is
@@ -235,6 +252,11 @@ func (p *pool) sweep(idle time.Duration) {
 			if now.Sub(u.last) > transportIdle && e.active == 0 {
 				u.tr.CloseIdleConnections()
 				delete(e.up, k)
+			}
+		}
+		for k, ch := range e.sems { // no open connection: forget the semaphore
+			if len(ch) == 0 && e.up[k] == nil {
+				delete(e.sems, k)
 			}
 		}
 		closeIt := e.active == 0 && now.Sub(e.lastUse) > idle && !e.dead

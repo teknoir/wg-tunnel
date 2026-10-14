@@ -246,6 +246,42 @@ func (s *session) closeConns() int {
 	return len(cs)
 }
 
+// connUsers returns the distinct end users of the open connections of a
+// perConn session.
+func (s *session) connUsers() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]struct{}{}
+	var out []string
+	for c := range s.conns {
+		if c.as == "" {
+			continue
+		}
+		if _, ok := seen[c.as]; !ok {
+			seen[c.as] = struct{}{}
+			out = append(out, c.as)
+		}
+	}
+	return out
+}
+
+// closeConnsOf closes the open connections of one end user of a perConn
+// session and returns how many.
+func (s *session) closeConnsOf(user string) int {
+	s.mu.Lock()
+	var cs []*spliceConn
+	for c := range s.conns {
+		if c.as == user {
+			cs = append(cs, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range cs {
+		c.close()
+	}
+	return len(cs)
+}
+
 // spliceConn is one client connection spliced to one device connection.
 type spliceConn struct {
 	client, dev net.Conn

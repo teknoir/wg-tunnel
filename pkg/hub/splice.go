@@ -99,7 +99,11 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 	// The connection cap is enforced before any slow work: a reserved slot is
 	// held while authorizing and dialling, so a burst of attempts cannot
 	// exceed MaxConnsPerSession in flight.
-	if err := s.reserveConn(h.cfg.MaxConnsPerSession); err != nil {
+	maxConns := h.cfg.MaxConnsPerSession
+	if s.perConn { // one shared session carries every user of the web service
+		maxConns = h.cfg.MaxConnsPerConnSession
+	}
+	if err := s.reserveConn(maxConns); err != nil {
 		closeDenied(api.ReasonSessionLimit, "too many concurrent connections")
 		return
 	}

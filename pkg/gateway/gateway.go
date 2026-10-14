@@ -54,8 +54,16 @@ type Config struct {
 	// ConnMaxAge bounds how long keep-alive connections to a device are reused
 	// (default 30 s): each connection is authorized for its user when it is
 	// opened, so this is the delay after which a revoked user's next request
-	// is checked again.
+	// is checked again. It does not bound a WebSocket or a stream, which is one
+	// connection for its whole life: the hub authorizes the users of open
+	// connections again on every renewal of the session (about every minute)
+	// and closes those of a user who lost access.
 	ConnMaxAge time.Duration
+	// MaxConnsPerUser caps the open connections one user may hold to one
+	// service, upgraded and streaming ones included (default 16). The hub
+	// session of a service is shared by all users; this keeps one user from
+	// taking all of it.
+	MaxConnsPerUser int
 	// StripCookies lists extra cookie names (case-insensitive, exact) that are
 	// never forwarded to the device nor accepted from it, on top of the built-in
 	// platform rules (see platformCookie). Set from STRIP_COOKIES.
@@ -95,6 +103,9 @@ func New(cfg Config) (*Gateway, error) {
 	}
 	if cfg.ConnMaxAge <= 0 {
 		cfg.ConnMaxAge = 30 * time.Second
+	}
+	if cfg.MaxConnsPerUser <= 0 {
+		cfg.MaxConnsPerUser = 16
 	}
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = time.Minute
@@ -230,7 +241,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer g.pool.release(e)
 
-	tr := e.transport(user, g.cfg.Now(), g.cfg.ConnMaxAge, func(as string) *http.Transport { return newTransport(e.sess, as) })
+	sem := e.sem(user, g.cfg.MaxConnsPerUser)
+	tr := e.transport(user, g.cfg.Now(), g.cfg.ConnMaxAge, func(as string) *http.Transport {
+		return newTransport(e.sess, as, sem)
+	})
 	invalidate := func() { g.pool.invalidate(e) }
 	rp := &httputil.ReverseProxy{
 		Transport: tr,
@@ -306,13 +320,45 @@ type tunnelError struct{ err error }
 func (e *tunnelError) Error() string { return "tunnel: " + e.err.Error() }
 func (e *tunnelError) Unwrap() error { return e.err }
 
-// newTransport dials every connection through the session for one user.
-func newTransport(sess Session, as string) *http.Transport {
+// semWait bounds the wait for a free per-user connection slot.
+var semWait = 5 * time.Second
+
+// semConn releases its user's connection slot when it is closed.
+type semConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *semConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+// newTransport dials every connection through the session for one user. sem
+// (capacity = the user's connection cap) is held for the life of each
+// connection, including a connection that became a WebSocket or stream.
+func newTransport(sess Session, as string, sem chan struct{}) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 			defer cancel()
+			wait := time.NewTimer(semWait)
+			defer wait.Stop()
+			select {
+			case sem <- struct{}{}:
+			case <-wait.C:
+				return nil, &wgclient.DialError{Reason: api.ReasonSessionLimit}
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			c, err := sess.DialAs(ctx, as)
+			if err == nil {
+				c = &semConn{Conn: c, release: func() { <-sem }}
+			} else {
+				<-sem
+			}
 			var de *wgclient.DialError
 			var he *wgclient.Error
 			if err != nil && !errors.As(err, &de) && !errors.As(err, &he) && !errors.Is(err, wgclient.ErrSessionClosed) {
