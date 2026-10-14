@@ -332,3 +332,39 @@ func TestFailedCreateLeaksNothing(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+func TestPlaneBFailureBackoffAndCallerCancellation(t *testing.T) {
+	pc := &p2pClient{}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	pc.fail(cancelled, time.Now())
+	if pc.skipUntil.Load() != 0 || pc.failures.Load() != 0 || pc.failedHS.Load() != 0 {
+		t.Fatal("a failure caused by the caller was recorded")
+	}
+	// Real failures back off: 30 s, 60 s, 120 s, ... capped at p2pRetryMax.
+	var prev time.Duration
+	for i := range 8 {
+		before := time.Now()
+		pc.fail(context.Background(), time.Time{})
+		d := time.Unix(0, pc.skipUntil.Load()).Sub(before)
+		if i == 0 && (d < p2pRetryAfter-time.Second || d > p2pRetryAfter+time.Second) {
+			t.Fatalf("first skip %v, want about %v", d, p2pRetryAfter)
+		}
+		if d < prev-time.Second || d > p2pRetryMax+time.Second {
+			t.Fatalf("skip %d: %v (previous %v, max %v)", i, d, prev, p2pRetryMax)
+		}
+		prev = d
+	}
+	if prev < p2pRetryMax-time.Second {
+		t.Fatalf("the backoff stopped at %v", prev)
+	}
+	// A zero handshake (a refusal) leaves the marker alone; a real one sets it.
+	if pc.failedHS.Load() != 0 {
+		t.Fatal("a refusal marked the handshake as dead")
+	}
+	hs := time.Now()
+	pc.fail(context.Background(), hs)
+	if pc.failedHS.Load() != hs.UnixNano() {
+		t.Fatal("the failed handshake was not recorded")
+	}
+}

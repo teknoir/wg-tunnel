@@ -23,8 +23,10 @@ const (
 	p2pGatherTimeout = 1500 * time.Millisecond
 	// p2pDialTimeout bounds the connect preamble over plane B.
 	p2pDialTimeout = 3 * time.Second
-	// p2pRetryAfter is how long plane B is skipped after it failed a dial.
+	// p2pRetryAfter is how long plane B is skipped after it failed a dial; it
+	// doubles with every failure in a row, up to p2pRetryMax.
 	p2pRetryAfter = 30 * time.Second
+	p2pRetryMax   = 5 * time.Minute
 )
 
 // p2pPrep is what the client prepares before the session request: the plane-B
@@ -106,8 +108,14 @@ type p2pClient struct {
 	devAddr netip.Addr
 	budget  time.Duration
 
-	punchedAt   atomic.Int64 // unix nanos of the last (re)punch
-	skipUntil   atomic.Int64 // unix nanos: plane B is not tried before this
+	punchedAt atomic.Int64 // unix nanos of the last (re)punch
+	skipUntil atomic.Int64 // unix nanos: plane B is not tried before this
+	// failures counts plane-B failures in a row (reset by a direct dial that
+	// worked); failedHS is the WireGuard handshake (unix nanos) that was
+	// current when a dial over it failed: a session that is merely "fresh"
+	// but known not to carry traffic does not count as established.
+	failures    atomic.Int32
+	failedHS    atomic.Int64
 	closeOnce   sync.Once
 	directDials atomic.Int64
 }
@@ -253,6 +261,49 @@ func (s *Session) DialService(ctx context.Context, service string) (net.Conn, er
 	return s.Dial(ctx)
 }
 
+// fail records a plane-B failure: plane B is skipped for a while (longer after
+// each failure in a row) and the handshake it failed on (hs; zero when the
+// path is not to blame, e.g. a refusal) stops counting as an established path. A failure caused by the caller (cancelled or timed-out
+// request) says nothing about the path and is not recorded.
+func (pc *p2pClient) fail(ctx context.Context, hs time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	n := pc.failures.Add(1)
+	d := p2pRetryAfter
+	for i := int32(1); i < n && d < p2pRetryMax; i++ {
+		d *= 2
+	}
+	d = min(d, p2pRetryMax)
+	if !hs.IsZero() {
+		pc.failedHS.Store(hs.UnixNano())
+	}
+	pc.skipUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+// fresh reports whether the plane-B session is established and is not the one
+// a dial just failed on.
+func (pc *p2pClient) fresh() (p2p.PeerStatus, bool) {
+	st := pc.pl.Status(pc.devPub)
+	return st, st.Established && st.LastHandshake.UnixNano() != pc.failedHS.Load()
+}
+
+// waitFresh waits until the peer has a session that is not known to be dead.
+func (pc *p2pClient) waitFresh(ctx context.Context) bool {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if _, ok := pc.fresh(); ok {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+		}
+	}
+}
+
 func (s *Session) dialDirect(ctx context.Context, service string) net.Conn {
 	pc := s.p2pc
 	if pc == nil || service == "" {
@@ -262,7 +313,7 @@ func (s *Session) dialDirect(ctx context.Context, service string) net.Conn {
 	if now.UnixNano() < pc.skipUntil.Load() {
 		return nil
 	}
-	if !pc.pl.Status(pc.devPub).Established {
+	if _, ok := pc.fresh(); !ok {
 		// A punch that ran out of budget is restarted for this dial.
 		budget := pc.budget
 		if budget <= 0 {
@@ -277,20 +328,24 @@ func (s *Session) dialDirect(ctx context.Context, service string) net.Conn {
 			race = api.P2PDialRaceMillis * time.Millisecond
 		}
 		wctx, cancel := context.WithTimeout(ctx, race)
-		ok := pc.pl.WaitEstablished(wctx, pc.devPub)
+		ok := pc.waitFresh(wctx)
 		cancel()
 		if !ok {
+			if ctx.Err() != nil {
+				return nil // the caller gave up; that says nothing about plane B
+			}
 			s.log.Info("plane B did not come up in time; using the hub splice", "race", race.String())
-			pc.skipUntil.Store(time.Now().Add(p2pRetryAfter).UnixNano())
+			pc.fail(ctx, pc.pl.Status(pc.devPub).LastHandshake)
 			return nil
 		}
 	}
+	hs := pc.pl.Status(pc.devPub).LastHandshake
 	dctx, cancel := context.WithTimeout(ctx, p2pDialTimeout)
 	defer cancel()
 	raw, err := pc.pl.DialContext(dctx, "tcp", net.JoinHostPort(pc.devAddr.String(), strconv.Itoa(api.AgentConnectPort)))
 	if err != nil {
 		s.log.Info("plane B dial failed; using the hub splice", "error", err.Error())
-		pc.skipUntil.Store(time.Now().Add(p2pRetryAfter).UnixNano())
+		pc.fail(ctx, hs)
 		return nil
 	}
 	wrapped, resp, err := connectproto.Handshake(raw, api.ConnectRequest{Service: service}, p2pDialTimeout)
@@ -301,7 +356,11 @@ func (s *Session) dialDirect(ctx context.Context, service string) net.Conn {
 			reason = err.Error()
 		}
 		s.log.Info("plane B connect refused; using the hub splice", "reason", reason)
-		pc.skipUntil.Store(time.Now().Add(p2pRetryAfter).UnixNano())
+		if err != nil {
+			pc.fail(ctx, hs)
+		} else {
+			pc.fail(ctx, time.Time{}) // the path works, the device said no
+		}
 		return nil
 	}
 	tc := &trackedConn{Conn: wrapped, s: s}
@@ -310,5 +369,6 @@ func (s *Session) dialDirect(ctx context.Context, service string) net.Conn {
 		return nil
 	}
 	pc.directDials.Add(1)
+	pc.failures.Store(0)
 	return tc
 }

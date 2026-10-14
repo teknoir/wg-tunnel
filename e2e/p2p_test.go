@@ -397,3 +397,34 @@ func TestP2PGrantLeaseRefreshAndExpiry(t *testing.T) {
 	}
 	_ = c.Close()
 }
+
+// A dial the caller cancels (Ctrl-C of a ProxyCommand, a browser abort) says
+// nothing about the path: it must not switch plane B off for the session
+// (review finding 18).
+func TestP2PCancelledDialDoesNotDisablePlaneB(t *testing.T) {
+	t.Parallel()
+	r, _ := p2pRig(t, e2erig.Options{})
+	r.BlockP2P(true)
+	sess := r.MustP2PClient(e2erig.AliceEmail, "ssh")
+	if sess.Response().P2P == nil {
+		t.Fatal("expected a grant")
+	}
+	short, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	if c, err := sess.DialService(short, ""); err == nil {
+		_ = c.Close()
+		t.Fatal("a dial with a 300ms deadline succeeded although the race takes longer")
+	}
+	cancel()
+	// The next dial still gives plane B its race (it is blocked, so it falls back to the splice).
+	start := time.Now()
+	ctx, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	c, err := sess.DialService(ctx, "")
+	if err != nil {
+		t.Fatalf("fallback dial: %v", err)
+	}
+	_ = c.Close()
+	if d := time.Since(start); d < api.P2PDialRaceMillis*time.Millisecond-300*time.Millisecond {
+		t.Fatalf("the dial took %v: plane B was skipped after a cancelled dial", d)
+	}
+}
