@@ -224,14 +224,23 @@ type attested struct {
 
 // verifyAttestations checks the attestations of an enrollment. It returns
 // (nil, nil) for an enrollment that neither advertises api.CapAttest nor sends
-// attestations (a phase-1 agent), and ReasonAttestRequired when it does but no
-// attestation is valid. Every nonce presented is consumed. A valid attestation
+// attestations (a phase-1 agent) while the policy trusts no host key, and
+// ReasonAttestRequired when it does advertise or send them but none is valid,
+// or when the policy has a TrustedHostKey and there is none at all. Every nonce presented is consumed. A valid attestation
 // is a SSHSIG by an ed25519 or RSA (rsa-sha2-512) key over api.AttestStatement
 // with the policy's CURRENT epoch and generation, a nonce this hub issued to
 // this device for this identity key, and the enrolling identity's fingerprint.
 func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry) (*attested, *denial) {
 	advertised := slices.Contains(req.Capabilities, api.CapAttest)
 	if !advertised && len(req.HostKeyAttestations) == 0 {
+		if pol.TrustedHostKey != "" {
+			// An admin trusted a host key: identities now activate by attestation
+			// alone. An enrollment that carries none (whatever it claims to
+			// support) could only ever be approved by hand, which is exactly
+			// what a squatter with the legacy key wants; refuse it. Removing the
+			// trusted key re-opens manual approval.
+			return nil, deny(api.ReasonAttestRequired, "a host key is trusted for this device; the enrollment must be attested by it")
+		}
 		return nil, nil
 	}
 	if len(req.HostKeyAttestations) > maxAttestations {

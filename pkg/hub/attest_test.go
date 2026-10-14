@@ -508,11 +508,30 @@ func TestNoAutoActivationWithoutTrustedKeyOrWithAnotherKey(t *testing.T) {
 		}
 	})
 	t.Run("unattested phase-1 agent with a trusted key", func(t *testing.T) {
+		// Once a host key is trusted an enrollment without attestation is
+		// refused outright (review finding 27): manual approval of an
+		// unattested identity is not possible until the trusted key is removed.
 		r := newRig(t)
 		r.trust(hk)
+		tok, req := r.dev.enrollRequest(t, r.clock.Now())
+		st, body := r.enroll(tok, req)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+		if _, found, _ := r.ids.Get(context.Background(), testNS, testDevice); found {
+			t.Fatal("an unattested identity was pinned although a host key is trusted")
+		}
+		// Removing the trusted key re-opens the manual path.
+		p := r.policy
+		p.TrustedHostKey = ""
+		r.setPolicy(p)
 		r.enrollOK()
-		st, body := r.deviceSessionStatus()
+		st, body = r.deviceSessionStatus()
 		wantReason(t, st, body, http.StatusForbidden, api.ReasonPendingApproval)
+	})
+	t.Run("a capable-looking squatter without attestation is refused too", func(t *testing.T) {
+		r := newRig(t)
+		r.trust(hk)
+		st, body := r.enrollWith(r.dev, nil)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
 	})
 }
 
@@ -584,8 +603,8 @@ func TestDuplicateHostKeyRefusesAutoActivation(t *testing.T) {
 func TestReenrollWithAttestationUpgradesPin(t *testing.T) {
 	r := newRig(t)
 	hk := newTestHostKey(t, "ed25519")
-	r.trust(hk)
 	r.enrollOK() // phase-1 style, pending
+	r.trust(hk)
 	if st, _ := r.deviceSessionStatus(); st != http.StatusForbidden {
 		t.Fatal("pending expected")
 	}
@@ -680,15 +699,16 @@ func TestEnforcerEndsHostKeyActivatedSessionWhenTrustChanges(t *testing.T) {
 func TestTrustedAttestationDisplacesSquattedPin(t *testing.T) {
 	r := newRig(t)
 	hk := newTestHostKey(t, "ed25519")
-	r.trust(hk)
 
-	// An attacker with the exposed legacy RSA key enrolls first, unattested.
+	// An attacker with the exposed legacy RSA key enrolls first, unattested
+	// (before any host key was trusted; afterwards it could not).
 	squatter := r.otherDevice(t)
 	if st, body := r.enrollWith(squatter, nil); st != http.StatusCreated {
 		t.Fatalf("squatter: %d %s", st, body)
 	}
-	// Without an attestation the real device is a conflict.
-	if st, body := r.enrollWith(r.dev, nil); st != http.StatusConflict {
+	r.trust(hk)
+	// Without an attestation the real device is turned away.
+	if st, body := r.enrollWith(r.dev, nil); st != http.StatusForbidden {
 		t.Fatalf("unattested real device: %d %s", st, body)
 	}
 	// With an attestation by the trusted key it takes the pin.
@@ -700,7 +720,7 @@ func TestTrustedAttestationDisplacesSquattedPin(t *testing.T) {
 	if got.IdentityPublicKey != r.dev.idPubB64 || got.AttestedHostKey != hk.fp || got.ActivatedBy != api.ActivatedByHostKey {
 		t.Fatalf("pin %+v", got)
 	}
-	if got.Conflicts < 2 { // the earlier unattested attempt and the displacement
+	if got.Conflicts < 2 { // the earlier unattested attempt (recorded) and the displacement
 		t.Errorf("conflicts %d", got.Conflicts)
 	}
 	if !slices.Contains(got.VoidedFingerprints, squatter.fingerprint()) {
@@ -709,8 +729,8 @@ func TestTrustedAttestationDisplacesSquattedPin(t *testing.T) {
 	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
 		t.Fatalf("session: %d %s", st, body)
 	}
-	// The squatter cannot get back in: its key is now a conflict.
-	if st, body := r.enrollWith(squatter, nil); st != http.StatusConflict {
+	// The squatter cannot get back in.
+	if st, body := r.enrollWith(squatter, nil); st != http.StatusForbidden {
 		t.Fatalf("squatter again: %d %s", st, body)
 	}
 }
@@ -719,11 +739,11 @@ func TestDisplacementNeverHappensWhen(t *testing.T) {
 	hk := newTestHostKey(t, "ed25519")
 	setup := func(t *testing.T, mutate func(*rig, *deviceCreds)) (*rig, *deviceCreds) {
 		r := newRig(t)
-		r.trust(hk)
 		squatter := r.otherDevice(t)
 		if st, body := r.enrollWith(squatter, nil); st != http.StatusCreated {
 			t.Fatalf("squatter: %d %s", st, body)
 		}
+		r.trust(hk)
 		if mutate != nil {
 			mutate(r, squatter)
 		}
