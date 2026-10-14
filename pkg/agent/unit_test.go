@@ -54,10 +54,20 @@ func TestConfigFromEnv(t *testing.T) {
 		c.ForwardHost != "10.0.0.5" || c.TURNServer != "192.168.2.166:3478" {
 		t.Fatalf("overrides: %+v, %v", c, err)
 	}
+	c, err = ConfigFromEnv(env(map[string]string{
+		"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y",
+		"SERVICE_CIDR": "10.96.0.0/12,fd00::/108", "CLUSTER_DOMAIN": "k8s.example", "SSH_PORT": "2200",
+	}))
+	if err != nil || len(c.ServiceCIDRs) != 2 || c.ClusterDomain != "k8s.example" || c.SSHPort != 2200 || c.AllowTarget != nil {
+		t.Fatalf("service settings: %+v, %v", c, err)
+	}
 	bad := []map[string]string{
 		{},
+		{"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y", "SERVICE_CIDR": "nope"},
+		{"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y", "SSH_PORT": "0"},
+		{"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y", "SSH_PORT": "ssh"},
 		{"DEVICE_ID": "d1"},
-		{"DEVICE_ID": "d1", "NAMESPACE": "ns"}, // neither HUB_URL nor DOMAIN
+		{"DEVICE_ID": "d1", "NAMESPACE": "ns"},                   // neither HUB_URL nor DOMAIN
 		{"DEVICE_ID": "d/1", "NAMESPACE": "ns", "DOMAIN": "x.y"}, // slash in id
 		{"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y", "TURN_SERVER": "nohostport"},
 		{"DEVICE_ID": "d1", "NAMESPACE": "ns", "DOMAIN": "x.y", "CA_FILE": "/does/not/exist.pem"}, // explicit CA must exist

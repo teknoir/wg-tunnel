@@ -166,6 +166,10 @@ func (h *Hub) syncServices(dev *session, pol api.PolicyEntry) {
 		dev.mu.Unlock()
 		return
 	}
+	if h.ctx.Err() != nil { // shutting down
+		dev.mu.Unlock()
+		return
+	}
 	dev.pushing = true
 	dev.mu.Unlock()
 	h.wg.Add(1)

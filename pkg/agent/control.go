@@ -22,12 +22,11 @@ const maxControlBody = 64 << 10
 // address is served; the agent's only plane-A peer is the hub anyway, this is
 // the second check.
 type controlServer struct {
-	log      *slog.Logger
-	connect  *connectServer
-	grants   *GrantStore
-	hubAddr  netip.Addr
-	srv      *http.Server
-	serveErr chan error
+	log     *slog.Logger
+	connect *connectServer
+	grants  *GrantStore
+	hubAddr netip.Addr
+	srv     *http.Server
 }
 
 func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore) *controlServer {

@@ -67,7 +67,7 @@ func (d *fakeDNS) serve() {
 				})
 			}
 		} else if len(resp.Answers) == 0 {
-			resp.Header.RCode = dnsmessage.RCodeNameError
+			resp.RCode = dnsmessage.RCodeNameError
 		}
 		out, err := resp.Pack()
 		if err == nil {

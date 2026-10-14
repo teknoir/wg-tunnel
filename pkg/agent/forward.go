@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/wgclient"
 )
 
@@ -35,6 +36,10 @@ func (a *Agent) serve(ctx context.Context, sess *wgclient.Session) (time.Duratio
 	}
 	sem := make(chan struct{}, a.cfg.MaxConns)
 	for _, p := range resp.AllowedPorts {
+		if p == api.AgentConnectPort || p == api.AgentControlPort {
+			a.log.Warn("ignoring an allowed port that is reserved for the services listeners", "port", p)
+			continue
+		}
 		ln, err := sess.Listen(p)
 		if err != nil {
 			a.log.Error("cannot listen on allowed port", "port", p, "error", err.Error())

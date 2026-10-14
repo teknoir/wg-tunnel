@@ -56,7 +56,7 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		closeDenied(api.ReasonSessionUnknown, "no session for this address")
 		return
 	}
-	d.ns, d.device, d.subject, d.session = s.ns, s.device, s.subjectLabel(), s.id
+	d.ns, d.device, d.subject, d.session, d.service = s.ns, s.device, s.subjectLabel(), s.id, s.service
 	if s.kind != api.KindClient {
 		d.kind = s.kind
 		closeDenied(api.ReasonForbidden, "only client sessions may connect")

@@ -634,6 +634,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	if den != nil {
 		return 0, nil, den
 	}
+	d.service = service
 	route := &session{service: service, targetPort: targetPort, svcSpec: spec}
 	if den := serviceDenial(route, eff.Policy, false, false); den != nil {
 		return 0, nil, den

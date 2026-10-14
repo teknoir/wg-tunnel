@@ -35,6 +35,8 @@ func TestParseArgs(t *testing.T) {
 		with("--sa-token-file", "/t", "--on-behalf-of", "user@example.com", "--port", "2222"),
 		with("--keycloak-token-file", "/t", "--direct"),
 		with("--keycloak-token-file", "/t", "--turn-server", "192.168.2.166:3478"),
+		with("--keycloak-token-file", "/t", "--service", "ssh", "--port", "22"),
+		with("--keycloak-token-file", "/t", "--service", "grafana"),
 	}
 	for _, a := range ok {
 		if _, err := parseArgs(a, io.Discard); err != nil {
@@ -42,7 +44,7 @@ func TestParseArgs(t *testing.T) {
 		}
 	}
 	o, _ := parseArgs(with("--keycloak-token-file", "/t"), io.Discard)
-	if o.port != 22 || o.direct {
+	if o.port != 22 || o.direct || o.service != "ssh" {
 		t.Errorf("defaults: %+v", o)
 	}
 	bad := map[string][]string{
@@ -56,6 +58,9 @@ func TestParseArgs(t *testing.T) {
 		"port 0":              with("--keycloak-token-file", "/t", "--port", "0"),
 		"port 70000":          with("--keycloak-token-file", "/t", "--port", "70000"),
 		"extra arg":           with("--keycloak-token-file", "/t", "extra"),
+		"empty service":       with("--keycloak-token-file", "/t", "--service", ""),
+		"upper-case service":  with("--keycloak-token-file", "/t", "--service", "Web"),
+		"service with a port": with("--keycloak-token-file", "/t", "--service", "web", "--port", "80"),
 		"token on cmdline":    with("--token", "abc"),
 		"bearer on cmdline":   with("--keycloak-token", "abc"),
 		"no hub":              {"--namespace", ns, "--device", dev, "--known-hosts-file", "/k", "--keycloak-token-file", "/t"},
@@ -447,5 +452,28 @@ func TestStreamClosedBeforeAnyByteIsAnError(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("stdout %q", out.String())
+	}
+}
+
+// --service maps to ClientSessionRequest.Service; ssh keeps the legacy port.
+func TestRequestServiceMapping(t *testing.T) {
+	base := []string{"--hub-url", "https://wg.example.com", "--namespace", ns, "--device", dev, "--known-hosts-file", "/tmp/kh", "--keycloak-token-file", "/t"}
+	for _, tc := range []struct {
+		args    []string
+		service string
+		port    int
+	}{
+		{nil, "ssh", 22},
+		{[]string{"--service", "ssh"}, "ssh", 22},
+		{[]string{"--port", "2222"}, "", 2222}, // a legacy raw port: no service
+		{[]string{"--service", "grafana"}, "grafana", 0},
+	} {
+		o, err := parseArgs(append(append([]string(nil), base...), tc.args...), io.Discard)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if got, port := o.requestService(), o.requestPort(); got != tc.service || port != tc.port {
+			t.Errorf("%v: service %q port %d, want %q %d", tc.args, got, port, tc.service, tc.port)
+		}
 	}
 }

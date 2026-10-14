@@ -18,6 +18,8 @@ type dctx struct {
 	subject string
 	session string
 	remote  string
+	// service is the service id of a client request or connection (phase 2).
+	service string
 	// internal is true for requests served on api.HubInternalPort.
 	internal bool
 }
@@ -39,6 +41,9 @@ func (h *Hub) logDecision(d *dctx, decision, reason, detail string) {
 		slog.String("subject", d.subject),
 		slog.String("session", d.session),
 		slog.String("remote", d.remote),
+	}
+	if d.service != "" {
+		attrs = append(attrs, slog.String("service", d.service))
 	}
 	if detail != "" {
 		attrs = append(attrs, slog.String("detail", detail))

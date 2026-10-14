@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,10 @@ type Options struct {
 	// hub.K8sFlagsSource. Change the annotations with Rig.SetDeviceAnnotations
 	// (Rig.Flags is not connected to the hub in this mode).
 	FlagsViaWatcher bool
+	// Services are the device's initial policy services (phase 2).
+	Services []api.ServiceSpec
+	// Agent lets a test adjust the agent configuration (resolver, service CIDR ...).
+	Agent func(*agent.Config)
 }
 
 // Epoch names of the rig's enrollment windows; tests that reset enrollment
@@ -210,6 +215,11 @@ type Rig struct {
 	Identity *hubtest.Identity
 	Authz    *hubtest.Authz
 	Echo     *Echo
+	// Web is a second echo server, the target of the external test services.
+	// The agent refuses loopback targets; the rig lets exactly the echo
+	// servers through with the agent's AllowTarget test hook (the hub, the
+	// policy and every other rule are the production ones).
+	Web *Echo
 
 	// HostKey is the SSH host key the agent reports ("ssh-ed25519 AAAA...").
 	HostKey     string
@@ -219,6 +229,8 @@ type Rig struct {
 	HubLogs, AgentLogs, ClientLogs *LogBuf
 
 	hostKeysGlob string
+	allowMu      sync.Mutex
+	allowLoop    map[uint16]bool
 	metaClient   *metafake.FakeMetadataClient
 	secMu        sync.Mutex
 	secrets      map[string]struct{}
@@ -250,6 +262,8 @@ func New(t testing.TB, opts Options) *Rig {
 
 	r.TURN = turntest.Start(t, TURNSecret)
 	r.Echo = startEcho(t)
+	r.Web = startEcho(t)
+	r.allowLoop = map[uint16]bool{uint16(r.Web.Port): true}
 
 	// Device files: the legacy RSA key, the SSH host key, the identity dir.
 	r.RSAKeyPath = filepath.Join(dir, "rsa_private.pem")
@@ -286,6 +300,7 @@ func New(t testing.TB, opts Options) *Rig {
 	r.Policy.Set(api.PolicyEntry{
 		Device: DeviceName, Namespace: NS, State: api.StateActive, RSAPublicCert: rsaCert,
 		AllowedPorts: []int{r.Echo.Port}, EnrollmentGeneration: 1, EnrollmentEpoch: Epoch1, EnrollUntil: time.Now().Add(time.Hour),
+		Services: opts.Services,
 	})
 	r.Flags.Set(NS, DeviceName, map[string]string{api.AnnotationWireGuard: "enabled"})
 	r.Authz.Set(AliceEmail, NS, true)
@@ -491,6 +506,14 @@ func (r *Rig) MustClient(email string) *wgclient.Session {
 
 // AgentConfig is the agent configuration of this rig.
 func (r *Rig) AgentConfig() agent.Config {
+	cfg := r.agentConfig()
+	if r.Opts.Agent != nil {
+		r.Opts.Agent(&cfg)
+	}
+	return cfg
+}
+
+func (r *Rig) agentConfig() agent.Config {
 	return agent.Config{
 		DeviceID: DeviceName, Namespace: NS, HubURL: r.HubURL,
 		RSAKeyPath: r.RSAKeyPath, IdentityDir: r.IdentityDir,
@@ -499,7 +522,53 @@ func (r *Rig) AgentConfig() agent.Config {
 		StaleAfter: r.Opts.StaleAfter, HandshakeTimeout: 20 * time.Second,
 		RenewRetry: 500 * time.Millisecond, RenewTimeout: 3 * time.Second,
 		DeadAfter: r.Opts.DeadAfter,
+		// The ssh service reaches the fake sshd (the echo server) instead of port 22.
+		SSHPort:     r.Echo.Port,
+		AllowTarget: r.allowLoopback,
 	}
+}
+
+// allowLoopback is the agent's AllowTarget test hook: the echo servers of the
+// rig are loopback listeners and the only loopback targets that pass.
+func (r *Rig) allowLoopback(ap netip.AddrPort) bool {
+	r.allowMu.Lock()
+	defer r.allowMu.Unlock()
+	return r.allowLoop[ap.Port()]
+}
+
+// SetServices replaces the services of the device's policy (the way
+// device-controller does when the annotation changes).
+func (r *Rig) SetServices(specs ...api.ServiceSpec) {
+	r.Policy.Update(NS, DeviceName, func(p *api.PolicyEntry) { p.Services = specs })
+}
+
+// WebService is an external http service that reaches the Web echo server.
+func (r *Rig) WebService(id string) api.ServiceSpec {
+	return api.ServiceSpec{ID: id, Kind: api.ServiceKindExternal, Target: "127.0.0.1", Port: r.Web.Port, Protocol: api.ProtocolHTTP, Web: true}
+}
+
+// ServiceClientOptions returns the options of a client session for email bound
+// to a named service (ssh included) instead of the raw echo port.
+func (r *Rig) ServiceClientOptions(email, service string) wgclient.Options {
+	o := r.ClientOptions(email)
+	o.ClientRequest.Service, o.ClientRequest.Port = service, 0
+	return o
+}
+
+// MustServiceClient is MustClient for a named service.
+func (r *Rig) MustServiceClient(email, service string) *wgclient.Session {
+	r.T.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s, err := wgclient.Create(ctx, r.ServiceClientOptions(email, service))
+	if err != nil {
+		r.T.Fatalf("client session for %s, service %s: %v", email, service, err)
+	}
+	if t := s.Response().TURN; t != nil {
+		r.AddSecret(t.Password)
+	}
+	r.T.Cleanup(func() { _ = s.Close() })
+	return s
 }
 
 // Agent is a running wg-agent.

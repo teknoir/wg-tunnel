@@ -108,7 +108,8 @@ namespace.
   supervisor, in-tunnel renewal with a fresh credential, `Dial`/`Listen`). The
   `Credential` callback receives the session's WireGuard public key so device
   identity tokens can bind it (`wgk`).
-- `pkg/agent`: the wg-agent loop (identity, enrollment, session, port forwarding, backoff).
+- `pkg/agent`: the wg-agent loop (identity, enrollment, session, port forwarding, backoff), the services connect/control listeners, target validation and the `GrantStore`.
+- `pkg/svc`: shape validation of `api.ServiceSpec` (shared with device-controller).
 
 ## wg-agent
 
@@ -120,11 +121,47 @@ namespace.
 `TURN_SERVER` (host:port override), `CA_FILE` (extra CAs added to the system
 roots; `/etc/teknoir/roots.pem` if present) and `LOG_LEVEL`.
 
+### Services (phase 2)
+
+The agent advertises `services-v1` and `control-v1` and serves, on its overlay
+address (reachable only from the hub), a connect listener on `api.AgentConnectPort`
+and a control listener on `api.AgentControlPort`. The phase-1 per-port listeners
+(`AllowedPorts`) stay. A dialer writes one JSON line (`api.ConnectRequest`,
+at most 1 KiB, 5 s), the agent answers one line (`api.ConnectResponse`) and then
+relays bytes with half-close; at most 16 connections per service (`MaxConnsPerService`).
+
+The agent never dials a host or port taken from the caller: it looks the service
+up in its **current** set (the session response, replaced by the hub's control RPC
+`api.ControlServicesPath`) and validates the target again on **every** dial:
+
+| Kind | Target | Refused |
+|---|---|---|
+| `ssh` (implicit) | `FORWARD_HOST:SSH_PORT` (127.0.0.1:22); the spec is ignored | |
+| `external` | IP literal and port | loopback (the ssh target excepted), 169.254/16, fe80::/10, multicast, unspecified, addresses inside the service CIDR, and the node's own addresses on 6443, 10250, 10255, 2379, 2380, 10257, 10259 |
+| `internal` | `<svc>.<ns>`, resolved as `<svc>.<ns>.svc.<CLUSTER_DOMAIN>.` (A records only) | any address outside `SERVICE_CIDR` (headless services, pod IPs), an answer through a CNAME (ExternalName), `kube-system`, `default/kubernetes` |
+
+`SERVICE_CIDR` (comma-separated, default `10.43.0.0/16`, the k3s default),
+`CLUSTER_DOMAIN` (`cluster.local`) and `SSH_PORT` (`22`) configure it. Internal
+services need the pod's cluster DNS (`dnsPolicy: ClusterFirstWithHostNet` for a
+host-network pod). A refusal is `service_denied` on the wire (`internal` for an
+unreachable target, `session_limit` at a cap); the detail is only in the agent's log.
+
+`POST api.ControlGrantsPath` takes a versioned `api.GrantSet` (see `GrantStore` in
+`pkg/agent/grants.go`): `(hubInstance, seq)` ordering, tombstones for removed
+pairs, relative TTLs on the agent's monotonic clock, a changed hub instance drops
+every pair. Plane B itself is not wired yet: grants are accepted and acknowledged
+with empty device parameters, and the `GrantHooks` are where the B peers will be
+added and removed.
+
+Tests that need an external service on a loopback listener use the
+`Config.AllowTarget` test hook (never settable from the environment); the e2e rig
+lets exactly its echo servers through.
+
 ## wg-connect
 
 ssh ProxyCommand: `wg-connect --hub-url U --namespace NS --device D
 (--sa-token-file F --on-behalf-of EMAIL | --keycloak-token-file F)
---known-hosts-file K [--port 22] [--direct] [--turn-server HOST:PORT] [--ca-file F]`.
+--known-hosts-file K [--service ssh | --port 22] [--direct] [--turn-server HOST:PORT] [--ca-file F]`.
 Token files are re-read for every create and renewal; tokens never go in argv or env.
 
 ## Images
