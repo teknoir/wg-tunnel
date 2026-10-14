@@ -511,6 +511,10 @@ func TestP2PServiceRemovalAndRevocationPushAtOnce(t *testing.T) {
 	pol := p.policy
 	pol.Services = []api.ServiceSpec{webSvc}
 	p.setPolicy(pol)
+	// The hub offers plane B only for a service the agent was told about.
+	waitFor(t, "the agent to get the web service", func() bool {
+		return len(p.h.deviceSession(testNS, testDevice).servicesOf()) == 1
+	})
 	r1, _ := p.mustClient(aliceToken, "web")
 	r2, _ := p.mustClient(aliceToken, "ssh")
 	if len(p.log.last().Grants) != 2 {

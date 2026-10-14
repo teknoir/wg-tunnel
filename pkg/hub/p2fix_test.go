@@ -73,7 +73,7 @@ func TestGatewayRenewalClosesConnectionsOfRevokedUsers(t *testing.T) {
 		_ = cb.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		_, err := cb.Read(make([]byte, 1))
 		var ne net.Error
-		return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+		return err != nil && (!errors.As(err, &ne) || !ne.Timeout())
 	})
 	// Alice, still authorized, is untouched, and so is the session.
 	echo(t, ca, "still here")
