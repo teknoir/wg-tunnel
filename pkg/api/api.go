@@ -213,6 +213,9 @@ func KnownHostsAlias(namespace, device string) string {
 // RenewRequest is posted in-tunnel to http://HubAddress:HubAPIPort/v1/renew.
 type RenewRequest struct {
 	Posture Posture `json:"posture"`
+	// Path is the client's current data path to the device for live status
+	// (PathDirectLAN | PathDirect | PathHub). Client-reported: informational.
+	Path string `json:"path,omitempty"`
 }
 
 // RenewResponse extends the session. TURN is set only when the hub rotated the
@@ -221,6 +224,10 @@ type RenewResponse struct {
 	ExpiresAt         time.Time        `json:"expiresAt"`
 	RenewAfterSeconds int              `json:"renewAfterSeconds"`
 	TURN              *TURNCredentials `json:"turn,omitempty"`
+	// Grants (device sessions with CapP2P) is the full current plane-B grant
+	// set: the backstop for a lost control push. Applied with the same
+	// (HubInstance, Seq) ordering as a control push.
+	Grants *GrantSet `json:"grants,omitempty"`
 }
 
 // Error is the JSON body of every 4xx/5xx. Reason is one of the Reason* codes.
@@ -483,8 +490,10 @@ const (
 	AgentConnectPort = 2224 // ConnectRequest line, then raw bytes to the service target
 	AgentControlPort = 2225 // HTTP: ControlGrantsPath, ControlServicesPath
 	// HubStatusPort serves read-only live status and admin actions to the
-	// Backstage backend only (TokenReview username must equal the configured
-	// Backstage ServiceAccount; separate AuthorizationPolicy). Never routed.
+	// Backstage backend only: Bearer = the Backstage pod's ordinary
+	// ServiceAccount token, verified with a TokenReview (default API audience)
+	// whose username must equal the configured Backstage ServiceAccount;
+	// separate AuthorizationPolicy. Never routed.
 	HubStatusPort = 8082
 )
 
