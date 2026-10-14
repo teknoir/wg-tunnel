@@ -131,6 +131,9 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		return 0, &fatalError{fmt.Errorf("identity key unusable: %w", err)}
 	}
 	a.logFingerprint(priv)
+	if err := a.publishIdentityPub(priv); err != nil {
+		return 0, err
+	}
 	hostKeys := ReadHostKeys(a.cfg.SSHHostKeysGlob, a.log)
 	if len(hostKeys) == 0 {
 		a.log.Warn("no SSH host keys found; clients will not be able to verify this device", "glob", a.cfg.SSHHostKeysGlob)
@@ -163,6 +166,9 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 			}
 			priv = rotated
 			a.logFingerprint(priv)
+			if err := a.publishIdentityPub(priv); err != nil {
+				return 0, err
+			}
 		default:
 			return 0, cerr
 		}
@@ -197,7 +203,7 @@ func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []
 			tok, _, err := identity.MintIdentityJWT(priv, a.sub, wgPub, identityTokenTTL)
 			return tok, err
 		},
-		DeviceRequest:      &api.DeviceSessionRequest{Posture: a.posture(), SSHHostKeys: hostKeys},
+		DeviceRequest:      &api.DeviceSessionRequest{Posture: a.posture(), SSHHostKeys: hostKeys, Capabilities: a.capabilities()},
 		TURNServerOverride: a.cfg.TURNServer,
 		HTTPClient:         a.cfg.HTTPClient,
 		Logger:             a.log,
@@ -217,15 +223,27 @@ func (a *Agent) enroll(ctx context.Context, priv ed25519.PrivateKey) error {
 		return fmt.Errorf("reading device RSA key for enrollment: %w", err)
 	}
 	pub := identity.EncodePublicKey(priv.Public().(ed25519.PublicKey))
+	var attestations []api.HostKeyAttestation
+	if a.attesting() {
+		if attestations, err = a.attest(ctx, rsaPEM, priv, pub); err != nil {
+			return fmt.Errorf("host-key attestation: %w", err)
+		}
+	}
 	token, jti, err := identity.MintEnrollJWT(rsaPEM, a.sub, pub, identityTokenTTL)
 	if err != nil {
 		return fmt.Errorf("minting enrollment token: %w", err)
 	}
-	resp, err := wgclient.Enroll(ctx, a.cfg.HubURL, a.cfg.HTTPClient, token, api.EnrollRequest{
+	req := api.EnrollRequest{
 		IdentityPublicKey: pub,
 		Proof:             identity.ProveEnroll(priv, a.sub, jti),
 		Posture:           a.posture(),
-	})
+	}
+	if len(attestations) > 0 {
+		// Advertised only together with a valid attestation: an agent that
+		// could not obtain one enrolls like a phase-1 agent (admin approval).
+		req.Capabilities, req.HostKeyAttestations = []string{api.CapAttest}, attestations
+	}
+	resp, err := wgclient.Enroll(ctx, a.cfg.HubURL, a.cfg.HTTPClient, token, req)
 	if err != nil {
 		return fmt.Errorf("enrolling: %w", err)
 	}

@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,11 @@ type Config struct {
 	ForwardHost     string
 	// TURNServer ("host:port") overrides the TURN server in the hub's credentials.
 	TURNServer string
+	// AttestExchange is the directory shared with the attestor sidecar
+	// (ATTEST_EXCHANGE). Empty: no host-key attestation (phase-1 behaviour).
+	AttestExchange string
+	// AttestTimeout is how long to wait for the attestor (default 15 s).
+	AttestTimeout time.Duration
 
 	HTTPClient *http.Client
 	Logger     *slog.Logger
@@ -87,6 +93,8 @@ type Config struct {
 //	SSH_HOST_KEYS_GLOB         default /etc/ssh/ssh_host_*_key.pub
 //	FORWARD_HOST               default 127.0.0.1
 //	TURN_SERVER                optional host:port override
+//	ATTEST_EXCHANGE            directory shared with the attestor sidecar
+//	                           (e.g. /run/wg-attest); empty: no attestation
 //	CA_FILE                    extra CA bundle added to the system roots
 //	                           (default: /etc/teknoir/roots.pem if present)
 //	LOG_LEVEL                  debug, info (default), warn, error
@@ -101,6 +109,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		SSHHostKeysGlob: getenv("SSH_HOST_KEYS_GLOB"),
 		ForwardHost:     getenv("FORWARD_HOST"),
 		TURNServer:      getenv("TURN_SERVER"),
+		AttestExchange:  getenv("ATTEST_EXCHANGE"),
 	}
 	caFile, explicit := getenv("CA_FILE"), true
 	if caFile == "" {
@@ -153,6 +162,9 @@ func (c *Config) applyDefaults() error {
 		if _, _, err := net.SplitHostPort(c.TURNServer); err != nil {
 			return fmt.Errorf("agent: TURN_SERVER must be host:port: %w", err)
 		}
+	}
+	if c.AttestExchange != "" && !filepath.IsAbs(c.AttestExchange) {
+		return errors.New("agent: ATTEST_EXCHANGE must be an absolute path")
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)

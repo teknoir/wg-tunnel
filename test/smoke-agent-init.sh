@@ -15,7 +15,7 @@ for _ in 1 2; do
     --security-opt no-new-privileges -v "$H":/var/lib/teknoir "$IMG" \
     init --dir /var/lib/teknoir/wg-agent --uid 65532
 done
-[[ $(stat -c '%u:%g %a' "$H/wg-agent") == "65532:65532 700" ]] || { stat "$H/wg-agent"; echo "bad state dir"; exit 1; }
+[[ $(stat -c '%u:%g %a' "$H/wg-agent") == "65532:65532 711" ]] || { stat "$H/wg-agent"; echo "bad state dir"; exit 1; }
 out=$(timeout 8 docker run --rm --user 65532:65532 --cap-drop ALL --read-only \
   -v "$H/wg-agent":/var/lib/teknoir/wg-agent -e DEVICE_ID=smoke -e NAMESPACE=smoke \
   -e DOMAIN=example.invalid "$IMG" run 2>&1 || true)

@@ -35,7 +35,7 @@ func TestInit(t *testing.T) {
 	if code := run(context.Background(), []string{"init", "--dir", dir, "--uid", uid}, env(nil), &bytes.Buffer{}, &errb); code != 0 {
 		t.Fatalf("init: %d %q", code, errb.String())
 	}
-	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o711 {
 		t.Fatalf("dir: %v %v", fi, err)
 	}
 	for name, args := range map[string][]string{
