@@ -602,7 +602,7 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 		id: id, kind: api.KindDevice, authKind: authDevice, ns: ns, device: device, subject: sub,
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now,
 		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), attestedKey: pin.AttestedHostKey, ports: ports,
-		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote,
+		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote, posture: req.Posture,
 		caps: caps, services: services, p2pKey: p2pKey,
 		expiresAt: now.Add(h.cfg.SessionTTL), turnExpiry: turn.ExpiresAt,
 	}
@@ -672,7 +672,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	// Service-account delegation and direct UDP are in-cluster features: the
 	// outside API (reachable through the ingress gateways) refuses them, no
 	// matter what credential comes with the request.
-	if !d.internal && (req.OnBehalfOf != "" || req.Direct) {
+	if !d.internal && (req.OnBehalfOf != "" || req.Direct || req.Posture.Software == softwareGateway) {
 		return 0, nil, deny(api.ReasonForbidden, "delegation and direct sessions are not available on this endpoint")
 	}
 	if !validLabel(req.Namespace) || !validLabel(req.Device) {
@@ -702,8 +702,22 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		tokenExp      time.Time
 		tokenID       string
 		tokenIAT      time.Time
+		perConn       bool
 	)
-	if req.OnBehalfOf != "" {
+	switch {
+	case req.OnBehalfOf == "" && req.Posture.Software == softwareGateway:
+		// The web gateway: a delegating service account without a user. Each
+		// spliced connection names its user (and is authorized) on its own.
+		dv, ok := h.deps.SA.(DelegateVerifier)
+		if !ok {
+			return 0, nil, deny(api.ReasonForbidden, "delegation is not enabled")
+		}
+		sa, err := dv.VerifyDelegate(ctx, tok, ns, device)
+		if err != nil {
+			return 0, nil, asDenial(err)
+		}
+		saName, authKind, perConn = sa.Name, authSA, true
+	case req.OnBehalfOf != "":
 		if !ValidEmail(req.OnBehalfOf) {
 			return 0, nil, deny(api.ReasonBadRequest, "onBehalfOf must be a lowercase email address")
 		}
@@ -715,7 +729,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 			return 0, nil, asDenial(err)
 		}
 		email, saName, authKind = req.OnBehalfOf, sa.Name, authSA
-	} else {
+	default:
 		u, err := h.deps.Users.Authenticate(ctx, tok)
 		if err != nil {
 			return 0, nil, asDenial(err)
@@ -726,22 +740,28 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	if authKind == authSA {
 		d.subject = email + " via sa:" + saName
 	}
-	probe := &session{authKind: authKind, saName: saName, subject: email}
+	probe := &session{authKind: authKind, saName: saName, subject: email, perConn: perConn}
+	if perConn {
+		d.subject = probe.subjectLabel()
+	}
 	if den := h.subjectDenial("client|" + probe.limitKey()); den != nil {
 		return 0, nil, den
 	}
-	if den := validPosture(req.Posture, "tnctl", "web-terminal"); den != nil {
+	if den := validPosture(req.Posture, "tnctl", "web-terminal", softwareGateway); den != nil {
 		return 0, nil, den
 	}
 
-	// Authorize before revealing anything about the device.
-	allowed, err := h.deps.Authz.CanExec(ctx, email, ns)
-	if err != nil {
-		h.log.Error("authorization check failed", "ns", ns, "err", err)
-		return 0, nil, denyUnavailable("authorization backend unavailable")
-	}
-	if !allowed {
-		return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+	// Authorize before revealing anything about the device. A perConn session
+	// has no user yet: each connection is authorized for its own.
+	if !perConn {
+		allowed, err := h.deps.Authz.CanExec(ctx, email, ns)
+		if err != nil {
+			h.log.Error("authorization check failed", "ns", ns, "err", err)
+			return 0, nil, denyUnavailable("authorization backend unavailable")
+		}
+		if !allowed {
+			return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+		}
 	}
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)
 	if !eff.Active {
@@ -780,7 +800,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	s := &session{
 		id: id, kind: api.KindClient, authKind: authKind, ns: ns, device: device, subject: email, saName: saName,
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now, targetPort: targetPort, direct: req.Direct,
-		service: service, svcSpec: spec, agentSvc: agentSvc,
+		service: service, svcSpec: spec, agentSvc: agentSvc, perConn: perConn, posture: req.Posture,
 		remote: d.remote, tokenExpiry: tokenExp, lastTokenID: tokenID, lastTokenIAT: tokenIAT,
 		expiresAt: capExpiry(now.Add(h.cfg.SessionTTL), tokenExp, h.cfg.SessionTTL),
 	}

@@ -42,6 +42,13 @@ func (d *K8sSADelegation) Verify(ctx context.Context, token, ns, device, onBehal
 	if !ValidEmail(onBehalfOf) {
 		return SAIdentity{}, fmt.Errorf("%w: onBehalfOf is not a lowercase email", ErrForbidden)
 	}
+	return d.VerifyDelegate(ctx, token, ns, device)
+}
+
+// VerifyDelegate implements DelegateVerifier: the same checks as Verify for a
+// session without an asserted user (the web gateway names its users per
+// connection).
+func (d *K8sSADelegation) VerifyDelegate(ctx context.Context, token, ns, device string) (SAIdentity, error) {
 	if token == "" || len(token) > maxBearerTokenSize {
 		return SAIdentity{}, fmt.Errorf("%w: bad token length", ErrUnauthenticated)
 	}

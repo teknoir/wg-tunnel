@@ -37,14 +37,18 @@ func (h *Hub) admitLocked(s *session) *denial {
 		// Quotas protect against client sessions only. A device holds exactly
 		// one session of its own, so clients can never fill the teamspace and
 		// lock the devices out.
+		perDev, perAll := h.cfg.MaxPerSubjectDevice, h.cfg.MaxPerSubject
+		if s.perConn { // the web gateway keeps one session per web service
+			perDev, perAll = max(perDev, api.MaxServices), max(perAll, api.MaxServices)
+		}
 		switch {
 		case len(h.byID) >= h.cfg.MaxSessions:
 			return deny(api.ReasonSessionLimit, "hub session limit reached")
 		case h.perNS[s.ns] >= h.cfg.MaxPerNamespace:
 			return deny(api.ReasonSessionLimit, "teamspace session limit reached")
-		case h.perSubj[subjKey] >= h.cfg.MaxPerSubjectDevice:
+		case h.perSubj[subjKey] >= perDev:
 			return deny(api.ReasonSessionLimit, "too many sessions for this device")
-		case h.perSubjAll[s.limitKey()] >= h.cfg.MaxPerSubject:
+		case h.perSubjAll[s.limitKey()] >= perAll:
 			return deny(api.ReasonSessionLimit, "too many sessions for this user")
 		}
 	} else if len(h.byID) >= 2*h.cfg.MaxSessions {

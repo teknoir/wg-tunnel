@@ -98,9 +98,17 @@ type SAIdentity struct {
 // SADelegation verifies a delegating service account token (the per-device WG
 // web terminal): the token is valid for api.SATokenAudience, the SA lives in
 // the hub namespace, is annotated for exactly (ns, device), and onBehalfOf is
-// a syntactically valid lowercase email.
+// empty (a gateway session: its users are named per connection) or a
+// syntactically valid lowercase email.
 type SADelegation interface {
 	Verify(ctx context.Context, token, ns, device, onBehalfOf string) (SAIdentity, error)
+}
+
+// DelegateVerifier is implemented by an SADelegation that also accepts the web
+// gateway: the same token and device-binding checks, without an asserted user
+// (each spliced connection names and is authorized for its own user).
+type DelegateVerifier interface {
+	VerifyDelegate(ctx context.Context, token, ns, device string) (SAIdentity, error)
 }
 
 // Authorizer answers whether a user may open an exec-class session in a
@@ -142,6 +150,9 @@ type Deps struct {
 	SA       SADelegation
 	Authz    Authorizer
 	TURN     TURNMinter
+	// Status verifies the Backstage service account token of the status
+	// listener (optional: without it StatusHandler refuses everything).
+	Status StatusAuthenticator
 	// Tunnel is optional; New creates the wireguard-go tunnel when nil.
 	Tunnel Tunnel
 }

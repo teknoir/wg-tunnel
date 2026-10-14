@@ -131,6 +131,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The status listener (live status and admin actions for the Backstage
+	// backend) is off unless STATUS_ADDR is set; it then needs BACKSTAGE_SA, the
+	// full username of the Backstage service account.
+	statusAddr := env("STATUS_ADDR", "")
+	backstageSA := env("BACKSTAGE_SA", "")
+	if statusAddr != "" && backstageSA == "" {
+		return errors.New("STATUS_ADDR needs BACKSTAGE_SA (system:serviceaccount:<namespace>:<name>)")
+	}
 	flushGrace, err := time.ParseDuration(env("FLUSH_GRACE", "300ms"))
 	if err != nil || flushGrace < 0 {
 		return fmt.Errorf("FLUSH_GRACE must be a non-negative duration such as 300ms: %v", err)
@@ -141,6 +149,7 @@ func run() error {
 		PodIP:          podIP,
 		WGListenPort:   api.HubWGPort,
 		ClientIPHeader: env("CLIENT_IP_HEADER", ""),
+		BackstageSA:    backstageSA,
 		Logger:         log,
 	}, hub.Deps{
 		Policy:   policy,
@@ -150,6 +159,7 @@ func run() error {
 		SA:       hub.NewK8sSADelegation(cs, hubNS),
 		Authz:    hub.NewCachedAuthorizer(hub.NewK8sAuthorizer(cs), 5*time.Second, 1024),
 		TURN:     hub.NewTURNMinter(secrets.Secret, turnURLs, 30*time.Minute, nil),
+		Status:   hub.NewK8sStatusAuth(cs),
 	})
 	if err != nil {
 		return err
@@ -164,7 +174,13 @@ func run() error {
 	internalSrv := hub.NewHTTPServer(env("INTERNAL_HTTP_ADDR", fmt.Sprintf(":%d", api.HubInternalPort)), h.InternalHandler())
 	metricsSrv := hub.NewHTTPServer(env("METRICS_ADDR", ":9090"), metricsMux(h))
 
-	errc := make(chan error, 4)
+	srvs := []*http.Server{httpSrv, internalSrv, metricsSrv}
+	errc := make(chan error, 5)
+	if statusAddr != "" {
+		statusSrv := hub.NewHTTPServer(statusAddr, h.StatusHandler())
+		srvs = append(srvs, statusSrv)
+		go func() { errc <- statusSrv.ListenAndServe() }()
+	}
 	go func() { errc <- httpSrv.ListenAndServe() }()
 	go func() { errc <- internalSrv.ListenAndServe() }()
 	go func() { errc <- metricsSrv.ListenAndServe() }()
@@ -177,11 +193,11 @@ func run() error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server stopped", "err", err)
 			stop()
-			shutdown(httpSrv, internalSrv, metricsSrv)
+			shutdown(srvs...)
 			return err
 		}
 	}
-	shutdown(httpSrv, internalSrv, metricsSrv)
+	shutdown(srvs...)
 	return nil
 }
 

@@ -245,7 +245,6 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 	return &best, nil
 }
 
-
 // withAttestation returns cur carrying the attestation and capabilities, or
 // nil when cur already has them.
 func withAttestation(cur api.IdentityEntry, att *attested, caps []string) *api.IdentityEntry {

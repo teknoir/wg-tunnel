@@ -27,6 +27,9 @@ type Config struct {
 	WGListenPort int
 	// Endpoint overrides the advertised "ip:port" (default PodIP:<listen port>).
 	Endpoint string
+	// BackstageSA is the full username ("system:serviceaccount:<ns>:<name>") of
+	// the Backstage backend, the only caller of the status listener.
+	BackstageSA string
 	// ClientIPHeader names a header with the real client address set by a
 	// trusted proxy (e.g. X-Envoy-External-Address). Per-source rate limits
 	// apply only to requests that carry a parseable address in it: behind a

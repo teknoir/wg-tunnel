@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-# Two images from one file: build a target with
+# Three images from one file: build a target with
 #   docker buildx build --target wg-hub   -t ghcr.io/teknoir/wg-hub   .
 #   docker buildx build --target wg-agent -t ghcr.io/teknoir/wg-agent .
+#   docker buildx build --target wg-gateway -t ghcr.io/teknoir/wg-gateway .
 #
 # The Go toolchain runs on the build host's architecture and cross-compiles
 # (CGO off, so no C toolchain and no emulation is needed); the final stage only
@@ -26,7 +27,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     set -eu; \
     export GOOS="${TARGETOS}" GOARCH="${TARGETARCH}"; \
     if [ "${TARGETARCH}" = "arm" ]; then export GOARM="${TARGETVARIANT#v}"; fi; \
-    for cmd in wg-hub wg-agent; do \
+    for cmd in wg-hub wg-agent wg-gateway; do \
       go build -trimpath \
         -ldflags "-s -w -X github.com/teknoir/wg-tunnel/pkg/version.Version=${VERSION}" \
         -o "/out/${cmd}" "./cmd/${cmd}"; \
@@ -34,12 +35,13 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 # wg-hub: unprivileged, no TUN device, no capabilities. Listens on UDP 51820
 # (WireGuard), TCP 8080 (outside session API), TCP 8081 (internal API: service
-# account delegation and direct sessions) and TCP 9090 (metrics). The same
+# account delegation and direct sessions), TCP 8082 (status and admin API for the
+# Backstage backend; only when STATUS_ADDR is set) and TCP 9090 (metrics). The same
 # binary runs `wg-hub flags-watcher` (metrics and health on 9090).
 FROM ${BASE_IMAGE} AS wg-hub
 COPY --from=build /out/wg-hub /usr/local/bin/wg-hub
 USER 65532:65532
-EXPOSE 8080 8081 9090 51820/udp
+EXPOSE 8080 8081 8082 9090 51820/udp
 ENTRYPOINT ["/usr/local/bin/wg-hub"]
 
 # wg-agent: no shell. The pod's init container runs `wg-agent init` as uid 0
@@ -50,3 +52,12 @@ COPY --from=build /out/wg-agent /usr/local/bin/wg-agent
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/wg-agent"]
 CMD ["run"]
+
+# wg-gateway: the web gateway, second container of the per-device wgt- pod.
+# Unprivileged, no shell, no capabilities; serves HTTP on TCP 8090. It reaches
+# the hub over UDP (WireGuard, direct) and TCP 8081.
+FROM ${BASE_IMAGE} AS wg-gateway
+COPY --from=build /out/wg-gateway /usr/local/bin/wg-gateway
+USER 65532:65532
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/wg-gateway"]
