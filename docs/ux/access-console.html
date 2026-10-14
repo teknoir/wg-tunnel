@@ -228,6 +228,7 @@ td.num,th.num{text-align:right}
 .picker .field{border:0;border-bottom:1px solid var(--line)}
 .picker ul{list-style:none;margin:0;padding:0;max-height:170px;overflow:auto}
 .picker li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--line2)}
+.picker li.blocked{opacity:.6}
 .picker li:hover{background:rgba(255,255,255,.04)}
 .picker li[aria-selected=true]{background:rgba(59,97,191,.16);box-shadow:inset 3px 0 0 var(--blue)}
 .picker li .n{font-size:13px}
@@ -303,16 +304,21 @@ const FP={
   wgid:'ju0/FUShfUhTCdqgJqc8xwgPK8SAYZy8yeZ82RmojFw',
   newid:'RbCkSkLvciC0LWPGUSmvCNZSpRi7yhBJ2h4nj0yyb/8'
 };
-const PASTED_TYPO='{"time":"2026-10-14T15:44:02Z","level":"INFO","msg":"device identity","fingerprint":"SHA256:RbCkSkLvciC0LWPGUSmvCNZ5pRi7yhBJ2h4nj0yyb/8"}';
+const PASTED_WG_TYPO='{"time":"2026-10-14T15:44:02Z","level":"INFO","msg":"device identity","fingerprint":"SHA256:RbCkSkLvciC0LWPGUSmvCNZ5pRi7yhBJ2h4nj0yyb/8"}';
+const PASTED_WG_OK='{"time":"2026-10-14T16:11:09Z","level":"INFO","msg":"device identity","fingerprint":"SHA256:RbCkSkLvciC0LWPGUSmvCNZSpRi7yhBJ2h4nj0yyb/8"}';
+const PASTED_HK_TYPO='256 SHA256:eb+w4rp2udRHYG3bzE1INPBaTBHesFLnS0nqMHo8W80 root@rtx2000-ada-128gb-se (ED25519)';
+const PASTED_HK_OK='256 SHA256:eb+w4rp2udRHYG3bzElINPBaTBHesFLnS0nqMHo8W80 root@rtx2000-ada-128gb-se (ED25519)';
+const NODE_IPS=['192.168.10.20'];
+const CP_PORTS=[6443,10250,10255,2379,2380,10257,10259];
 const C={green:'#1DB954',blue:'#3B61BF',purple:'#9B357D',orange:'#ED6D36',red:'#FA4E4E',yellow:'#E0AD1B',silver:'#808080',gray:'#3A3A3A'};
 const KIND={ssh:{acc:C.green,on:'#000',label:'SSH'},internal:{acc:C.blue,on:'#fff',label:'k3s service'},external:{acc:C.purple,on:'#fff',label:'Device network'}};
 const ALL_SERVICES=[
   {id:'ssh',kind:'ssh',target:'127.0.0.1:22',protocol:'TCP'},
   {id:'grafana',kind:'internal',target:'grafana.monitoring:3000',protocol:'HTTP, in browser',url:'https://wgs-k3v9q2m7x4d1h8n6c5ta.'+DOMAIN,desc:'Device dashboards'},
   {id:'postgres',kind:'internal',target:'postgres.historian:5432',protocol:'TCP',desc:'Historian database'},
-  {id:'openclaw',kind:'external',target:'127.0.0.1:31789',protocol:'HTTP, in browser',url:'https://wgs-p8r2w6y1z3b5n7m9q4ce.'+DOMAIN,desc:'OpenClaw console'},
+  {id:'openclaw',kind:'external',target:'192.168.10.30:31789',protocol:'HTTP, in browser',url:'https://wgs-p8r2w6y1z3b5n7m9q4ce.'+DOMAIN,desc:'OpenClaw console'},
   {id:'camera-dock-2',kind:'external',target:'192.168.10.64:554',protocol:'TCP',desc:'Loading dock camera, RTSP'},
-  {id:'open-notebook',kind:'external',target:'127.0.0.1:30502',protocol:'HTTP',pending:true}
+  {id:'open-notebook',kind:'external',target:'192.168.10.31:30502',protocol:'HTTP',pending:true}
 ];
 const SESSIONS=[
   {user:'anders.aslund@teknoir.ai',you:true,svc:'ssh',kind:'ssh',client:'tnctl',path:'Direct (LAN)',since:'12 min',abs:'15:37',down:'4.1 MB',up:'220 kB'},
@@ -325,25 +331,38 @@ const DEVICE_K3S_SERVICES=[
   {n:'historian-api',ns:'historian',ports:['8080/TCP http','9090/TCP metrics']},
   {n:'mosquitto',ns:'teknoir',ports:['1883/TCP mqtt']},
   {n:'postgres',ns:'historian',ports:['5432/TCP']},
-  {n:'nvr-web',ns:'nvr',ports:['8000/TCP http']}
+  {n:'nvr-web',ns:'nvr',ports:['8000/TCP http']},
+  {n:'legacy-db',ns:'historian',ports:['5432/TCP'],blocked:'legacy-db is an ExternalName Service. Only Services with a cluster IP in this device’s k3s can be exposed.'},
+  {n:'kubernetes',ns:'default',ports:['443/TCP https'],blocked:'default/kubernetes is the Kubernetes API server and can’t be exposed.'},
+  {n:'metrics-server',ns:'kube-system',ports:['443/TCP https'],blocked:'Services in kube-system can’t be exposed. They belong to the device’s control plane.'}
 ];
 
 /* ---- states ---- */
+const WAITSVC={svcAvail:false,svcNote:'Services open once the device identity is approved.',link:'up',flags:null,sessions:[],path:'—'};
 const STATES={
-  active:{label:'Active + direct',state:'Active',sc:C.green,path:'Direct (LAN)',sessions:SESSIONS,act:'Automatic',ac:C.green,id:'auto',services:ALL_SERVICES,svcAvail:true,link:'up',flags:null},
-  waiting:{label:'Waiting for approval',state:'Waiting for approval',sc:C.orange,path:'—',sessions:[],act:'No host key yet',ac:C.orange,id:'waiting',services:ALL_SERVICES.slice(0,1),svcAvail:false,svcNote:'Services open once the device identity is approved.',link:'up',flags:null},
+  active:{label:'Active, automatic',state:'Active',sc:C.green,path:'Direct (LAN)',sessions:SESSIONS,act:'Automatic',ac:C.green,id:'auto',services:ALL_SERVICES,svcAvail:true,link:'up',flags:null},
+  waiting:Object.assign({label:'Waiting: trust host key',state:'Waiting for approval',sc:C.orange,act:'No trusted host key',ac:C.orange,id:'waiting',services:ALL_SERVICES.slice(0,1),paste:PASTED_HK_TYPO},WAITSVC),
+  waitingok:{label:'Waiting: host key matches',base:'waiting',paste:PASTED_HK_OK},
+  waitingwg:{label:'Waiting: approve identity only',base:'waiting',wmode:'wg',paste:PASTED_WG_TYPO},
+  forced:Object.assign({label:'Forced manual after compromise',state:'Waiting for approval',sc:C.orange,act:'Manual, forced',ac:C.orange,id:'forced',services:ALL_SERVICES,paste:PASTED_WG_TYPO},WAITSVC),
+  duplicate:Object.assign({label:'Duplicate host key',state:'Waiting for approval',sc:C.orange,act:'Duplicate host key',ac:C.orange,id:'duplicate',services:ALL_SERVICES.slice(0,1),paste:''},WAITSVC),
+  unavail:Object.assign({label:'Verification unavailable: old agent',state:'Waiting for approval',sc:C.orange,act:'Manual only',ac:C.orange,id:'unavail',services:ALL_SERVICES.slice(0,1),paste:PASTED_WG_OK},WAITSVC),
+  unavailkey:{label:'Verification unavailable: no ed25519 key',base:'unavail',id:'unavailkey',paste:''},
+  unattested:{label:'Unattested enrollment (red)',state:'Blocked',sc:C.red,path:'—',sessions:[],act:'Unattested enrollment',ac:C.red,id:'unattested',services:ALL_SERVICES,svcAvail:false,svcNote:'Services stay closed while this enrollment is blocked.',svcNoteC:C.red,link:'up',flags:null},
   mismatch:{label:'Host key mismatch',state:'Blocked',sc:C.red,path:'—',sessions:[],act:'Host key mismatch',ac:C.red,id:'mismatch',services:ALL_SERVICES,svcAvail:false,svcNote:'Services stay closed while the host key does not match.',svcNoteC:C.red,link:'up',flags:null},
   revoked:{label:'Revoked',state:'Revoked',sc:C.red,path:'—',sessions:[],emptySessions:'No sessions. All sessions ended when access was revoked.',act:'Automatic',ac:C.silver,id:'revoked',services:ALL_SERVICES,svcAvail:false,svcNote:'Access is revoked. Services are unreachable until an admin clears the flags.',svcNoteC:C.red,link:'up',flags:'compromised'},
   offline:{label:'Device offline',state:'Device offline',sc:C.yellow,path:'—',sessions:[],emptySessions:'No sessions while the device is offline.',act:'Automatic',ac:C.green,id:'offline',services:ALL_SERVICES,svcAvail:false,svcNote:'The device is offline. Services are unreachable until it reconnects.',svcNoteC:C.yellow,link:'down',flags:null},
   stale:{label:'Stale + error toast',base:'active',stale:true},
   loading:{label:'Loading',loading:true},
   off:{label:'Off',state:'Off',sc:C.silver,path:'—',sessions:[],act:'—',ac:C.silver,off:true},
-  dialog:{label:'Add service dialog',base:'active',dialog:true}
+  dialog:{label:'Add service dialog',base:'active',dialog:true},
+  dialogbad:{label:'Add service: rejected address',base:'active',dialog:'bad'},
+  dialogks:{label:'Add service: rejected k3s service',base:'active',dialog:'ks'}
 };
-let cur='active', admin=true, pasteVal=PASTED_TYPO, animate=true;
+let cur='active', admin=true, pasteVal='', animate=true, wmode='host';
 const sw={wg:true,p2p:true,mode:'auto',term:true};
 
-function resolve(k){const s=STATES[k];return s.base?Object.assign({},STATES[s.base],s,{label:s.label}):s}
+function resolve(k){const s=STATES[k];return s.base?Object.assign({},resolve(s.base),s,{label:s.label}):s}
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ticks=()=>'<span class="tk a"></span><span class="tk b"></span><span class="tk c"></span><span class="tk d"></span>';
 const ICON={
@@ -406,63 +425,128 @@ function compareFig(top,bottom,labels,opt={}){
     <div class="units">${units}</div></div><ul class="sr">${sr}</ul></figure>`};
 }
 function parsePasted(v){
+  /* Accepts an ssh-keygen line, a log line, a bare SHA256:… value or the bare 43 characters. Returns the 43-character token. */
   if(!v)return '';
-  let m=v.split('SHA256:'); let s=m.length>1?m[m.length-1]:v.replace(/\s+/g,'');
-  s=s.replace(/\s+/g,''); const k=s.match(/^[A-Za-z0-9+/]*/); return k?k[0].slice(0,43):'';
+  const m=v.match(/SHA256:\s*([A-Za-z0-9+\/]+)/);
+  let t;
+  if(m)t=m[1];
+  else{const k=v.trim().split(/\s+/);t=k.find(x=>/^[A-Za-z0-9+\/]{43}$/.test(x))||k[0].replace(/[^A-Za-z0-9+\/].*$/,'');}
+  return t.slice(0,43);
 }
 
 /* ---- identity ---- */
+const HK_CMD='ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub';
+const WG_CMD="sudo kubectl logs deploy/wg-agent | grep 'device identity'";
+const wgFact=(fp)=>['WireGuard identity',`<span class="mono-s">SHA256:${fp.slice(0,8)}…${fp.slice(-4)}</span>${copyBtn('SHA256:'+fp,'Copy WireGuard identity fingerprint')}`];
+const TRUSTED_BY='anders.aslund@teknoir.ai, 12 Oct';
 function identity(s){
   const facts=(rows)=>`<div class="facts">${rows.map(([l,v,cls])=>`<div><div class="lbl">${l}</div><div class="v ${cls||''}">${v}</div></div>`).join('')}</div>`;
-  const wgFact=['WireGuard identity',`<span class="mono-s">SHA256:${FP.wgid.slice(0,8)}…${FP.wgid.slice(-4)}</span>${copyBtn('SHA256:'+FP.wgid,'Copy WireGuard identity fingerprint')}`];
-  const why=`<details class="why"><summary>What this proves</summary><p>Only root on the device can read its SSH host key, so a match shows that the software enrolling is running on the same machine Teknoir saw before. It doesn't protect you if someone already has root on the device, and devices cloned from one image share host keys. In those cases, switch activation to Manual.</p></details>`;
+  const why=`<details class="why"><summary>What this proves</summary><p>Only root on the device can read its SSH host key, so a signature from it shows that the enrolling software runs on the same machine an admin checked when trusting the key. It doesn't protect you if someone already has root on the device. Devices cloned from one image share host keys, so Teknoir refuses automatic activation when two devices trust the same key. In those cases, switch activation to Manual.</p></details>`;
+  const keep=`<button class="btn" data-act="keep">Keep blocked</button>`;
+  const mark=`<button class="btn danger-o" data-act="compromise">Mark compromised</button>`;
   let verdict, fig, side, extra='', vc;
   const right=`<a href="#" class="hint" style="color:var(--off)">How activation works</a>`;
-  if(s.id==='auto'||s.id==='revoked'||s.id==='offline'){
-    vc=s.id==='revoked'?C.red:C.green;
-    const c=compareFig(FP.anchor,FP.anchor,['Seen through tunnel','Signed by device'],{dim:s.id==='revoked'});
-    if(s.id==='revoked'){
-      verdict=`<h3>Access revoked</h3><p>Marked compromised by anders.aslund@teknoir.ai 14 min ago: “Unknown process listening on port 8443.” The identity below still matches, but nobody can connect until an admin clears the flag.</p>`;
-    } else {
-      verdict=`<h3>Activated automatically</h3><p>The device proved it holds the SSH host key Teknoir saw through the SSH tunnel on 12 Oct at 09:14.</p>`;
-    }
-    if(s.id==='offline') extra=`<p class="note-y">The device hasn't been connected to the hub since 15:02 (12 min ago). What you see is its last known state.</p>`;
-    fig=c.html+`<div class="cmpsum"><span${s.id==='revoked'?' style="color:var(--silver)"':''}>${c.match} of ${c.n} groups match</span><span class="muted">Host key SHA256:${FP.anchor.slice(0,8)}… (ed25519)</span></div>`+why;
-    side=facts([['Anchor source','SSH tunnel, 12 Oct'],['Attested','4 min ago'],['Enrollment conflicts','0'],wgFact,['Enrollment','#2, today 15:44']]);
-  } else if(s.id==='waiting'){
-    vc=C.orange;
+
+  /* manual approval of one WireGuard identity: used by waiting (after "Approve identity only"), forced manual, duplicate key, verification unavailable */
+  const manualFlow=(note)=>{
     const pv=parsePasted(pasteVal);
     const c=compareFig(FP.newid,pv,['Presented to Teknoir','From the device log']);
-    const diff=pv? c.n-c.match:0;
-    const ok=pv.length===43&&c.match===c.n;
-    verdict=`<h3>Waiting for approval</h3><p>This device has no SSH host key on record yet, so it can't prove itself automatically. Compare the fingerprint it presented with the one it prints in its log, then approve. Later re-enrollments of this device activate automatically.</p>`;
-    let sum=!pv?`<span class="muted" style="color:var(--silver)">Nothing to compare yet</span>`
+    const ok=pv.length===43&&c.match===c.n, diff=pv?c.n-c.match:0;
+    const sum=!pv?`<span style="color:var(--silver)">Nothing to compare yet</span>`
       : ok?`<span style="color:${C.green}">${c.n} of ${c.n} groups match</span>`
       : `<span style="color:${C.red}">${diff} ${diff===1?'group differs':'groups differ'}. Check for a typo or copy the line again.</span>`;
-    const approve=admin
+    const btn=admin
       ? `<button class="btn green" data-act="approve" ${ok?'':'disabled aria-describedby="apphint"'}>Approve identity</button>${ok?'':`<span class="hint" id="apphint">${pv?'Approval needs every group to match.':'Paste the device’s fingerprint to enable approval.'}</span>`}`
-      : `<span class="hint">A teamspace admin approves new device identities. Send them this page.</span>`;
-    fig=`<div id="cmpbox">${c.html}<div class="cmpsum">${sum}</div></div>
+      : `<span class="hint">Ask a teamspace admin to approve this identity. Send them this page.</span>`;
+    return `<div id="cmpbox">${c.html}<div class="cmpsum">${sum}${pv?`<span class="muted">Read from your paste: ${pv.length} of 43 characters</span>`:''}</div></div>
       <div class="paste">
         <div class="hint">On the device, run this and copy the fingerprint it prints:</div>
-        ${cmd("sudo kubectl logs deploy/wg-agent | grep 'device identity'")}
+        ${cmd(WG_CMD)}
         <label for="paste" style="margin-top:8px">Paste the fingerprint from the device log</label>
         <input id="paste" class="field" value="${esc(pasteVal)}" placeholder="SHA256:… or the whole log line" autocomplete="off" spellcheck="false">
       </div>
-      <div class="actions" id="approveRow">${approve}</div>
-      <p class="hint" style="margin:18px 0 0;max-width:80ch">Or skip the comparison: turn on the SSH tunnel on the <a href="#">Tunneling tab</a>. Teknoir then records the device's host key and activates it without a manual comparison.</p>`;
-    side=facts([['Anchor source','None yet'],['Presented','2 min ago'],['Enrollment conflicts','0'],['Enrollment','#1, today 15:44'],['Activation mode','Automatic after first approval']]);
+      <div class="actions" id="approveRow">${btn}</div>
+      ${note?`<p class="hint" style="margin:18px 0 0;max-width:80ch">${note}</p>`:''}`;
+  };
+
+  if(s.id==='auto'||s.id==='revoked'||s.id==='offline'){
+    vc=s.id==='revoked'?C.red:C.green;
+    const c=compareFig(FP.anchor,FP.anchor,['Trusted host key','Signed by device'],{dim:s.id==='revoked'});
+    if(s.id==='revoked'){
+      verdict=`<h3>Access revoked</h3><p>Marked compromised by anders.aslund@teknoir.ai 14 min ago: “Unknown process listening on port 8443.” The identity below still matches, but nobody can connect until an admin clears the flag. After that, the next identity needs manual approval.</p>`;
+    } else {
+      verdict=`<h3>Activated automatically</h3><p>The device signed its new identity with the trusted SSH host key (trusted by anders.aslund@teknoir.ai on 12 Oct at 09:14).</p>`;
+    }
+    if(s.id==='offline') extra=`<p class="note-y">The device hasn't been connected to the hub since 15:02 (12 min ago). What you see is its last known state.</p>`;
+    fig=c.html+`<div class="cmpsum"><span${s.id==='revoked'?' style="color:var(--silver)"':''}>${c.match} of ${c.n} groups match</span><span class="muted">Host key SHA256:${FP.anchor.slice(0,8)}… (ed25519)</span></div>`+why
+      +(admin&&s.id==='auto'?`<div class="actions" style="margin-top:14px"><button class="btn sm text" style="padding:0" data-act="anchor">Update trusted host key</button></div>`:'');
+    side=facts([['Trusted by',TRUSTED_BY],['Attested','4 min ago'],['Enrollment conflicts','0'],wgFact(FP.wgid),['Enrollment','#2, today 15:44']]);
+  } else if(s.id==='waiting'&&wmode==='host'){
+    vc=C.orange;
+    const pv=parsePasted(pasteVal);
+    const c=compareFig(FP.anchor,pv,['Signed by device','On the device']);
+    const diff=pv? c.n-c.match:0;
+    const ok=pv.length===43&&c.match===c.n;
+    verdict=`<h3>Waiting for approval</h3><p>No SSH host key is trusted for this device yet. Compare the host key it signed its enrollment with against the key on the device itself, then trust it. After that, every re-enrollment signed by that key activates automatically.</p>`;
+    const sum=!pv?`<span style="color:var(--silver)">Nothing to compare yet</span>`
+      : ok?`<span style="color:${C.green}">${c.n} of ${c.n} groups match</span>`
+      : `<span style="color:${C.red}">${diff} ${diff===1?'group differs':'groups differ'}. Check for a typo or copy the line again.</span>`;
+    const btns=admin
+      ? `<button class="btn green" data-act="trustact" ${ok?'':'disabled aria-describedby="apphint"'}>Trust host key and activate</button><button class="btn" data-act="trustonly" ${ok?'':'disabled'}>Trust host key only</button>${ok?`<span class="hint" id="apphint">Trusts this host key for this device and approves its WireGuard identity (right).</span>`:`<span class="hint" id="apphint">${pv?'Trusting needs every group to match.':'Paste the output from the device to enable trusting.'}</span>`}`
+      : `<span class="hint">Ask a teamspace admin to trust this host key. Send them this page.</span>`;
+    fig=`<div id="cmpbox">${c.html}<div class="cmpsum">${sum}${pv?`<span class="muted">Read from your paste: ${pv.length} of 43 characters</span>`:''}</div></div>
+      <div class="paste">
+        <div class="hint">On the device, run this and paste what it prints:</div>
+        ${cmd(HK_CMD)}
+        <label for="paste" style="margin-top:8px">Paste the output of ssh-keygen</label>
+        <input id="paste" class="field" value="${esc(pasteVal)}" placeholder="256 SHA256:… root@host (ED25519), or just the SHA256 value" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="actions" id="approveRow">${btns}</div>
+      <details class="why" style="margin-top:18px"><summary>No shell access to the device?</summary><p>You can approve only this WireGuard identity by comparing the fingerprint in the agent log. The host key then stays untrusted, so the next re-enrollment waits for approval again. ${admin?`<button class="btn sm text" style="height:auto;padding:0;text-decoration:underline" data-act="tomanual">Approve identity only</button>`:'Ask a teamspace admin.'}</p></details>`;
+    side=facts([['Trusted host key','None yet'],['Attested','2 min ago'],['Enrollment conflicts','0'],wgFact(FP.newid),['Enrollment','#1, today 15:44']]);
+  } else if(s.id==='waiting'){
+    vc=C.orange;
+    verdict=`<h3>Waiting for approval</h3><p>You are approving this WireGuard identity only. The SSH host key stays untrusted, so the next re-enrollment of this device waits for approval again.</p>`;
+    fig=manualFlow(`<button class="btn sm text" style="height:auto;padding:0;text-decoration:underline" data-act="tohost">Compare the host key instead</button> to activate this device and its future re-enrollments automatically.`);
+    side=facts([['Trusted host key','None yet'],['Presented','2 min ago'],['Enrollment conflicts','0'],wgFact(FP.newid),['Enrollment','#1, today 15:44']]);
+  } else if(s.id==='forced'){
+    vc=C.orange;
+    verdict=`<h3>Manual approval required this time</h3><p>An admin cleared a compromised flag on 14 Oct at 16:02. This device's host key still matches the trusted one, but that is not enough now. If the device was compromised, whoever had access could also use its host key, so a match proves little. A person must approve the next identity. After that, automatic activation resumes.</p>`;
+    fig=manualFlow('Applies once, to this enrollment only. The activation setting stays on Automatic.');
+    side=facts([['Host key','<span style="color:var(--green)">Matches the trusted key</span>'],['Trusted by',TRUSTED_BY],['Flag cleared','anders.aslund@teknoir.ai, 14 Oct 16:02'],wgFact(FP.newid),['Enrollment','#4, today 16:11']]);
+  } else if(s.id==='duplicate'){
+    vc=C.orange;
+    verdict=`<h3>Automatic activation refused: duplicate host key</h3><p>The same SSH host key is trusted on <a href="#" style="color:var(--off)">jetson-orin-lab-3</a>. Devices cloned from one image share host keys, so the key can't tell them apart. Approve this identity by hand. To get automatic activation back, generate new SSH host keys on one of the two devices and trust the new key.</p>`;
+    fig=manualFlow('');
+    side=facts([['Host key','<span style="color:var(--green)">Matches the trusted key</span>'],['Also trusted on','<a href="#" style="color:var(--off)">jetson-orin-lab-3</a>','warn'],['Trusted by',TRUSTED_BY],wgFact(FP.newid),['Enrollment','#2, today 15:44']]);
+  } else if(s.id==='unavail'||s.id==='unavailkey'){
+    vc=C.orange;
+    const old=s.id==='unavail';
+    verdict=`<h3>Automatic verification unavailable: ${old?'agent too old':'no ed25519 host key'}</h3><p>${old
+      ?'The agent on this device is too old to sign its identity with the SSH host key (it does not offer host-key attestation). Update the agent to turn automatic activation on. Until then, approve each identity by hand.'
+      :'This device has no ed25519 SSH host key, so the agent has nothing to sign with. Generate one on the device (ssh-keygen -A) to turn automatic activation on. Until then, approve each identity by hand.'}</p>`;
+    fig=manualFlow('');
+    side=facts([['Trusted host key','Not possible yet'],['Agent',old?'Version 0.4.1, no attestation':'Attestation supported'],['Host key',old?'Unknown':'No ed25519 key'],wgFact(FP.newid),['Enrollment','#1, today 15:44']]);
+  } else if(s.id==='unattested'){
+    vc=C.red;
+    const c=compareFig(FP.anchor,null,['Trusted host key','Signed by device']);
+    verdict=`<h3>Unattested enrollment. Likely not this device.</h3><p>The agent on this device always signs its enrollment with the SSH host key, but this enrollment arrived with no signature. A genuine agent would have signed it, so something else is probably using this device's credentials. Access is blocked. If the real device enrolls, its signed enrollment replaces this one by itself.</p>`;
+    fig=c.html+`<div class="cmpsum"><span>Nothing signed. Nothing to compare.</span><span class="muted">An unsigned enrollment never matches, whatever it presents.</span></div>
+      <div class="actions">
+        ${keep}${admin?`<button class="btn" data-act="reset">Reset enrollment</button>`:''}${mark}
+        ${admin?'':`<span class="hint">Ask a teamspace admin to reset the enrollment.</span>`}
+      </div>`;
+    side=facts([['Trusted by',TRUSTED_BY],['Attested','Never, this enrollment'],['Agent','Offers attestation, did not use it','warn'],wgFact(FP.other),['Enrollment','#3, today 15:58']]);
   } else if(s.id==='mismatch'){
     vc=C.red;
-    const c=compareFig(FP.anchor,FP.other,['Seen through tunnel','Signed by device']);
-    verdict=`<h3>Host key mismatch. Access is blocked.</h3><p>The device signed its enrollment with a different SSH host key than the one Teknoir saw through the tunnel on 12 Oct. Either the host keys were changed (an OS reinstall or image rebuild), or another machine is using this device's credentials.</p>`;
-    fig=c.html+`<div class="cmpsum"><span${s.id==='revoked'?' style="color:var(--silver)"':''}>${c.match} of ${c.n} groups match</span><span class="muted">A different key changes every group. Never accept a partial match.</span></div>
+    const c=compareFig(FP.anchor,FP.other,['Trusted host key','Signed by device']);
+    verdict=`<h3>Host key mismatch. Access is blocked.</h3><p>The device signed its enrollment with a different SSH host key than the one an admin trusted on 12 Oct. Either the host keys were changed (an OS reinstall or image rebuild), or another machine is using this device's credentials.</p>`;
+    fig=c.html+`<div class="cmpsum"><span>${c.match} of ${c.n} groups match</span><span class="muted">A different key changes every group. Never accept a partial match.</span></div>
       <div class="actions">
-        <button class="btn" data-act="keep">Keep blocked</button>
-        <button class="btn danger-o" data-act="compromise">Mark compromised</button>
-        ${admin?`<button class="btn" data-act="reset">Reset enrollment</button><button class="btn text danger-t" data-act="anchor">Update anchor</button>`:`<span class="hint">Resetting enrollment or trusting a new host key needs a teamspace admin.</span>`}
+        ${keep}${mark}
+        ${admin?`<button class="btn" data-act="reset">Reset enrollment</button><button class="btn text danger-t" data-act="anchor">Update trusted host key</button>`:`<span class="hint">Ask a teamspace admin to reset the enrollment or update the trusted host key.</span>`}
       </div>`;
-    side=facts([['Anchor source','SSH tunnel, 12 Oct'],['Attested','1 min ago'],['Enrollment conflicts','0'],wgFact.map((x,i)=>i?x.replace(FP.wgid.slice(0,8),'Qm4tR2xa'):x),['Enrollment','#3, today 15:58']]);
+    side=facts([['Trusted by',TRUSTED_BY],['Attested','1 min ago'],['Enrollment conflicts','0'],wgFact('Qm4tR2xaPvB7yJ0dN3sLk8cHf5WzEu1gXoTiA6rVq9M'),['Enrollment','#3, today 15:58']]);
   }
   return `<section class="panel s12" style="--acc:${vc};--vc:${vc}" aria-labelledby="idh">${ticks()}
     <div class="phrow"><h2 class="ph" id="idh">Identity</h2>${right}</div>
@@ -485,7 +569,7 @@ function serviceCard(v,avail){
   }
   return `<article class="panel svc" style="--acc:${k.acc};--on-acc:${k.on}">${ticks()}
     <div class="top"><span class="sq"></span><span class="name">${esc(v.id)}</span>${v.pending?'<span class="tag">Applying…</span>':`<span class="kind">${k.label}</span>`}
-      ${v.kind!=='ssh'&&admin!==null?`<button class="iconbtn red" aria-label="Remove ${esc(v.id)}" title="Remove service">${ICON.trash}</button>`:''}</div>
+      ${v.kind!=='ssh'&&admin?`<button class="iconbtn red" aria-label="Remove ${esc(v.id)}" title="Remove service">${ICON.trash}</button>`:''}</div>
     <div class="kv"><div><div class="lbl">Target</div><div class="v">${esc(v.target)}</div></div><div><div class="lbl">Protocol</div><div class="v">${esc(v.protocol)}</div></div></div>
     ${v.desc?`<div class="desc">${esc(v.desc)}</div>`:''}
     <div class="act">${act}</div></article>`;
@@ -493,12 +577,13 @@ function serviceCard(v,avail){
 function services(s){
   const list=s.services;
   const cards=list.map(v=>serviceCard(v,s.svcAvail)).join('');
-  const empty=list.length===1?`<article class="panel svc empty">${ticks()}<p class="body" style="margin:0">Add a service to reach a web app or a port on this device. Use a k3s service for apps in the device's cluster, or an address for things on its network, like a camera.</p><div><button class="btn" data-act="add">${ICON.plus}Add service</button></div></article>`:'';
+  const empty=list.length===1?`<article class="panel svc empty">${ticks()}<p class="body" style="margin:0">Add a service to reach a web app or a port on this device. Use a k3s service for apps in the device's cluster, or an address for things on its network, like a camera.</p><div>${admin?`<button class="btn" data-act="add">${ICON.plus}Add service</button>`:`<span class="hint">Ask a teamspace admin to add services.</span>`}</div></article>`:'';
   return `<section class="panel s12" style="--acc:${C.gray}" aria-labelledby="svch">${ticks()}
-    <div class="phrow"><h2 class="ph" id="svch">Services<span class="count">${list.length}</span></h2><button class="btn" data-act="add">${ICON.plus}Add service</button></div>
+    <div class="phrow"><h2 class="ph" id="svch">Services<span class="count">${list.length}</span></h2>${admin?`<button class="btn" data-act="add">${ICON.plus}Add service</button>`:`<span class="hint">Only teamspace admins can add or remove services.</span>`}</div>
     ${s.svcNote?`<p class="svcnote" style="--vc:${s.svcNoteC||C.orange}">${s.svcNote}</p>`:''}
     <div class="svcgrid">${cards}${empty}</div>
-    ${list.length>1?`<p class="hint" style="margin:14px 0 0">tnctl port-forward prints the local port it listens on. Put a port before the service ID to choose it, for example <code>8080:postgres</code>.</p>`:''}</section>`;
+    ${list.length>1?`<p class="hint" style="margin:14px 0 0">tnctl port-forward prints the local port it listens on. Put a port before the service ID to choose it, for example <code>8080:postgres</code>.</p>`:''}
+    ${admin?`<p class="hint" style="margin:8px 0 0">Only teamspace admins can add or remove services. Targets are checked when you add them and again by the device on every connection.</p>`:''}</section>`;
 }
 
 /* ---- sessions ---- */
@@ -534,7 +619,7 @@ function connection(s){
       <span class="h">Off: all traffic goes through the hub, which checks access on every connection. Slower, but access changes apply at once.</span></div>
     <div class="setting"><span class="n">Activation</span>
       <div class="seg" role="radiogroup" aria-label="Activation mode"><button role="radio" aria-checked="${sw.mode==='auto'}" data-mode="auto" ${d}>Automatic</button><button role="radio" aria-checked="${sw.mode==='manual'}" data-mode="manual" ${d}>Manual</button></div>
-      <span class="h">Automatic: a new device identity is activated when the device proves it holds the SSH host key Teknoir already knows. Manual: an admin approves every new identity.</span></div>
+      <span class="h">Automatic: a new identity activates by itself when the device signs it with the SSH host key an admin trusted. Manual: an admin approves every new identity.</span>${s.id==='forced'?`<span class="h" style="color:var(--orange)">Forced manual once: clearing the compromised flag requires a person to approve the next identity.</span>`:''}</div>
     <div class="setting"><span class="n">Web terminal</span>${swb('term','Web terminal')}<span class="h">Lets people open an SSH terminal in the browser.</span></div>
     ${!admin?'<p class="hint" style="margin:8px 0 0">Only teamspace admins can change these.</p>':''}
     </div></section>`;
@@ -582,26 +667,35 @@ function idMsg(id){
 }
 function ipMsg(ip){
   if(!ip)return 'Enter an IP address.';
+  if(/^127\./.test(ip))return 'Loopback addresses (127.0.0.0/8) are only allowed for the device’s SSH service. Use the device’s network address, or a k3s service.';
+  if(/^169\.254\./.test(ip))return 'Link-local addresses (169.254.0.0/16) aren’t allowed. They include cloud metadata endpoints.';
   if(/[a-z]/i.test(ip))return 'Enter an IP address. Services don’t use host names, so a changed DNS record can’t redirect them.';
   const p=ip.split('.');if(p.length!==4||p.some(x=>!/^\d{1,3}$/.test(x)||+x>255))return 'Enter an IPv4 address like 192.168.10.64.';
   return '';
 }
-function portMsg(p){if(!p)return 'Enter a port.';if(!/^\d+$/.test(p)||+p<1||+p>65535)return 'Enter a port from 1 to 65535.';return ''}
+function portMsg(p,ip){
+  if(!p)return 'Enter a port.';
+  if(!/^\d+$/.test(p)||+p<1||+p>65535)return 'Enter a port from 1 to 65535.';
+  if(NODE_IPS.includes(ip)&&CP_PORTS.includes(+p))return `Port ${p} on ${ip} is a Kubernetes control-plane port of this device and can’t be exposed (${CP_PORTS.join(', ')}).`;
+  return '';
+}
 function dialogHtml(){
   const svc=DEVICE_K3S_SERVICES.find(x=>x.n===dlg.sel);
   const list=DEVICE_K3S_SERVICES.filter(x=>!dlg.q||(x.n+x.ns).includes(dlg.q));
-  const im=idMsg(dlg.id), ipm=dlg.kind==='external'&&dlg.touched.ip?ipMsg(dlg.ip):'', pm=dlg.kind==='external'&&dlg.touched.port?portMsg(dlg.port):'';
-  const valid=!im&&(dlg.kind==='internal'?!!svc:!ipMsg(dlg.ip)&&!portMsg(dlg.port));
+  const im=idMsg(dlg.id), ipm=dlg.kind==='external'&&dlg.touched.ip?ipMsg(dlg.ip):'', pm=dlg.kind==='external'&&dlg.touched.port?portMsg(dlg.port,dlg.ip):'';
+  const sm=dlg.kind==='internal'&&svc&&svc.blocked?svc.blocked:'';
+  const valid=!im&&(dlg.kind==='internal'?!!svc&&!sm:!ipMsg(dlg.ip)&&!portMsg(dlg.port,dlg.ip));
   const kindTile=(k,t,h)=>`<button class="kindopt" role="radio" aria-checked="${dlg.kind===k}" data-kind="${k}" style="--k:${KIND[k].acc};--acc:${dlg.kind===k?KIND[k].acc:'transparent'}">${dlg.kind===k?ticks():''}<span class="t"><span class="sq"></span>${t}</span><span class="h" style="display:block">${h}</span></button>`;
   const target=dlg.kind==='internal'?`
     <div class="fld"><span class="fl" id="pickl">k3s service</span>
       <div class="picker"><input class="field" id="q" placeholder="Filter by name or namespace" value="${esc(dlg.q)}" aria-label="Filter services">
-      <ul role="listbox" aria-labelledby="pickl">${list.map(x=>`<li role="option" tabindex="0" aria-selected="${x.n===dlg.sel}" data-sel="${x.n}"><span class="n">${x.n}</span><span class="ns">${x.ns}</span><span class="p">${x.ports.join(', ')}</span></li>`).join('')||'<li class="ns">No match.</li>'}</ul></div></div>
+      <ul role="listbox" aria-labelledby="pickl">${list.map(x=>`<li role="option" tabindex="0" aria-selected="${x.n===dlg.sel}" ${x.blocked?'aria-disabled="true" class="blocked"':''} data-sel="${x.n}"><span class="n">${x.n}</span><span class="ns">${x.ns}</span><span class="p">${x.blocked?'Not allowed':x.ports.join(', ')}</span></li>`).join('')||'<li class="ns">No match.</li>'}</ul></div>${sm?`<span class="msg" role="alert">${sm}</span>`:''}</div>
     <div class="fld"><label for="port">Port</label><select id="port" class="field">${(svc?svc.ports:[]).map(p=>`<option>${p}</option>`).join('')}</select></div>`
-  :`<div class="row2"><div class="fld"><label for="ip">IP address</label><input id="ip" class="field ${ipm?'err':''}" placeholder="192.168.10.64" value="${esc(dlg.ip)}" ${ipm?'aria-invalid="true" aria-describedby="ipm"':''}>${ipm?`<span class="msg" id="ipm">${ipm}</span>`:''}</div>
-     <div class="fld"><label for="eport">Port</label><input id="eport" class="field ${pm?'err':''}" placeholder="554" inputmode="numeric" value="${esc(dlg.port)}" ${pm?'aria-invalid="true" aria-describedby="pm"':''}>${pm?`<span class="msg" id="pm">${pm}</span>`:''}</div></div>`;
+  :`<div class="row2"><div class="fld"><label for="ip">IP address</label><input id="ip" class="field ${ipm?'err':''}" placeholder="192.168.10.64" value="${esc(dlg.ip)}" ${ipm?'aria-invalid="true" aria-describedby="ipm"':''}></div>
+     <div class="fld"><label for="eport">Port</label><input id="eport" class="field ${pm?'err':''}" placeholder="554" inputmode="numeric" value="${esc(dlg.port)}" ${pm?'aria-invalid="true" aria-describedby="pm"':''}></div></div>${ipm||pm?`<div class="fld" style="margin-top:-6px">${ipm?`<span class="msg" id="ipm">${ipm}</span>`:''}${pm?`<span class="msg" id="pm">${pm}</span>`:''}</div>`:''}`;
   return `<div class="scrim" data-act="closebg"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlgt">${ticks()}
     <h2 id="dlgt">Add service</h2>
+    <p class="hint" style="margin:-6px 0 16px">Only teamspace admins can add services. The device checks every target again on each connection.</p>
     <div class="kinds" role="radiogroup" aria-label="Kind of service">
       ${kindTile('internal','k3s service','An app in the device’s cluster, reached by its Service name.')}
       ${kindTile('external','Device network address','Something on the device’s network, like a camera or a local web UI.')}
@@ -612,12 +706,14 @@ function dialogHtml(){
     <div class="fld"><span class="fl" id="protol">Protocol</span><div class="seg" role="radiogroup" aria-labelledby="protol" style="width:max-content"><button role="radio" aria-checked="${dlg.proto==='http'}" data-proto="http">HTTP</button><button role="radio" aria-checked="${dlg.proto==='tcp'}" data-proto="tcp">TCP</button></div></div>
     ${dlg.proto==='http'?`<div class="fld"><label class="check"><input type="checkbox" id="pub" ${dlg.publish?'checked':''}><span>Publish in the browser<span class="help" style="display:block;margin-top:3px">Gives signed-in teamspace members an address like https://wgs-….${DOMAIN}.</span></span></label></div>`:''}
     <div class="fld"><label for="desc">Description <span class="muted">(optional)</span></label><input id="desc" class="field" placeholder="What people will find here"></div>
+    <details class="why" style="margin:0 0 4px"><summary>What can be a target</summary><p>No loopback addresses, except the device’s SSH service. No link-local addresses (169.254.0.0/16, fe80::). No control-plane ports of the device (6443, 10250, 10255, 2379, 2380, 10257, 10259). A k3s service must have a cluster IP and cannot be in kube-system or be default/kubernetes.</p></details>
     <div class="mact"><button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="addok" ${valid?'':'disabled'}>Add service</button></div>
   </div></div>`;
 }
-function openDialog(){document.body.style.overflow='hidden';document.getElementById('dlgroot').innerHTML=dialogHtml();const f=document.querySelector('.modal .kindopt[aria-checked=true]');f&&f.focus({preventScroll:true})}
+function openDialog(){document.body.style.overflow='hidden';document.getElementById('dlgroot').innerHTML=dialogHtml();revealSel();const f=document.querySelector('.modal .kindopt[aria-checked=true]');f&&f.focus({preventScroll:true})}
+function revealSel(){const ul=document.querySelector('.picker ul'),li=ul&&ul.querySelector('[aria-selected=true]');if(li)ul.scrollTop=Math.max(0,li.offsetTop-ul.offsetTop-60)}
 function rerenderDialog(focusId){const a=document.activeElement, id=focusId||(a&&a.id), pos=a&&a.selectionStart;document.getElementById('dlgroot').innerHTML=dialogHtml();if(id){const e=document.getElementById(id);if(e){e.focus({preventScroll:true});try{e.setSelectionRange(pos,pos)}catch(_){}}}}
-function closeDialog(){document.body.style.overflow='';document.getElementById('dlgroot').innerHTML='';if(cur==='dialog'){setState('active',false)}}
+function closeDialog(){document.body.style.overflow='';document.getElementById('dlgroot').innerHTML='';if(resolve(cur).dialog){setState('active',false)}}
 
 /* ---- toasts ---- */
 function toast(kind,html){
@@ -639,11 +735,16 @@ function render(){
 }
 function setState(k,push=true){
   cur=k;animate=true;document.getElementById('toasts').innerHTML='';
-  if(k==='waiting')pasteVal=PASTED_TYPO;
+  {const r=resolve(k);pasteVal=r.paste||'';wmode=r.wmode||'host';}
   render();
   const s=resolve(k);
   document.getElementById('dlgroot').innerHTML='';document.body.style.overflow='';
-  if(s.dialog)openDialog();
+  if(s.dialog&&admin){
+    if(s.dialog==='bad'){Object.assign(dlg,{kind:'external',id:'node-kubelet',proto:'tcp',ip:'192.168.10.20',port:'10250',touched:{id:true,ip:true,port:true}})}
+    else if(s.dialog==='ks'){Object.assign(dlg,{kind:'internal',sel:'metrics-server',id:'metrics-server',proto:'http',touched:{id:true}})}
+    else {Object.assign(dlg,{kind:'internal',sel:'influxdb2',id:'influxdb2-historian-api',proto:'http',ip:'',port:'',touched:{id:true}})}
+    openDialog();
+  }
   if(s.stale)toast('err','<b>Couldn’t refresh:</b> GET /api/teknoir-entity/devices/teknoir-demo/rtx2000-ada-128gb-se/ztna returned 503: hub status unavailable (dial tcp 10.43.12.7:8081: connect: connection refused). Showing what was known 2 min ago.');
   if(push)history.replaceState(null,'','#'+k+(admin?'':',member'));
   proto();
@@ -668,6 +769,11 @@ document.addEventListener('click',e=>{
   if(a==='add'){openDialog();return}
   if(a==='close'){closeDialog();return}
   if(a==='addok'){const id=dlg.id;closeDialog();toast('ok',`<b>${esc(id)} added.</b> It’s ready in a few seconds.`);return}
+  if(a==='trustact'){b.disabled=true;b.textContent='Trusting…';setTimeout(()=>{setState('active');toast('ok','<b>Host key trusted. Identity approved.</b> The device connects within a few seconds. Its next re-enrollments activate automatically.')},900);return}
+  if(a==='trustonly'){toast('ok','<b>Host key trusted.</b> The identity still waits for approval.');return}
+  if(a==='tomanual'){wmode='wg';pasteVal='';animate=true;render();return}
+  if(a==='tohost'){wmode='host';pasteVal='';animate=true;render();return}
+  if(a==='anchor'){toast('ok','<b>Update trusted host key:</b> opens a dialog that shows the new key and asks for a reason.');return}
   if(a==='approve'){b.disabled=true;b.textContent='Approving…';setTimeout(()=>{setState('active');toast('ok','<b>Identity approved.</b> The device connects within a few seconds.')},900);return}
   if(a==='keep'){toast('ok','<b>Device stays blocked.</b>');return}
   if(a==='end'){toast('ok',`<b>Session ended.</b> ${esc(b.dataset.user)} lost the ${esc(b.dataset.svc)} connection.`);return}
@@ -676,7 +782,7 @@ document.addEventListener('click',e=>{
 document.addEventListener('change',e=>{
   const t=e.target;
   if(t.id==='pstate'){setState(t.value);return}
-  if(t.id==='prole'){admin=t.value!=='member';animate=false;render();if(resolve(cur).dialog)openDialog();history.replaceState(null,'','#'+cur+(admin?'':',member'));proto();return}
+  if(t.id==='prole'){admin=t.value!=='member';animate=false;render();if(resolve(cur).dialog&&admin)openDialog();history.replaceState(null,'','#'+cur+(admin?'':',member'));proto();return}
 });
 document.addEventListener('input',e=>{
   const t=e.target;
