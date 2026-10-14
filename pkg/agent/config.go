@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -35,6 +36,8 @@ const (
 
 	DefaultMaxConns    = 32
 	DefaultDialTimeout = 5 * time.Second
+	// DefaultMaxConnsPerService caps concurrent connections of one service.
+	DefaultMaxConnsPerService = 16
 )
 
 // Backoff bounds the delay between session attempts: exponential from Min to
@@ -65,9 +68,30 @@ type Config struct {
 	HTTPClient *http.Client
 	Logger     *slog.Logger
 	Backoff    Backoff
-	// MaxConns caps concurrent forwarded connections (default 32).
+	// MaxConns caps concurrent forwarded connections (default 32); it applies
+	// to the legacy per-port listeners and, separately, to the connect listener.
 	MaxConns    int
 	DialTimeout time.Duration
+
+	// Services (phase 2). See TargetPolicy for the rules they select.
+	//
+	// ServiceCIDRs are the cluster's service networks (default 10.43.0.0/16,
+	// the k3s default); ClusterDomain the cluster DNS domain (default
+	// cluster.local); SSHPort the sshd port of the implicit ssh service
+	// (default 22; the host is ForwardHost).
+	ServiceCIDRs  []netip.Prefix
+	ClusterDomain string
+	SSHPort       int
+	// MaxConnsPerService caps concurrent connections of one service (default 16).
+	MaxConnsPerService int
+	// Resolver and NodeIPs replace the system resolver and the interface
+	// addresses (tests).
+	Resolver Resolver
+	NodeIPs  func() []netip.Addr
+	// AllowTarget is a TEST HOOK that lifts the loopback refusal for the
+	// targets it approves (see TargetPolicy.AllowTarget). Never set by
+	// ConfigFromEnv.
+	AllowTarget func(netip.AddrPort) bool
 
 	// Passed through to wgclient (zero: its defaults).
 	StaleAfter       time.Duration
@@ -86,6 +110,9 @@ type Config struct {
 //	IDENTITY_DIR               default /var/lib/teknoir/wg-agent
 //	SSH_HOST_KEYS_GLOB         default /etc/ssh/ssh_host_*_key.pub
 //	FORWARD_HOST               default 127.0.0.1
+//	SERVICE_CIDR               comma-separated k3s service networks, default 10.43.0.0/16
+//	CLUSTER_DOMAIN             cluster DNS domain, default cluster.local
+//	SSH_PORT                   sshd port of the ssh service, default 22
 //	TURN_SERVER                optional host:port override
 //	CA_FILE                    extra CA bundle added to the system roots
 //	                           (default: /etc/teknoir/roots.pem if present)
@@ -101,6 +128,21 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		SSHHostKeysGlob: getenv("SSH_HOST_KEYS_GLOB"),
 		ForwardHost:     getenv("FORWARD_HOST"),
 		TURNServer:      getenv("TURN_SERVER"),
+		ClusterDomain:   getenv("CLUSTER_DOMAIN"),
+	}
+	if v := getenv("SERVICE_CIDR"); v != "" {
+		cidrs, err := ParseServiceCIDRs(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("agent: SERVICE_CIDR: %w", err)
+		}
+		c.ServiceCIDRs = cidrs
+	}
+	if v := getenv("SSH_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil || port < 1 || port > 65535 {
+			return Config{}, fmt.Errorf("agent: SSH_PORT %q is not a port", v)
+		}
+		c.SSHPort = port
 	}
 	caFile, explicit := getenv("CA_FILE"), true
 	if caFile == "" {
@@ -171,6 +213,12 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = DefaultDialTimeout
+	}
+	if c.MaxConnsPerService <= 0 {
+		c.MaxConnsPerService = DefaultMaxConnsPerService
+	}
+	if c.SSHPort < 0 || c.SSHPort > 65535 {
+		return errors.New("agent: SSHPort out of range")
 	}
 	if c.HTTPClient == nil {
 		hc, err := HTTPClient("", false)

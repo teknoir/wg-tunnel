@@ -30,6 +30,9 @@ func (a *Agent) serve(ctx context.Context, sess *wgclient.Session) (time.Duratio
 	}()
 
 	var wg sync.WaitGroup
+	if !a.serveServices(sctx, sess, resp, &wg) {
+		_ = sess.Close()
+	}
 	sem := make(chan struct{}, a.cfg.MaxConns)
 	for _, p := range resp.AllowedPorts {
 		ln, err := sess.Listen(p)

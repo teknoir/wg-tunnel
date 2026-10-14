@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
@@ -51,6 +52,16 @@ type session struct {
 	ports       []int
 	direct      bool
 	remote      string
+	// caps are the sanitized capabilities a device agent advertised (CapServices ...).
+	caps []string
+	// service is the service id a client session is bound to: "" for a legacy
+	// raw port, "ssh", or a policy service (svcSpec is its definition at
+	// session creation).
+	service string
+	svcSpec api.ServiceSpec
+	// agentSvc: the device agent spoke services-v1 when this client session
+	// was created (used when the device is offline).
+	agentSvc bool
 
 	// ended is protected by Hub.mu.
 	ended bool
@@ -65,6 +76,11 @@ type session struct {
 	// reserved counts splice connections that passed the cap and are still
 	// dialling the device.
 	reserved int
+	// services is what a services-v1 device agent was last told (session
+	// response or control push); pushing/pushDirty serialize the pushes.
+	services  []api.ServiceSpec
+	pushing   bool
+	pushDirty bool
 	// lastTokenID/lastTokenIAT identify the Keycloak token accepted last
 	// (create or renew); the next renewal must present a newer one.
 	lastTokenID  string

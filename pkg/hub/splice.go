@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 
+	"github.com/teknoir/wg-tunnel/internal/connectproto"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 )
 
@@ -70,8 +72,8 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		closeDenied(eff.Reason, eff.Detail)
 		return
 	}
-	if !portAllowed(eff.Policy.AllowedPorts, s.targetPort) {
-		closeDenied(api.ReasonPortNotAllowed, "port is no longer allowed")
+	if den := serviceDenial(s, eff.Policy, false, false); den != nil {
+		closeDenied(den.reason, den.msg)
 		return
 	}
 	// The connection cap is enforced before any slow work: a reserved slot is
@@ -104,9 +106,13 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		closeDenied(api.ReasonDeviceOffline, "device has no live tunnel")
 		return
 	}
-	dc, err := h.tunnel.DialContext(cctx, netip.AddrPortFrom(dev.ip, uint16(s.targetPort)))
-	if err != nil {
-		closeDenied(api.ReasonDeviceOffline, "dialing the device failed")
+	if den := serviceDenial(s, eff.Policy, true, dev.hasCap(api.CapServices)); den != nil {
+		closeDenied(den.reason, den.msg)
+		return
+	}
+	dc, den := h.dialAgent(cctx, s, dev)
+	if den != nil {
+		closeDenied(den.reason, den.msg)
 		return
 	}
 	sc := &spliceConn{client: c, dev: dc, cs: s, ds: dev}
@@ -140,6 +146,9 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 	dev.removeConn(sc)
 }
 
+// agentRefusals are the reasons a connect listener may answer with.
+var agentRefusals = []string{api.ReasonServiceUnknown, api.ReasonServiceDenied, api.ReasonSessionLimit, api.ReasonBadRequest, api.ReasonInternal}
+
 type closeWriter interface{ CloseWrite() error }
 
 // pipe copies in both directions with half-close and returns when both
@@ -154,10 +163,8 @@ func (h *Hub) pipe(sc *spliceConn) {
 			sc.close()
 			return
 		}
-		if cw, ok := dst.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		} else {
-			sc.close()
+		if cw, ok := dst.(closeWriter); !ok || cw.CloseWrite() != nil {
+			sc.close() // no half-close on this connection: end both directions
 		}
 	}
 	wg.Add(2)
@@ -165,4 +172,48 @@ func (h *Hub) pipe(sc *spliceConn) {
 	go cp(sc.client, sc.dev, "device_to_client")
 	wg.Wait()
 	sc.close()
+}
+
+// dialAgent opens the stream to the device for one client connection.
+//
+//   - A legacy raw port, and ssh towards a phase-1 agent, dial that port on the
+//     agent's overlay address (the agent forwards it to the local host).
+//   - Everything else dials the agent's connect port and speaks the preamble:
+//     the agent resolves the service itself, validates the target and answers
+//     before a single byte is relayed. For a session delegated by a service
+//     account the end user's email travels as ConnectRequest.As (the agent only
+//     logs it; the SubjectAccessReview for that user ran just before).
+func (h *Hub) dialAgent(ctx context.Context, s, dev *session) (net.Conn, *denial) {
+	port := s.targetPort
+	viaConnect := s.service != "" && dev.hasCap(api.CapServices)
+	if viaConnect {
+		port = api.AgentConnectPort
+	}
+	dc, err := h.tunnel.DialContext(ctx, netip.AddrPortFrom(dev.ip, uint16(port)))
+	if err != nil {
+		return nil, deny(api.ReasonDeviceOffline, "dialing the device failed")
+	}
+	if !viaConnect {
+		return dc, nil
+	}
+	req := api.ConnectRequest{Service: s.service}
+	if s.authKind == authSA {
+		req.As = s.subject
+	}
+	wrapped, resp, err := connectproto.Handshake(dc, req, h.cfg.DialTimeout)
+	if err != nil {
+		_ = dc.Close()
+		return nil, deny(api.ReasonDeviceOffline, "the device agent did not answer")
+	}
+	if !resp.OK {
+		_ = dc.Close()
+		// The reason is a metric label and a log field: never an arbitrary
+		// string from the device.
+		reason := resp.Reason
+		if !slices.Contains(agentRefusals, reason) {
+			reason = api.ReasonInternal
+		}
+		return nil, deny(reason, "the device agent refused the connection")
+	}
+	return wrapped, nil
 }

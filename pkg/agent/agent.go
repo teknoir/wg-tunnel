@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
@@ -26,6 +27,8 @@ type Agent struct {
 	cfg Config
 	log *slog.Logger
 	sub string
+	// target decides where services may connect (re-validated on every dial).
+	target *TargetPolicy
 
 	// Replaceable in tests.
 	sleep func(context.Context, time.Duration)
@@ -40,9 +43,19 @@ func New(cfg Config) (*Agent, error) {
 	if err := cfg.applyDefaults(); err != nil {
 		return nil, err
 	}
+	sshHost, err := netip.ParseAddr(cfg.ForwardHost)
+	if err != nil {
+		sshHost = netip.MustParseAddr(DefaultForwardHost) // a host name cannot be vetted: fall back to loopback
+	}
+	target := &TargetPolicy{
+		ServiceCIDRs: cfg.ServiceCIDRs, ClusterDomain: cfg.ClusterDomain,
+		SSHHost: sshHost.Unmap(), SSHPort: cfg.SSHPort,
+		Resolver: cfg.Resolver, NodeIPs: cfg.NodeIPs, AllowTarget: cfg.AllowTarget,
+	}
+	target.applyDefaults()
 	return &Agent{
 		cfg: cfg, log: cfg.Logger, sub: api.DeviceSubject(cfg.Namespace, cfg.DeviceID),
-		sleep: sleepCtx, rnd: randFloat,
+		sleep: sleepCtx, rnd: randFloat, target: target,
 	}, nil
 }
 
@@ -197,7 +210,7 @@ func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []
 			tok, _, err := identity.MintIdentityJWT(priv, a.sub, wgPub, identityTokenTTL)
 			return tok, err
 		},
-		DeviceRequest:      &api.DeviceSessionRequest{Posture: a.posture(), SSHHostKeys: hostKeys},
+		DeviceRequest:      &api.DeviceSessionRequest{Capabilities: capabilities(), Posture: a.posture(), SSHHostKeys: hostKeys},
 		TURNServerOverride: a.cfg.TURNServer,
 		HTTPClient:         a.cfg.HTTPClient,
 		Logger:             a.log,

@@ -44,6 +44,8 @@ type rig struct {
 	isrv   *httptest.Server // internal API (api.HubInternalPort)
 	dev    *deviceCreds
 	policy api.PolicyEntry
+	// devCaps are the capabilities deviceSessionOK advertises (nil: a phase-1 agent).
+	devCaps []string
 
 	smu     sync.Mutex
 	secrets []string // credentials used in the test; they must never reach the logs
@@ -216,6 +218,7 @@ func (r *rig) deviceSessionOK(hostKeys ...string) devSess {
 		r.approve()
 	}
 	tok, req, priv := r.dev.sessionRequest(r.t, r.clock.Now(), hostKeys...)
+	req.Capabilities = r.devCaps
 	st, body := r.post(api.DeviceSessionPath, tok, req)
 	if st != http.StatusCreated {
 		r.t.Fatalf("device session: %d %s", st, body)

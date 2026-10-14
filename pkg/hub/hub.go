@@ -369,11 +369,19 @@ func (h *Hub) enforce(k devKey) {
 			h.logRevoke(k, reason, detail, dev.id)
 		}
 	}
+	// The services of a live agent follow the policy (pushed over its control
+	// port, or by ending its session if it cannot take a push).
+	live := h.deviceSession(k.ns, k.device)
+	if live != nil {
+		h.syncServices(live, eff.Policy)
+	}
+	// A client session whose port or service is gone or was redefined ends,
+	// and its spliced connections with it.
 	for _, c := range clients {
-		if !portAllowed(eff.Policy.AllowedPorts, c.targetPort) {
-			if h.endSession(c, api.ReasonPortNotAllowed) {
-				h.met.revocations.WithLabelValues(api.ReasonPortNotAllowed).Inc()
-				h.logRevoke(k, api.ReasonPortNotAllowed, "port removed from policy", c.id)
+		if den := h.serviceDenialLive(c, eff.Policy); den != nil {
+			if h.endSession(c, den.reason) {
+				h.met.revocations.WithLabelValues(den.reason).Inc()
+				h.logRevoke(k, den.reason, den.msg, c.id)
 			}
 		}
 	}

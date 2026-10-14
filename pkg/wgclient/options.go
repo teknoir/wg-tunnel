@@ -113,7 +113,9 @@ func (o Options) Validate() error {
 		if r.Namespace == "" || r.Device == "" {
 			return errors.New("wgclient: ClientRequest needs a namespace and a device")
 		}
-		if r.Port < 1 || r.Port > 65535 {
+		// A named service (phase 2) needs no port; without one the port is the
+		// legacy raw port (22 = ssh).
+		if r.Service == "" && (r.Port < 1 || r.Port > 65535) || r.Port < 0 || r.Port > 65535 {
 			return fmt.Errorf("wgclient: ClientRequest port %d out of range", r.Port)
 		}
 	default:

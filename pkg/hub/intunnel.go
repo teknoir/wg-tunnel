@@ -191,8 +191,8 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 		if !allowed {
 			return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
 		}
-		if !portAllowed(eff.Policy.AllowedPorts, s.targetPort) {
-			return 0, nil, deny(api.ReasonPortNotAllowed, "port is no longer allowed")
+		if den := h.serviceDenialLive(s, eff.Policy); den != nil {
+			return 0, nil, den
 		}
 	} else if reason, detail := deviceStale(s, eff.Policy); reason != "" {
 		return 0, nil, deny(staleDenialReason(reason), detail)
