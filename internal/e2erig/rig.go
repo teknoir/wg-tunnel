@@ -98,6 +98,21 @@ type Options struct {
 	// configures the agent to use it (Rig.HostKeyFingerprint is the key's
 	// SHA256 fingerprint; Rig.TrustHostKey makes it the activation anchor).
 	Attest bool
+	// P2P turns plane B on everywhere: the device policy (PolicyEntry.P2P),
+	// the agent and the clients made with P2PClientOptions. Both ends use
+	// loopback sockets whose only host candidate is 127.0.0.1; the rig's TURN
+	// server is the STUN server.
+	P2P bool
+	// P2PConn replaces the plane-B sockets: it is called for the agent
+	// ("agent") and for each client ("client") and returns a pre-opened
+	// socket, or nil for the default (the NAT lab opens sockets in network
+	// namespaces). When set, the rig's own loopback candidate list is not used.
+	P2PConn func(who string) (net.PacketConn, error)
+	// P2PInterfaces lists the host candidates of one end, "agent" or "client"
+	// (default: 127.0.0.1 for both).
+	P2PInterfaces func(who string) ([]netip.Addr, error)
+	// P2PSTUN overrides the STUN server of both ends (default: the rig's TURN server).
+	P2PSTUN string
 }
 
 // Epoch names of the rig's enrollment windows; tests that reset enrollment
@@ -235,6 +250,8 @@ type Rig struct {
 
 	HubLogs, AgentLogs, ClientLogs *LogBuf
 
+	// blocker drops plane-B packets of both ends while set (BlockP2P).
+	blocker      blocker
 	hostKeysGlob string
 	allowMu      sync.Mutex
 	allowLoop    map[uint16]bool
@@ -310,7 +327,7 @@ func New(t testing.TB, opts Options) *Rig {
 	r.Policy.Set(api.PolicyEntry{
 		Device: DeviceName, Namespace: NS, State: api.StateActive, RSAPublicCert: rsaCert,
 		AllowedPorts: []int{r.Echo.Port}, EnrollmentGeneration: 1, EnrollmentEpoch: Epoch1, EnrollUntil: time.Now().Add(time.Hour),
-		Services: opts.Services,
+		Services: opts.Services, P2P: opts.P2P,
 	})
 	r.Flags.Set(NS, DeviceName, map[string]string{api.AnnotationWireGuard: "enabled"})
 	r.Authz.Set(AliceEmail, NS, true)
@@ -524,7 +541,7 @@ func (r *Rig) AgentConfig() agent.Config {
 }
 
 func (r *Rig) agentConfig() agent.Config {
-	return agent.Config{
+	cfg := agent.Config{
 		DeviceID: DeviceName, Namespace: NS, HubURL: r.HubURL,
 		RSAKeyPath: r.RSAKeyPath, IdentityDir: r.IdentityDir,
 		SSHHostKeysGlob: r.hostKeysGlob, ForwardHost: "127.0.0.1",
@@ -536,6 +553,18 @@ func (r *Rig) agentConfig() agent.Config {
 		SSHPort:     r.Echo.Port,
 		AllowTarget: r.allowLoopback,
 	}
+	if r.Opts.P2P {
+		cfg.P2P = true
+		cfg.P2PSTUN = r.p2pSTUN()
+		cfg.P2PWrapConn = r.blocker.wrap
+		cfg.P2PInterfaces = r.p2pInterfaces("agent")
+		cfg.P2PIncludeLoopback = true
+		cfg.P2PProbeInterval = 50 * time.Millisecond
+		if r.Opts.P2PConn != nil {
+			cfg.P2PConn = func() (net.PacketConn, error) { return r.Opts.P2PConn("agent") }
+		}
+	}
+	return cfg
 }
 
 // allowLoopback is the agent's AllowTarget test hook: the echo servers of the
@@ -583,6 +612,8 @@ func (r *Rig) MustServiceClient(email, service string) *wgclient.Session {
 
 // Agent is a running wg-agent.
 type Agent struct {
+	// Agent is the running agent (for its test hooks and status).
+	Agent  *agent.Agent
 	cancel context.CancelFunc
 	done   chan error
 }
@@ -599,7 +630,7 @@ func (r *Rig) StartAgent() *Agent {
 	a, err := agent.New(r.AgentConfig())
 	must(r.T, err)
 	ctx, cancel := context.WithCancel(context.Background())
-	ag := &Agent{cancel: cancel, done: make(chan error, 1)}
+	ag := &Agent{Agent: a, cancel: cancel, done: make(chan error, 1)}
 	go func() { ag.done <- a.Run(ctx) }()
 	r.secMu.Lock()
 	r.agentRuns++
@@ -788,4 +819,102 @@ func (r *Rig) AssertLogHygiene() {
 			}
 		}
 	}
+}
+
+func (r *Rig) p2pSTUN() string {
+	if r.Opts.P2PSTUN != "" {
+		return r.Opts.P2PSTUN
+	}
+	return r.TURN.Addr
+}
+
+func (r *Rig) p2pInterfaces(who string) func() ([]netip.Addr, error) {
+	if r.Opts.P2PInterfaces != nil {
+		return func() ([]netip.Addr, error) { return r.Opts.P2PInterfaces(who) }
+	}
+	return func() ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil }
+}
+
+// P2PClientOptions returns the options of a client session for email bound to
+// service, with plane B on.
+func (r *Rig) P2PClientOptions(email, service string) wgclient.Options {
+	o := r.ServiceClientOptions(email, service)
+	o.P2P = true
+	o.P2PSTUN = r.p2pSTUN()
+	o.P2PWrapConn = r.blocker.wrap
+	o.P2PInterfaces = r.p2pInterfaces("client")
+	o.P2PIncludeLoopback = true
+	o.P2PProbeInterval = 50 * time.Millisecond
+	if r.Opts.P2PConn != nil {
+		o.P2PConn = func() (net.PacketConn, error) { return r.Opts.P2PConn("client") }
+	}
+	return o
+}
+
+// MustP2PClient is MustServiceClient with plane B on.
+func (r *Rig) MustP2PClient(email, service string) *wgclient.Session {
+	r.T.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s, err := wgclient.Create(ctx, r.P2PClientOptions(email, service))
+	if err != nil {
+		r.T.Fatalf("p2p client session for %s, service %s: %v", email, service, err)
+	}
+	if t := s.Response().TURN; t != nil {
+		r.AddSecret(t.Password)
+	}
+	r.T.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// SetP2P flips the device policy's plane-B switch (annotation ztna.teknoir.org/p2p).
+func (r *Rig) SetP2P(on bool) {
+	r.Policy.Update(NS, DeviceName, func(p *api.PolicyEntry) { p.P2P = on })
+}
+
+// BlockP2P drops every plane-B datagram of both ends (except STUN) while on,
+// as a firewall that blocks UDP between client and device would.
+func (r *Rig) BlockP2P(on bool) { r.blocker.on.Store(on) }
+
+// blocker wraps plane-B sockets with a switchable packet filter.
+type blocker struct{ on atomic.Bool }
+
+func (b *blocker) wrap(pc net.PacketConn) net.PacketConn { return &blockConn{PacketConn: pc, b: b} }
+
+type blockConn struct {
+	net.PacketConn
+	b *blocker
+}
+
+func (c *blockConn) WriteTo(p []byte, a net.Addr) (int, error) {
+	if c.b.on.Load() && !isSTUNDatagram(p) {
+		return len(p), nil
+	}
+	return c.PacketConn.WriteTo(p, a)
+}
+
+// isSTUNDatagram mirrors the plane's own STUN test: bits 00, cookie, length.
+func isSTUNDatagram(p []byte) bool {
+	return len(p) >= 20 && p[0]&0xC0 == 0 && p[4] == 0x21 && p[5] == 0x12 && p[6] == 0xA4 && p[7] == 0x42 &&
+		int(p[2])<<8|int(p[3]) == len(p)-20
+}
+
+// EchoViaService dials the session's service with DialService and echoes msg.
+func EchoViaService(sess *wgclient.Session, msg string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		c, err := sess.DialService(ctx, "")
+		cancel()
+		if err == nil {
+			if err = RoundTrip(c, msg); err == nil {
+				return c, nil
+			}
+			_ = c.Close()
+		}
+		last = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil, last
 }

@@ -421,7 +421,7 @@ func controlRig(t *testing.T) (*controlServer, *connectServer, *GrantStore) {
 	log := slog.New(slog.NewJSONHandler(logs, nil))
 	connect := newConnectServer(log, testPolicy(&fakeResolver{}), time.Second, 4, 8)
 	grants := NewGrantStore(GrantStoreOptions{})
-	return newControlServer(log, connect, grants), connect, grants
+	return newControlServer(log, connect, grants, nil), connect, grants
 }
 
 func post(t *testing.T, c *controlServer, path, remote string, body any) *httptest.ResponseRecorder {

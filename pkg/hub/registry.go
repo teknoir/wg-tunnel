@@ -188,6 +188,7 @@ func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
 	}
 	h.detachLocked(s)
 	h.mu.Unlock()
+	h.p2pClientGone(s)
 	h.teardown(s, grace)
 	return true
 }

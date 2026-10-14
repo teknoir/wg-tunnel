@@ -46,6 +46,8 @@ type rig struct {
 	policy api.PolicyEntry
 	// devCaps are the capabilities deviceSessionOK advertises (nil: a phase-1 agent).
 	devCaps []string
+	// devP2PKey is the plane-B key deviceSessionOK sends (base64; "" none).
+	devP2PKey string
 
 	smu     sync.Mutex
 	secrets []string // credentials used in the test; they must never reach the logs
@@ -219,6 +221,7 @@ func (r *rig) deviceSessionOK(hostKeys ...string) devSess {
 	}
 	tok, req, priv := r.dev.sessionRequest(r.t, r.clock.Now(), hostKeys...)
 	req.Capabilities = r.devCaps
+	req.P2PWGPublicKey = r.devP2PKey
 	st, body := r.post(api.DeviceSessionPath, tok, req)
 	if st != http.StatusCreated {
 		r.t.Fatalf("device session: %d %s", st, body)

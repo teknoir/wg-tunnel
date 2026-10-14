@@ -63,6 +63,9 @@ type session struct {
 	// session creation).
 	service string
 	svcSpec api.ServiceSpec
+	// p2pKey (device sessions) is the agent's plane-B public key (base64) from
+	// the session request; "" when the agent has no plane B.
+	p2pKey string
 	// agentSvc: the device agent spoke services-v1 when this client session
 	// was created (used when the device is offline).
 	agentSvc bool
@@ -85,6 +88,17 @@ type session struct {
 	services  []api.ServiceSpec
 	pushing   bool
 	pushDirty bool
+	// p2p is the client's plane-B pair (nil: none); path is the data path the
+	// client reported at its last renewal (informational).
+	p2p  *clientP2P
+	path string
+	// wgKeyB is the client's plane-B public key from its offer.
+	wgKeyB wgkey.PublicKey
+	// gmu serializes the grant-set numbering of a device session: the sequence
+	// number is taken in the same critical section as the membership snapshot,
+	// so higher sequence numbers always describe newer states.
+	gmu  sync.Mutex
+	gseq uint64
 	// lastTokenID/lastTokenIAT identify the Keycloak token accepted last
 	// (create or renew); the next renewal must present a newer one.
 	lastTokenID  string

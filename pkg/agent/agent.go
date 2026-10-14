@@ -10,12 +10,15 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/identity"
+	"github.com/teknoir/wg-tunnel/pkg/p2p"
 	"github.com/teknoir/wg-tunnel/pkg/version"
 	"github.com/teknoir/wg-tunnel/pkg/wgclient"
+	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
 // identityTokenTTL is the lifetime of the identity JWTs sent with session and
@@ -36,6 +39,11 @@ type Agent struct {
 
 	mu       sync.Mutex
 	loggedFP string
+
+	// pb is the plane B of the current device session (nil: none).
+	pb atomic.Pointer[planeB]
+	// grants is the grant store of the current device session.
+	grants atomic.Pointer[GrantStore]
 }
 
 // New validates cfg (applying defaults) and returns an Agent.
@@ -154,9 +162,24 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 
 	enrolled := false
 	for {
-		sess, cerr := a.create(ctx, priv, hostKeys)
+		// Plane B: a fresh WireGuard key for every device session, never stored.
+		var p2pPriv *wgkey.PrivateKey
+		if a.cfg.P2P {
+			if k, _, err := wgkey.Generate(); err == nil {
+				p2pPriv = &k
+			}
+		}
+		holder := &grantHolder{log: a.log}
+		sess, cerr := a.create(ctx, priv, hostKeys, p2pPriv, holder)
 		if cerr == nil {
-			return a.serve(ctx, sess)
+			up, err := a.serve(ctx, sess, p2pPriv, holder)
+			if p2pPriv != nil {
+				p2pPriv.Zero()
+			}
+			return up, err
+		}
+		if p2pPriv != nil {
+			p2pPriv.Zero()
 		}
 		switch wgclient.ReasonOf(cerr) {
 		case api.ReasonNotEnrolled:
@@ -208,15 +231,26 @@ func (a *Agent) logFingerprint(priv ed25519.PrivateKey) {
 
 // create asks the hub for a device session. The credential is a fresh identity
 // JWT bound to the session's WireGuard key, minted for every create and renew.
-func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []string) (*wgclient.Session, error) {
+func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []string, p2pPriv *wgkey.PrivateKey, holder *grantHolder) (*wgclient.Session, error) {
+	req := &api.DeviceSessionRequest{Posture: a.posture(), SSHHostKeys: hostKeys, Capabilities: a.capabilities()}
+	if p2pPriv != nil {
+		if pub, err := p2pPriv.Public(); err == nil {
+			req.P2PWGPublicKey = pub.Base64()
+		}
+	}
 	return wgclient.Create(ctx, wgclient.Options{
+		OnRenew: func(rr *api.RenewResponse) {
+			if rr.Grants != nil {
+				holder.applyBackstop(*rr.Grants)
+			}
+		},
 		HubURL: a.cfg.HubURL,
 		Kind:   api.KindDevice,
 		Credential: func(_ context.Context, wgPub string) (string, error) {
 			tok, _, err := identity.MintIdentityJWT(priv, a.sub, wgPub, identityTokenTTL)
 			return tok, err
 		},
-		DeviceRequest:      &api.DeviceSessionRequest{Posture: a.posture(), SSHHostKeys: hostKeys, Capabilities: a.capabilities()},
+		DeviceRequest:      req,
 		TURNServerOverride: a.cfg.TURNServer,
 		HTTPClient:         a.cfg.HTTPClient,
 		Logger:             a.log,
@@ -262,4 +296,22 @@ func (a *Agent) enroll(ctx context.Context, priv ed25519.PrivateKey) error {
 	}
 	a.log.Info("device identity enrolled", "fingerprint", resp.Fingerprint, "generation", resp.EnrollmentGeneration)
 	return nil
+}
+
+// P2PStatus reports the plane B of the current device session.
+func (a *Agent) P2PStatus() P2PStatus {
+	pb := a.pb.Load()
+	if pb == nil {
+		return P2PStatus{}
+	}
+	return P2PStatus{Up: true, Peers: pb.pl.PeerCount(), Candidates: p2p.Strings(pb.pl.Socket().Candidates())}
+}
+
+// DropP2PGrants forgets every plane-B grant of the current device session, as
+// if the hub's control pushes had been lost (a test hook: the renewal backstop
+// is what restores them).
+func (a *Agent) DropP2PGrants() {
+	if g := a.grants.Load(); g != nil {
+		g.DropAll()
+	}
 }

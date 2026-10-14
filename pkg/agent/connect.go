@@ -1,17 +1,20 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/teknoir/wg-tunnel/internal/connectproto"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/svc"
+	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
 // Timeouts of the connect listener.
@@ -35,6 +38,7 @@ type connectServer struct {
 	policy  *TargetPolicy
 	dialTO  time.Duration
 	perSvc  int           // concurrent connections per service
+	perPair int           // concurrent plane-B connections per pair
 	global  chan struct{} // concurrent connections in total
 	hubAddr netip.Addr
 	// preambleTO bounds the wait for the preamble line.
@@ -44,22 +48,26 @@ type connectServer struct {
 	specs  map[string]api.ServiceSpec
 	active map[*activeConn]struct{}
 	counts map[string]int
+	pairs  map[string]int
 	closed bool
 }
 
 type activeConn struct {
-	spec  api.ServiceSpec
+	spec api.ServiceSpec
+	// pair is the plane-B pair the connection belongs to ("" on plane A).
+	pair  string
 	close func()
 }
 
 func newConnectServer(log *slog.Logger, policy *TargetPolicy, dialTimeout time.Duration, perService, global int) *connectServer {
 	return &connectServer{
-		log: log, policy: policy, dialTO: dialTimeout, perSvc: perService,
+		log: log, policy: policy, dialTO: dialTimeout, perSvc: perService, perPair: perService,
 		global:  make(chan struct{}, global),
 		hubAddr: netip.MustParseAddr(api.HubAddress), preambleTO: preambleTimeout,
 		specs:  map[string]api.ServiceSpec{api.ServiceSSHID: implicitSSH},
 		active: map[*activeConn]struct{}{},
 		counts: map[string]int{},
+		pairs:  map[string]int{},
 	}
 }
 
@@ -111,8 +119,9 @@ func (s *connectServer) Active() int {
 	return len(s.active)
 }
 
-// reserve looks the service up and takes one of its connection slots.
-func (s *connectServer) reserve(id string) (api.ServiceSpec, string) {
+// reserve looks the service up and takes one of its connection slots (and,
+// on plane B, one of the pair's).
+func (s *connectServer) reserve(id, pair string) (api.ServiceSpec, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sp, ok := s.specs[id]
@@ -123,17 +132,46 @@ func (s *connectServer) reserve(id string) (api.ServiceSpec, string) {
 		return sp, api.ReasonServiceUnknown
 	case s.perSvc > 0 && s.counts[id] >= s.perSvc:
 		return sp, api.ReasonSessionLimit
+	case pair != "" && s.perPair > 0 && s.pairs[pair] >= s.perPair:
+		return sp, api.ReasonSessionLimit
 	}
 	s.counts[id]++
+	if pair != "" {
+		s.pairs[pair]++
+	}
 	return sp, ""
 }
 
-func (s *connectServer) release(id string) {
+func (s *connectServer) release(id, pair string) {
 	s.mu.Lock()
 	if s.counts[id] > 0 {
 		s.counts[id]--
 	}
+	if pair != "" && s.pairs[pair] > 0 {
+		s.pairs[pair]--
+		if s.pairs[pair] == 0 {
+			delete(s.pairs, pair)
+		}
+	}
 	s.mu.Unlock()
+}
+
+// ClosePair closes every plane-B connection of the pair at once and returns
+// how many it closed. New connections of a removed pair are refused by the
+// grant check, so this only has to end the live ones.
+func (s *connectServer) ClosePair(pair string) int {
+	var victims []*activeConn
+	s.mu.Lock()
+	for c := range s.active {
+		if c.pair == pair {
+			victims = append(victims, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range victims {
+		c.close()
+	}
+	return len(victims)
 }
 
 // register tracks a relay, unless its service changed while it was dialling.
@@ -189,7 +227,8 @@ func (s *connectServer) answer(c net.Conn, resp api.ConnectResponse) {
 	_ = c.SetWriteDeadline(time.Time{})
 }
 
-// handle serves one connection: preamble, validation, dial, relay.
+// handle serves one plane-A connection: only the hub's overlay address may
+// connect, and it vouches for the service (it checked the user).
 func (s *connectServer) handle(ctx context.Context, c net.Conn) {
 	defer func() { _ = c.Close() }()
 	if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err != nil || ap.Addr().Unmap() != s.hubAddr {
@@ -197,6 +236,44 @@ func (s *connectServer) handle(ctx context.Context, c net.Conn) {
 		s.log.Warn("connect from an address other than the hub", "remote", c.RemoteAddr().String())
 		return
 	}
+	br, req, ok := s.readPreamble(c)
+	if !ok {
+		return
+	}
+	s.relay(ctx, c, br, req, "", nil)
+}
+
+// handleB serves one plane-B connection. WireGuard's cryptokey routing makes
+// the source address trustworthy (a peer can only send from its allowed /32),
+// and this handler accepts only sources that are the client address of a live
+// grant, and only the services that grant lists. Plane A and plane B have
+// separate handlers on purpose: nothing a plane-B peer sends is ever treated
+// as the hub's word.
+func (s *connectServer) handleB(ctx context.Context, c net.Conn, grants *GrantStore) {
+	defer func() { _ = c.Close() }()
+	ap, err := netip.ParseAddrPort(c.RemoteAddr().String())
+	if err != nil {
+		return
+	}
+	g, ok := grants.ByClientAddress(ap.Addr())
+	if !ok {
+		s.log.Warn("plane B connect from an address without a grant", "remote", ap.String())
+		return
+	}
+	br, req, ok := s.readPreamble(c)
+	if !ok {
+		return
+	}
+	if !slices.Contains(g.Services, req.Service) {
+		s.log.Warn("plane B connect refused: service not granted", "pair", g.PairID, "service", req.Service)
+		s.answer(c, api.ConnectResponse{Reason: api.ReasonServiceDenied})
+		return
+	}
+	s.relay(ctx, c, br, req, g.PairID, func() bool { return grants.Allows(g.PairID, req.Service) })
+}
+
+// readPreamble reads the ConnectRequest line.
+func (s *connectServer) readPreamble(c net.Conn) (*bufio.Reader, api.ConnectRequest, bool) {
 	_ = c.SetReadDeadline(time.Now().Add(s.preambleTO))
 	br := connectproto.NewReader(c)
 	req, err := connectproto.ReadRequest(br)
@@ -205,10 +282,17 @@ func (s *connectServer) handle(ctx context.Context, c net.Conn) {
 		if !errors.Is(err, connectproto.ErrTooLong) && !isTimeout(err) {
 			s.answer(c, api.ConnectResponse{Reason: api.ReasonBadRequest})
 		}
-		return
+		return nil, req, false
 	}
 	_ = c.SetReadDeadline(time.Time{})
+	return br, req, true
+}
 
+// relay validates the service, dials its target and relays. pair is the
+// plane-B pair ("" on plane A); stillAllowed, when set, is checked once more
+// after the connection is registered, so that a grant removed meanwhile cannot
+// leave a relay behind (the removal closes only registered relays).
+func (s *connectServer) relay(ctx context.Context, c net.Conn, br *bufio.Reader, req api.ConnectRequest, pair string, stillAllowed func() bool) {
 	select {
 	case s.global <- struct{}{}:
 		defer func() { <-s.global }()
@@ -217,13 +301,13 @@ func (s *connectServer) handle(ctx context.Context, c net.Conn) {
 		s.answer(c, api.ConnectResponse{Reason: api.ReasonSessionLimit})
 		return
 	}
-	spec, reason := s.reserve(req.Service)
+	spec, reason := s.reserve(req.Service, pair)
 	if reason != "" {
 		s.log.Warn("connect refused", "service", req.Service, "reason", reason, "as", req.As)
 		s.answer(c, api.ConnectResponse{Reason: reason})
 		return
 	}
-	defer s.release(spec.ID)
+	defer s.release(spec.ID, pair)
 
 	dctx, cancel := context.WithTimeout(ctx, s.dialTO)
 	local, err := s.policy.DialService(dctx, spec, s.dialTO)
@@ -240,19 +324,39 @@ func (s *connectServer) handle(ctx context.Context, c net.Conn) {
 	}
 	defer func() { _ = local.Close() }()
 
-	ac := &activeConn{spec: spec, close: func() { _ = c.Close(); _ = local.Close() }}
+	ac := &activeConn{spec: spec, pair: pair, close: func() { _ = c.Close(); _ = local.Close() }}
 	if !s.register(ac) {
 		s.log.Warn("service changed while connecting; refusing", "service", spec.ID)
 		s.answer(c, api.ConnectResponse{Reason: api.ReasonServiceUnknown})
 		return
 	}
 	defer s.unregister(ac)
+	if stillAllowed != nil && !stillAllowed() {
+		s.log.Warn("grant removed while connecting; refusing", "service", spec.ID, "pair", pair)
+		s.answer(c, api.ConnectResponse{Reason: api.ReasonServiceDenied})
+		return
+	}
 	stop := context.AfterFunc(ctx, ac.close) // session over: unblock both copies
 	defer stop()
 
 	s.answer(c, api.ConnectResponse{OK: true})
-	s.log.Debug("relaying connection", "service", spec.ID, "as", req.As)
+	s.log.Debug("relaying connection", "service", spec.ID, "as", req.As, "pair", pair)
 	pipe(connectproto.Wrap(c, br), local)
+}
+
+// ServeB accepts plane-B connections until ln is closed.
+func (s *connectServer) ServeB(ctx context.Context, ln net.Listener, grants *GrantStore, wg *sync.WaitGroup) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.handleB(ctx, c, grants)
+		}()
+	}
 }
 
 func isTimeout(err error) bool {
@@ -265,22 +369,59 @@ func isTimeout(err error) bool {
 // false when a listener cannot be opened: the agent advertised the
 // capabilities, so the session is useless to the hub and is ended (the agent
 // retries with a new one).
-func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api.SessionResponse, wg *sync.WaitGroup) bool {
+func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api.SessionResponse, p2pPriv *wgkey.PrivateKey, holder *grantHolder, wg *sync.WaitGroup) bool {
 	connect := newConnectServer(a.log, a.target, a.cfg.DialTimeout, a.cfg.MaxConnsPerService, a.cfg.MaxConns)
 	connect.SetServices(resp.Services)
-	grants := NewGrantStore(GrantStoreOptions{})
-	control := newControlServer(a.log, connect, grants)
+	// Plane B, when this agent offers it and the hub accepted the key.
+	var pb *planeB
+	if a.cfg.P2P && p2pPriv != nil {
+		var err error
+		if pb, err = a.newPlaneB(resp, *p2pPriv, connect); err != nil {
+			a.log.Warn("plane B is not available; clients will use the hub splice", "error", err.Error())
+			pb = nil
+		}
+	}
+	var bLn net.Listener
+	if pb != nil {
+		var err error
+		if bLn, err = pb.pl.Listen(api.AgentConnectPort); err != nil {
+			a.log.Warn("plane B listener failed; clients will use the hub splice", "error", err.Error())
+			pb.close()
+			pb = nil
+		}
+	}
+	opts := GrantStoreOptions{Hooks: unavailableHooks()}
+	if pb != nil {
+		opts.Hooks = pb.hooks()
+	}
+	grants := NewGrantStore(opts)
+	if holder != nil {
+		holder.set(grants)
+	}
+	a.grants.Store(grants)
+	control := newControlServer(a.log, connect, grants, pb)
 
+	closePlaneB := func() {
+		if pb != nil {
+			pb.close()
+		}
+	}
 	connLn, err := sess.Listen(api.AgentConnectPort)
 	if err != nil {
 		a.log.Error("cannot listen on the connect port", "port", api.AgentConnectPort, "error", err.Error())
+		closePlaneB()
 		return false
 	}
 	ctlLn, err := sess.Listen(api.AgentControlPort)
 	if err != nil {
 		a.log.Error("cannot listen on the control port", "port", api.AgentControlPort, "error", err.Error())
 		_ = connLn.Close()
+		closePlaneB()
 		return false
+	}
+	if pb != nil {
+		pb.serve(ctx, bLn, grants, wg)
+		a.pb.Store(pb)
 	}
 	a.log.Info("serving services", "count", len(connect.Services()), "connect_port", api.AgentConnectPort, "control_port", api.AgentControlPort)
 	wg.Add(2)
@@ -295,6 +436,11 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 		// Session over (or shutting down): fail closed.
 		connect.Close()
 		grants.DropAll()
+		a.grants.CompareAndSwap(grants, nil)
+		if pb != nil {
+			a.pb.CompareAndSwap(pb, nil)
+			pb.close()
+		}
 	}()
 	wg.Add(1)
 	go func() { // lease expiry of the plane-B grants (wave B)

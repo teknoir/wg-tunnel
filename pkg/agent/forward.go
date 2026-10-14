@@ -10,12 +10,13 @@ import (
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/wgclient"
+	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
 // serve exposes the allowed ports of sess and forwards connections until the
 // session ends or ctx is cancelled. It returns how long it served and why the
 // session ended (nil after a local close).
-func (a *Agent) serve(ctx context.Context, sess *wgclient.Session) (time.Duration, error) {
+func (a *Agent) serve(ctx context.Context, sess *wgclient.Session, p2pPriv *wgkey.PrivateKey, holder *grantHolder) (time.Duration, error) {
 	start := time.Now()
 
 	resp := sess.Response()
@@ -31,7 +32,7 @@ func (a *Agent) serve(ctx context.Context, sess *wgclient.Session) (time.Duratio
 	}()
 
 	var wg sync.WaitGroup
-	if !a.serveServices(sctx, sess, resp, &wg) {
+	if !a.serveServices(sctx, sess, resp, p2pPriv, holder, &wg) {
 		_ = sess.Close()
 	}
 	sem := make(chan struct{}, a.cfg.MaxConns)

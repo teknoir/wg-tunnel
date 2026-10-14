@@ -99,6 +99,22 @@ type Config struct {
 	// ConfigFromEnv.
 	AllowTarget func(netip.AddrPort) bool
 
+	// P2P (phase 2) enables plane B, the direct WireGuard path to clients:
+	// the agent advertises api.CapP2P and serves granted clients on its own
+	// UDP socket (P2PPort, 0 = any). P2PSTUN ("host:port") overrides the STUN
+	// server, which is otherwise the host of the session's TURN URL.
+	P2P     bool
+	P2PPort int
+	P2PSTUN string
+	// Test hooks of plane B: a pre-opened socket, a wrapper around the socket
+	// (a lossy conn), a fake interface listing, loopback host candidates and
+	// the probe interval. ConfigFromEnv never sets them.
+	P2PConn            func() (net.PacketConn, error)
+	P2PWrapConn        func(net.PacketConn) net.PacketConn
+	P2PInterfaces      func() ([]netip.Addr, error)
+	P2PIncludeLoopback bool
+	P2PProbeInterval   time.Duration
+
 	// Passed through to wgclient (zero: its defaults).
 	StaleAfter       time.Duration
 	HandshakeTimeout time.Duration
@@ -120,6 +136,9 @@ type Config struct {
 //	CLUSTER_DOMAIN             cluster DNS domain, default cluster.local
 //	SSH_PORT                   sshd port of the ssh service, default 22
 //	TURN_SERVER                optional host:port override
+//	P2P                        on (default) or off: direct WireGuard to clients
+//	P2P_PORT                   UDP port of the direct socket, default 0 (any)
+//	P2P_STUN                   host:port of a STUN server (default: the TURN host)
 //	ATTEST_EXCHANGE            directory shared with the attestor sidecar
 //	                           (e.g. /run/wg-attest); empty: no attestation
 //	CA_FILE                    extra CA bundle added to the system roots
@@ -152,6 +171,26 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("agent: SSH_PORT %q is not a port", v)
 		}
 		c.SSHPort = port
+	}
+	switch strings.ToLower(strings.TrimSpace(getenv("P2P"))) {
+	case "", "on", "true", "1", "yes":
+		c.P2P = true
+	case "off", "false", "0", "no":
+	default:
+		return Config{}, fmt.Errorf("agent: P2P %q is not on or off", getenv("P2P"))
+	}
+	if v := getenv("P2P_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil || port < 0 || port > 65535 {
+			return Config{}, fmt.Errorf("agent: P2P_PORT %q is not a port", v)
+		}
+		c.P2PPort = port
+	}
+	c.P2PSTUN = getenv("P2P_STUN")
+	if c.P2PSTUN != "" {
+		if _, _, err := net.SplitHostPort(c.P2PSTUN); err != nil {
+			return Config{}, fmt.Errorf("agent: P2P_STUN must be host:port: %w", err)
+		}
 	}
 	caFile, explicit := getenv("CA_FILE"), true
 	if caFile == "" {

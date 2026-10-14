@@ -127,3 +127,71 @@ func mustOtherKey(t *testing.T) ssh.PublicKey {
 	}
 	return k
 }
+
+// With --p2p the ProxyCommand's bytes take the direct plane-B path to the
+// device: the hub splices nothing.
+func TestE2EConnectP2PUsesTheDirectPath(t *testing.T) {
+	r := e2erig.New(t, e2erig.Options{P2P: true})
+	ag := r.StartAgent()
+	r.WaitDeviceUp(1)
+	e2erig.Eventually(t, 10*time.Second, "the agent's plane B", func() bool { return ag.Agent.P2PStatus().Up })
+
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "keycloak-token")
+	if err := os.WriteFile(tokenFile, []byte(r.UserToken(e2erig.AliceEmail)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{
+		"--hub-url", r.HubURL, "--namespace", e2erig.NS, "--device", e2erig.DeviceName,
+		"--keycloak-token-file", tokenFile, "--known-hosts-file", filepath.Join(dir, "known_hosts"),
+		"--p2p", "--stun-server", r.TURN.Addr,
+	}
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	var stderr lockedBuf
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	exit := make(chan int, 1)
+	go func() { exit <- run(ctx, args, stdinR, stdoutW, &stderr) }()
+
+	out := bufio.NewReader(stdoutR)
+	line := "SSH-2.0-direct\n"
+	if _, err := stdinW.Write([]byte(line)); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 1)
+	go func() { s, _ := out.ReadString('\n'); got <- s }()
+	select {
+	case s := <-got:
+		if s != line {
+			t.Fatalf("echo mismatch %q (stderr: %s)", s, stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("no echo (stderr: %s)", stderr.String())
+	}
+	if n := r.HubLogs.Count(`"op":"connect","decision":"allow"`); n != 0 {
+		t.Fatalf("the hub spliced %d connections although --p2p was on", n)
+	}
+	if ag.Agent.P2PStatus().Peers != 1 {
+		t.Fatal("the device has no plane-B peer")
+	}
+	_ = stdinW.Close()
+	select {
+	case <-exit:
+	case <-time.After(10 * time.Second):
+		t.Fatal("wg-connect did not exit after stdin closed")
+	}
+}
+
+func TestParseArgsP2PConflicts(t *testing.T) {
+	base := []string{"--hub-url", "https://wg.example.com", "--namespace", "ns", "--device", "dev", "--known-hosts-file", "/tmp/kh"}
+	if _, err := parseArgs(append(base, "--keycloak-token-file", "/tmp/t", "--p2p"), io.Discard); err != nil {
+		t.Fatalf("--p2p with a keycloak token: %v", err)
+	}
+	if _, err := parseArgs(append(base, "--sa-token-file", "/tmp/t", "--on-behalf-of", "a@b.com", "--p2p"), io.Discard); err == nil {
+		t.Fatal("--p2p with delegation accepted")
+	}
+	if _, err := parseArgs(append(base, "--keycloak-token-file", "/tmp/t", "--direct", "--p2p"), io.Discard); err == nil {
+		t.Fatal("--p2p with --direct accepted")
+	}
+}

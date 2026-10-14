@@ -152,7 +152,9 @@ type svcAgent struct {
 	refuse    string // answer every connect with this refusal
 	garbage   bool   // answer every connect with junk
 	ctlStatus int    // control answer (default 204)
-	rawEcho   int    // also echo on this overlay port (legacy listener)
+	// grants, when set, serves ControlGrantsPath.
+	grants  func(w http.ResponseWriter, body []byte)
+	rawEcho int // also echo on this overlay port (legacy listener)
 }
 
 func (a *svcAgent) connects() []api.ConnectRequest {
@@ -254,6 +256,10 @@ func (a *svcAgent) handleConnect(c net.Conn) {
 func (a *svcAgent) handleControl(w http.ResponseWriter, r *http.Request) {
 	var upd api.ServicesUpdate
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if r.URL.Path == api.ControlGrantsPath && a.grants != nil {
+		a.grants(w, body)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != api.ControlServicesPath || json.Unmarshal(body, &upd) != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return

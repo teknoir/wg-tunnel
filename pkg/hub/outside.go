@@ -584,6 +584,16 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	}
 	ports := validPorts(eff.Policy.AllowedPorts)
 	caps := sanitizeCaps(req.Capabilities)
+	p2pKey := ""
+	if slices.Contains(caps, api.CapP2P) {
+		if k, err := wgkey.ParsePublic(req.P2PWGPublicKey); err == nil && k != wgPub {
+			p2pKey = k.Base64()
+		} else {
+			// Plane B needs its own key; without a valid one the agent is
+			// treated as a plane-A-only agent.
+			caps = slices.DeleteFunc(caps, func(c string) bool { return c == api.CapP2P })
+		}
+	}
 	var services []api.ServiceSpec
 	if slices.Contains(caps, api.CapServices) {
 		services = policyServices(eff.Policy)
@@ -593,7 +603,7 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now,
 		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), attestedKey: pin.AttestedHostKey, ports: ports,
 		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote,
-		caps: caps, services: services,
+		caps: caps, services: services, p2pKey: p2pKey,
 		expiresAt: now.Add(h.cfg.SessionTTL), turnExpiry: turn.ExpiresAt,
 	}
 	d.session = id
@@ -671,6 +681,16 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	wgPub, err := wgkey.ParsePublic(req.WGPublicKey)
 	if err != nil {
 		return 0, nil, deny(api.ReasonBadRequest, "invalid WireGuard public key")
+	}
+	var (
+		offerKey   wgkey.PublicKey
+		offerCands []string
+	)
+	if req.P2P != nil {
+		var den *denial
+		if offerKey, offerCands, den = validateOffer(req.P2P); den != nil {
+			return 0, nil, den
+		}
 	}
 	ns, device := req.Namespace, req.Device
 	d.ns, d.device = ns, device
@@ -777,15 +797,22 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		h.endSession(s, again.Reason)
 		return 0, nil, deny(again.Reason, again.Detail)
 	}
-	if h.deviceSession(ns, device) == nil {
+	liveDev := h.deviceSession(ns, device)
+	if liveDev == nil {
 		h.endSession(s, api.ReasonDeviceOffline)
 		return 0, nil, deny(api.ReasonDeviceOffline, "device has no live tunnel")
+	}
+	// Plane B is an add-on: whatever happens to it, the splice stays.
+	var grant *api.P2PGrant
+	if req.P2P != nil {
+		grant = h.offerP2P(ctx, s, liveDev, computeEffective(h.deps.Policy, h.deps.Flags, ns, device).Policy, offerKey, offerCands)
 	}
 	return http.StatusCreated, &api.SessionResponse{
 		SessionID: id, Kind: api.KindClient, Address: s.ip.String(),
 		HubAddress: api.HubAddress, HubPublicKey: h.tunnel.PublicKey().Base64(), HubEndpoint: h.Endpoint(),
 		TURN: turn, ExpiresAt: s.expiresAt, RenewAfterSeconds: int(h.cfg.RenewAfter.Seconds()), MTU: api.MTU,
 		SplicePort: api.HubSplicePort, TargetPort: targetPort, Service: service, SSHHostKeys: slices.Clone(dev.hostKeys),
+		P2P: grant,
 	}, nil
 }
 

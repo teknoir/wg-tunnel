@@ -39,6 +39,9 @@ func (a *Agent) capabilities() []string {
 	if a.attesting() {
 		caps = append(caps, api.CapAttest)
 	}
+	if a.cfg.P2P {
+		caps = append(caps, api.CapP2P)
+	}
 	return caps
 }
 

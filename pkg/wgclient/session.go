@@ -36,6 +36,8 @@ type Session struct {
 	renewURL string
 	closeURL string
 
+	p2pc *p2pClient // plane B (nil: none)
+
 	tnet *netstack.Net
 	dev  *device.Device
 	bind *turnbind.Bind
@@ -85,6 +87,7 @@ func Create(ctx context.Context, opts Options) (*Session, error) {
 		path    string
 		body    any
 		posture api.Posture
+		prep    *p2pPrep
 	)
 	switch opts.Kind {
 	case api.KindDevice:
@@ -95,8 +98,12 @@ func Create(ctx context.Context, opts Options) (*Session, error) {
 		req := *opts.ClientRequest
 		req.WGPublicKey = pubB64
 		req.Direct = opts.Direct
+		if prep = opts.prepareP2P(ctx); prep != nil {
+			req.P2P = prep.offer()
+		}
 		path, body, posture = api.ClientSessionPath, req, req.Posture
 	}
+	defer func() { prep.close() }() // closed already (nil) once plane B took over
 
 	token, err := opts.Credential(ctx, pubB64)
 	if err != nil {
@@ -133,6 +140,9 @@ func Create(ctx context.Context, opts Options) (*Session, error) {
 		s.end(nil)
 		return nil, err
 	}
+	// Plane B comes up after plane A: its failure never fails the session.
+	s.initP2P(prep, resp)
+	prep = nil
 	log.Info("wireguard session established", "session", resp.SessionID, "kind", resp.Kind,
 		"address", resp.Address, "transport", s.transportName(), "expires", resp.ExpiresAt.Format(time.RFC3339))
 	go func() {
@@ -465,8 +475,11 @@ func (s *Session) renew() (*api.RenewResponse, error) {
 	}
 	s.httpOnce()
 	var rr api.RenewResponse
-	if err := doJSON(ctx, s.tunnelHTTP, s.renewURL, token, api.RenewRequest{Posture: s.posture}, &rr); err != nil {
+	if err := doJSON(ctx, s.tunnelHTTP, s.renewURL, token, api.RenewRequest{Posture: s.posture, Path: s.Path()}, &rr); err != nil {
 		return nil, err
+	}
+	if s.opts.OnRenew != nil {
+		s.opts.OnRenew(&rr)
 	}
 	if rr.TURN != nil && s.sup != nil {
 		rc, err := s.relayConfig(rr.TURN)
@@ -629,6 +642,9 @@ func (s *Session) end(err error) {
 		}
 		if s.pc != nil {
 			_ = s.pc.Close()
+		}
+		if s.p2pc != nil {
+			s.p2pc.close()
 		}
 		close(s.done)
 	})

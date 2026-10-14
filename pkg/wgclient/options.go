@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -71,6 +72,32 @@ type Options struct {
 	RenewRetry time.Duration
 	// RenewTimeout bounds one renewal attempt (default 15 s).
 	RenewTimeout time.Duration
+	// OnRenew, when set, receives every successful renewal response (the
+	// device agent applies the grant backstop from it). It must not block.
+	OnRenew func(*api.RenewResponse)
+
+	// P2P (client sessions) asks for plane B: a direct WireGuard path to the
+	// device next to the hub splice. The client opens a UDP socket, gathers
+	// candidates (STUN) and offers them with the session request; if the
+	// device accepts, DialService races the direct path against the hub.
+	// A failure on plane B never fails the session or the splice.
+	P2P bool
+	// P2PSTUN ("host:port") overrides the STUN server, which is otherwise
+	// derived from HubURL (https://wg.<domain> -> turn.<domain>:3478) because
+	// the session response, with its TURN URLs, comes after the offer.
+	P2PSTUN string
+	// P2PRace bounds how long DialService waits for plane B before it falls
+	// back to the hub (default api.P2PDialRaceMillis).
+	P2PRace time.Duration
+	// P2PBudget bounds the probing of one punch (default p2p.DefaultBudget).
+	P2PBudget time.Duration
+	// Test hooks of plane B (see p2p.SocketConfig); never set by tnctl.
+	P2PConn            func() (net.PacketConn, error)
+	P2PWrapConn        func(net.PacketConn) net.PacketConn
+	P2PInterfaces      func() ([]netip.Addr, error)
+	P2PIncludeLoopback bool
+	P2PProbeInterval   time.Duration
+
 	// DeadAfter is how long nothing may arrive through WireGuard before a
 	// transport-level renewal failure ends the session (default
 	// 2 * api.PersistentKeepalive seconds).

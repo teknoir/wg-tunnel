@@ -213,6 +213,14 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 	s.mu.Unlock()
 
 	resp := &api.RenewResponse{ExpiresAt: exp, RenewAfterSeconds: int(h.cfg.RenewAfter.Seconds())}
+	if s.kind == api.KindClient {
+		h.p2pRenewed(s, req.Path)
+	} else if s.hasCap(api.CapP2P) && s.p2pKey != "" {
+		// The backstop for a grant push that never arrived: the full set, with
+		// the leases that are left (renewals of the device extend nothing).
+		set := h.buildGrantSet(s)
+		resp.Grants = &set
+	}
 	if rotate {
 		turn, err := h.deps.TURN.Mint(s.ns, s.id)
 		if err != nil {

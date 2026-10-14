@@ -48,6 +48,12 @@ type Config struct {
 	// stays installed after its spliced connections were closed, so that the
 	// FIN/RST reaches the other side (default 300ms).
 	FlushGrace time.Duration
+	// P2PGrantTTL is the lifetime of a plane-B grant on the device, restarted
+	// by every push (default api.DefaultGrantTTL seconds). A client renewal
+	// re-pushes once half of it has passed.
+	P2PGrantTTL time.Duration
+	// P2PPushTimeout bounds one grant push to the agent (default 3 s).
+	P2PPushTimeout time.Duration
 
 	MaxSessions         int // new client sessions are refused at this many sessions in total (default 5000); devices only at twice that
 	MaxPerNamespace     int // client sessions per teamspace (default 200); device sessions are exempt
@@ -95,6 +101,8 @@ func (c *Config) applyDefaults() {
 	dur(&c.DialTimeout, 10*time.Second)
 	dur(&c.Quarantine, 5*time.Minute)
 	dur(&c.FlushGrace, 300*time.Millisecond)
+	dur(&c.P2PGrantTTL, api.DefaultGrantTTL*time.Second)
+	dur(&c.P2PPushTimeout, 3*time.Second)
 	num(&c.MaxSessions, 5000)
 	num(&c.MaxPerNamespace, 200)
 	num(&c.MaxPerSubjectDevice, 5)
@@ -128,6 +136,10 @@ type Hub struct {
 	deps Deps
 	log  *slog.Logger
 	now  func() time.Time
+
+	// instance names this hub process in the grant sets it pushes: a restarted
+	// hub starts its sequence numbers over and the agents drop the old pairs.
+	instance string
 
 	tunnel  Tunnel
 	hubAddr netip.Addr
@@ -189,9 +201,14 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		_ = tun.Close()
 		return nil, err
 	}
+	instance, err := newID()
+	if err != nil {
+		_ = tun.Close()
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
-		cfg: cfg, deps: deps, log: log, now: cfg.Now,
+		cfg: cfg, deps: deps, log: log, now: cfg.Now, instance: instance,
 		tunnel: tun, hubAddr: hubAddr, ipam: pool, met: newMetrics(),
 		ipLimit:     newLimiter(cfg.IPRate, cfg.IPBurst, 50000, cfg.Now),
 		globalLimit: newLimiter(cfg.GlobalRate, cfg.GlobalBurst, 64, cfg.Now),
@@ -377,6 +394,7 @@ func (h *Hub) enforce(k devKey) {
 	if live != nil {
 		h.syncServices(live, eff.Policy)
 	}
+	h.syncP2P(k, eff.Policy, live, clients)
 	// A client session whose port or service is gone or was redefined ends,
 	// and its spliced connections with it.
 	for _, c := range clients {

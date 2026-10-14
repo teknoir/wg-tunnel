@@ -70,6 +70,8 @@ type options struct {
 	knownHostsFile            string
 	turnServer                string
 	caFile                    string
+	p2p                       bool
+	stunServer                string
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
@@ -90,6 +92,8 @@ func parseArgs(args []string, stderr io.Writer) (*options, error) {
 	fs.StringVar(&o.knownHostsFile, "known-hosts-file", "", "known_hosts file to write the device SSH host keys to")
 	fs.StringVar(&o.turnServer, "turn-server", "", "TURN server host:port overriding the hub's (LAN tests)")
 	fs.StringVar(&o.caFile, "ca-file", "", "extra CA bundle for the hub's TLS certificate")
+	fs.BoolVar(&o.p2p, "p2p", false, "try a direct WireGuard path to the device (keycloak users only); the hub splice stays the fallback")
+	fs.StringVar(&o.stunServer, "stun-server", "", "STUN server host:port for --p2p (default: turn.<domain> of the hub)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -128,6 +132,8 @@ func (o *options) validate() error {
 		return errors.New("--sa-token-file and --keycloak-token-file are mutually exclusive")
 	case o.saTokenFile != "" && o.onBehalfOf == "":
 		return errors.New("--on-behalf-of is required with --sa-token-file")
+	case o.p2p && (o.saTokenFile != "" || o.direct):
+		return errors.New("--p2p is for keycloak users on the outside API, not for delegated or direct sessions")
 	case o.saTokenFile == "" && o.onBehalfOf != "":
 		return errors.New("--on-behalf-of is only valid with --sa-token-file")
 	case o.direct && o.turnServer != "":
@@ -286,6 +292,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			Posture: api.Posture{Software: software, Version: version.Version, OS: runtime.GOOS, Arch: runtime.GOARCH, Hostname: host},
 		},
 		Direct:             o.direct,
+		P2P:                o.p2p,
+		P2PSTUN:            o.stunServer,
 		TURNServerOverride: o.turnServer,
 		HTTPClient:         hc,
 	}
@@ -308,7 +316,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	dctx, dcancel := context.WithTimeout(ctx, dialTimeout)
-	conn, err := sess.Dial(dctx)
+	var conn net.Conn
+	if o.p2p && resp.Service != "" {
+		// Direct if plane B comes up within the race budget, else the hub splice.
+		conn, err = sess.DialService(dctx, "")
+	} else {
+		conn, err = sess.Dial(dctx)
+	}
 	dcancel()
 	if err != nil {
 		return fail(stderr, exitFail, "cannot reach the hub inside the tunnel: %s", oneLine(err.Error()))

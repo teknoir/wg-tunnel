@@ -25,12 +25,15 @@ type controlServer struct {
 	log     *slog.Logger
 	connect *connectServer
 	grants  *GrantStore
+	// planeB answers the GrantAck's plane-B parameters; nil when this agent
+	// has no plane B (the hub then treats the ack as "not available").
+	planeB  *planeB
 	hubAddr netip.Addr
 	srv     *http.Server
 }
 
-func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore) *controlServer {
-	c := &controlServer{log: log, connect: connect, grants: grants, hubAddr: netip.MustParseAddr(api.HubAddress)}
+func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore, pb *planeB) *controlServer {
+	c := &controlServer{log: log, connect: connect, grants: grants, planeB: pb, hubAddr: netip.MustParseAddr(api.HubAddress)}
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.ControlServicesPath, c.handle(c.services))
 	mux.HandleFunc(api.ControlGrantsPath, c.handle(c.applyGrants))
@@ -64,7 +67,7 @@ func (c *controlServer) Serve(ctx context.Context, ln net.Listener, wg *sync.Wai
 	}()
 }
 
-type controlFunc func(body []byte) (status int, resp any, err *api.Error)
+type controlFunc func(ctx context.Context, body []byte) (status int, resp any, err *api.Error)
 
 func (c *controlServer) handle(fn controlFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +85,7 @@ func (c *controlServer) handle(fn controlFunc) http.HandlerFunc {
 			writeControlJSON(w, http.StatusRequestEntityTooLarge, &api.Error{Reason: api.ReasonBadRequest, Message: "unreadable or oversized body"})
 			return
 		}
-		status, resp, aerr := fn(body)
+		status, resp, aerr := fn(r.Context(), body)
 		if aerr != nil {
 			writeControlJSON(w, status, aerr)
 			return
@@ -102,7 +105,7 @@ func writeControlJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (c *controlServer) services(body []byte) (int, any, *api.Error) {
+func (c *controlServer) services(_ context.Context, body []byte) (int, any, *api.Error) {
 	var upd api.ServicesUpdate
 	if err := json.Unmarshal(body, &upd); err != nil {
 		return http.StatusBadRequest, nil, &api.Error{Reason: api.ReasonBadRequest, Message: "malformed JSON"}
@@ -112,7 +115,7 @@ func (c *controlServer) services(body []byte) (int, any, *api.Error) {
 	return http.StatusNoContent, nil, nil
 }
 
-func (c *controlServer) applyGrants(body []byte) (int, any, *api.Error) {
+func (c *controlServer) applyGrants(ctx context.Context, body []byte) (int, any, *api.Error) {
 	var set api.GrantSet
 	if err := json.Unmarshal(body, &set); err != nil {
 		return http.StatusBadRequest, nil, &api.Error{Reason: api.ReasonBadRequest, Message: "malformed JSON"}
@@ -127,7 +130,11 @@ func (c *controlServer) applyGrants(body []byte) (int, any, *api.Error) {
 	for id, why := range res.Rejected {
 		c.log.Warn("grant refused", "pair", id, "why", why)
 	}
-	// Plane B is wave B: until then no device parameters are handed out, and
-	// the hub treats an empty DeviceWGPublicKey as "not available".
-	return http.StatusOK, &api.GrantAck{DeviceCandidates: []string{}, Accepted: res.Accepted}, nil
+	ack := &api.GrantAck{DeviceCandidates: []string{}, Accepted: res.Accepted}
+	if c.planeB != nil {
+		// Without plane B the key stays empty and the hub treats the pairs as
+		// not available.
+		ack.DeviceWGPublicKey, ack.DeviceAddress, ack.DeviceCandidates = c.planeB.params(ctx)
+	}
+	return http.StatusOK, ack, nil
 }
