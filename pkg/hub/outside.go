@@ -18,6 +18,7 @@ import (
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/identity"
+	"github.com/teknoir/wg-tunnel/pkg/svc"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
@@ -485,11 +486,17 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 		return 0, nil, denyUnavailable("TURN credentials unavailable")
 	}
 	ports := validPorts(eff.Policy.AllowedPorts)
+	caps := sanitizeCaps(req.Capabilities)
+	var services []api.ServiceSpec
+	if slices.Contains(caps, api.CapServices) {
+		services = policyServices(eff.Policy)
+	}
 	s := &session{
 		id: id, kind: api.KindDevice, authKind: authDevice, ns: ns, device: device, subject: sub,
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now,
 		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), ports: ports,
 		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote,
+		caps: caps, services: services,
 		expiresAt: now.Add(h.cfg.SessionTTL), turnExpiry: turn.ExpiresAt,
 	}
 	d.session = id
@@ -504,12 +511,16 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	} else if reason, detail := deviceStale(s, again.Policy); reason != "" {
 		h.endSession(s, reason)
 		return 0, nil, deny(staleDenialReason(reason), detail)
+	} else {
+		// The services may have changed after the response set was read (the
+		// enforcer did not know s yet): push the difference once it is up.
+		h.syncServices(s, again.Policy)
 	}
 	return http.StatusCreated, &api.SessionResponse{
 		SessionID: id, Kind: api.KindDevice, Address: s.ip.String(),
 		HubAddress: api.HubAddress, HubPublicKey: h.tunnel.PublicKey().Base64(), HubEndpoint: h.Endpoint(),
 		TURN: turn, ExpiresAt: s.expiresAt, RenewAfterSeconds: int(h.cfg.RenewAfter.Seconds()), MTU: api.MTU,
-		AllowedPorts: slices.Clone(ports),
+		AllowedPorts: slices.Clone(ports), Services: slices.Clone(services),
 	}, nil
 }
 
@@ -525,6 +536,10 @@ func deviceStale(s *session, pol api.PolicyEntry) (reason, detail string) {
 		return api.ReasonPendingApproval, "identity approval changed"
 	case !samePorts(pol.AllowedPorts, s.ports):
 		return reasonPortsChanged, "allowed ports changed"
+	case s.hasCap(api.CapServices) && !s.hasCap(api.CapControl) && !svc.Same(s.servicesOf(), policyServices(pol)):
+		// An agent that cannot take a control push learns services only at
+		// session creation.
+		return reasonServicesChanged, "services changed"
 	}
 	return "", ""
 }
@@ -553,7 +568,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	if !d.internal && (req.OnBehalfOf != "" || req.Direct) {
 		return 0, nil, deny(api.ReasonForbidden, "delegation and direct sessions are not available on this endpoint")
 	}
-	if !validLabel(req.Namespace) || !validLabel(req.Device) || req.Port < 1 || req.Port > 65535 {
+	if !validLabel(req.Namespace) || !validLabel(req.Device) {
 		return 0, nil, deny(api.ReasonBadRequest, "invalid namespace, device or port")
 	}
 	wgPub, err := wgkey.ParsePublic(req.WGPublicKey)
@@ -615,12 +630,22 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	if !eff.Active {
 		return 0, nil, deny(eff.Reason, eff.Detail)
 	}
-	if !portAllowed(eff.Policy.AllowedPorts, req.Port) {
-		return 0, nil, deny(api.ReasonPortNotAllowed, "port is not allowed for this device")
+	service, targetPort, spec, den := resolveRequest(req, eff.Policy)
+	if den != nil {
+		return 0, nil, den
+	}
+	d.service = service
+	route := &session{service: service, targetPort: targetPort, svcSpec: spec}
+	if den := serviceDenial(route, eff.Policy, false, false); den != nil {
+		return 0, nil, den
 	}
 	dev := h.deviceSession(ns, device)
 	if dev == nil {
 		return 0, nil, deny(api.ReasonDeviceOffline, "device has no live tunnel")
+	}
+	agentSvc := dev.hasCap(api.CapServices)
+	if den := serviceDenial(route, eff.Policy, true, agentSvc); den != nil {
+		return 0, nil, den
 	}
 
 	id, err := newID()
@@ -637,7 +662,8 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	now := h.now()
 	s := &session{
 		id: id, kind: api.KindClient, authKind: authKind, ns: ns, device: device, subject: email, saName: saName,
-		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now, targetPort: req.Port, direct: req.Direct,
+		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now, targetPort: targetPort, direct: req.Direct,
+		service: service, svcSpec: spec, agentSvc: agentSvc,
 		remote: d.remote, tokenExpiry: tokenExp, lastTokenID: tokenID, lastTokenIAT: tokenIAT,
 		expiresAt: capExpiry(now.Add(h.cfg.SessionTTL), tokenExp, h.cfg.SessionTTL),
 	}
@@ -662,7 +688,7 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		SessionID: id, Kind: api.KindClient, Address: s.ip.String(),
 		HubAddress: api.HubAddress, HubPublicKey: h.tunnel.PublicKey().Base64(), HubEndpoint: h.Endpoint(),
 		TURN: turn, ExpiresAt: s.expiresAt, RenewAfterSeconds: int(h.cfg.RenewAfter.Seconds()), MTU: api.MTU,
-		SplicePort: api.HubSplicePort, TargetPort: req.Port, SSHHostKeys: slices.Clone(dev.hostKeys),
+		SplicePort: api.HubSplicePort, TargetPort: targetPort, Service: service, SSHHostKeys: slices.Clone(dev.hostKeys),
 	}, nil
 }
 

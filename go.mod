@@ -8,6 +8,8 @@ require (
 	github.com/pion/turn/v5 v5.0.3
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/crypto v0.58.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.49.0
 	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
 	k8s.io/api v0.34.12
 	k8s.io/apimachinery v0.34.12
@@ -48,9 +50,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

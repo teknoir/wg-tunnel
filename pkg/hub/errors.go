@@ -26,6 +26,8 @@ var reasonStatus = map[string]int{
 	api.ReasonDeviceRevoked:   http.StatusForbidden,
 	api.ReasonDeviceOffline:   http.StatusConflict,
 	api.ReasonPortNotAllowed:  http.StatusForbidden,
+	api.ReasonServiceUnknown:  http.StatusNotFound,
+	api.ReasonServiceDenied:   http.StatusForbidden,
 	api.ReasonPosture:         http.StatusForbidden,
 	api.ReasonSessionUnknown:  http.StatusNotFound,
 	api.ReasonSessionMaxAge:   http.StatusForbidden,

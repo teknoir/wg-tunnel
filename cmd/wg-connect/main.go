@@ -35,6 +35,7 @@ import (
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/knownhosts"
+	"github.com/teknoir/wg-tunnel/pkg/svc"
 	"github.com/teknoir/wg-tunnel/pkg/version"
 	"github.com/teknoir/wg-tunnel/pkg/wgclient"
 )
@@ -60,6 +61,8 @@ func main() {
 type options struct {
 	hubURL, namespace, device string
 	port                      int
+	service                   string
+	portSet                   bool
 	direct                    bool
 	saTokenFile               string
 	keycloakTokenFile         string
@@ -78,7 +81,8 @@ func parseArgs(args []string, stderr io.Writer) (*options, error) {
 	fs.StringVar(&o.hubURL, "hub-url", "", "session API base URL of the hub")
 	fs.StringVar(&o.namespace, "namespace", "", "teamspace (namespace) of the device")
 	fs.StringVar(&o.device, "device", "", "device name")
-	fs.IntVar(&o.port, "port", 22, "device TCP port")
+	fs.IntVar(&o.port, "port", 22, "device TCP port (legacy; use --service for anything but ssh)")
+	fs.StringVar(&o.service, "service", api.ServiceSSHID, "service id on the device (ssh, or a service defined for the device)")
 	fs.BoolVar(&o.direct, "direct", false, "send WireGuard straight to the hub over UDP (in-cluster only)")
 	fs.StringVar(&o.saTokenFile, "sa-token-file", "", "file with a projected service account token (re-read for every call)")
 	fs.StringVar(&o.keycloakTokenFile, "keycloak-token-file", "", "file with a Keycloak access token (re-read for every call)")
@@ -92,6 +96,11 @@ func parseArgs(args []string, stderr io.Writer) (*options, error) {
 	if fs.NArg() != 0 {
 		return nil, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "port" {
+			o.portSet = true
+		}
+	})
 	return &o, o.validate()
 }
 
@@ -105,6 +114,12 @@ func (o *options) validate() error {
 		return errors.New("--device is required and must be a DNS-style name")
 	case o.port < 1 || o.port > 65535:
 		return errors.New("--port must be between 1 and 65535")
+	case o.service == "":
+		return errors.New("--service must not be empty")
+	case !svc.ValidID(o.service):
+		return errors.New("--service must be a service id (a DNS label of at most 20 characters)")
+	case o.service != api.ServiceSSHID && o.portSet:
+		return errors.New("--port cannot be combined with --service other than ssh")
 	case o.knownHostsFile == "":
 		return errors.New("--known-hosts-file is required")
 	case o.saTokenFile == "" && o.keycloakTokenFile == "":
@@ -125,6 +140,24 @@ func (o *options) validate() error {
 		return err
 	}
 	return nil
+}
+
+// requestService is the ClientSessionRequest.Service: a named service as is;
+// ssh on port 22 is "ssh"; ssh on another port is the legacy raw port (no
+// service), which the hub still serves for ports in the policy.
+func (o *options) requestService() string {
+	if o.service == api.ServiceSSHID && o.port != 22 {
+		return ""
+	}
+	return o.service
+}
+
+// requestPort is the legacy port: 0 for a named service other than ssh.
+func (o *options) requestPort() int {
+	if o.service != api.ServiceSSHID {
+		return 0
+	}
+	return o.port
 }
 
 func (o *options) tokenFile() string {
@@ -248,7 +281,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return readToken(tokenPath)
 		},
 		ClientRequest: &api.ClientSessionRequest{
-			Namespace: o.namespace, Device: o.device, Port: o.port, OnBehalfOf: o.onBehalfOf,
+			Namespace: o.namespace, Device: o.device, OnBehalfOf: o.onBehalfOf,
+			Service: o.requestService(), Port: o.requestPort(),
 			Posture: api.Posture{Software: software, Version: version.Version, OS: runtime.GOOS, Arch: runtime.GOARCH, Hostname: host},
 		},
 		Direct:             o.direct,
