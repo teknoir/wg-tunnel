@@ -22,31 +22,45 @@ import (
 // softwareGateway is the posture software of the web gateway (api.ClientSessionInfo.Software).
 const softwareGateway = "web-gateway"
 
-// StatusRequesterHeader carries the end user (a lowercase email) on whose
-// behalf the Backstage backend calls the status listener. Only the verified
-// Backstage service account can reach the listener, so the value is trusted
-// for the audit line of an admin action; an invalid value is logged as "unknown".
-const StatusRequesterHeader = "X-Ztna-Requester"
+// StatusRequesterHeader (api.StatusRequesterHeader) carries the end user (a
+// lowercase email) on whose behalf the Backstage backend calls the status
+// listener. Only the verified Backstage service account can reach the
+// listener, so the value is trusted for the audit line of an admin action; an
+// invalid value is logged as "unknown".
+const StatusRequesterHeader = api.StatusRequesterHeader
 
 // reasonAdminEnd is the log and metric label of an administrator ending a session.
 const reasonAdminEnd = "admin_end"
 
-// StatusAuthenticator verifies a ServiceAccount token the way the API server
-// does for its own clients (the default audience) and returns the username of
-// the token's subject, e.g. "system:serviceaccount:teknoir-system:backstage".
+// StatusAuthenticator verifies a ServiceAccount token presented on the status
+// listener and returns the username of the token's subject, e.g.
+// "system:serviceaccount:teknoir-system:backstage".
 type StatusAuthenticator interface {
 	Authenticate(ctx context.Context, token string) (username string, err error)
 }
 
-// K8sStatusAuth implements StatusAuthenticator with a TokenReview WITHOUT
-// audiences: an ordinary pod token (automounted, API-server audience) is what
-// the Backstage backend presents. The caller still has to compare the username.
-type K8sStatusAuth struct{ cs kubernetes.Interface }
+// K8sStatusAuth implements StatusAuthenticator with a TokenReview FOR ONE
+// AUDIENCE (api.StatusTokenAudience by default) and requires the review to
+// confirm that audience. The Backstage backend presents a projected token with
+// exactly that audience, so the hub never receives a token the API server would
+// accept: a compromised hub (or its logs) cannot replay it as backstage-api.
+// The caller still has to compare the username.
+type K8sStatusAuth struct {
+	cs       kubernetes.Interface
+	audience string
+}
 
 var _ StatusAuthenticator = (*K8sStatusAuth)(nil)
 
-// NewK8sStatusAuth returns a TokenReview-backed StatusAuthenticator.
-func NewK8sStatusAuth(cs kubernetes.Interface) *K8sStatusAuth { return &K8sStatusAuth{cs: cs} }
+// NewK8sStatusAuth returns a TokenReview-backed StatusAuthenticator for the
+// audience (default api.StatusTokenAudience; main passes STATUS_AUDIENCE).
+func NewK8sStatusAuth(cs kubernetes.Interface, audience ...string) *K8sStatusAuth {
+	aud := api.StatusTokenAudience
+	if len(audience) > 0 && audience[0] != "" {
+		aud = audience[0]
+	}
+	return &K8sStatusAuth{cs: cs, audience: aud}
+}
 
 // Authenticate implements StatusAuthenticator.
 func (a *K8sStatusAuth) Authenticate(ctx context.Context, token string) (string, error) {
@@ -54,13 +68,18 @@ func (a *K8sStatusAuth) Authenticate(ctx context.Context, token string) (string,
 		return "", fmt.Errorf("%w: bad token length", ErrUnauthenticated)
 	}
 	tr, err := a.cs.AuthenticationV1().TokenReviews().Create(ctx, &authnv1.TokenReview{
-		Spec: authnv1.TokenReviewSpec{Token: token},
+		Spec: authnv1.TokenReviewSpec{Token: token, Audiences: []string{a.audience}},
 	}, metav1.CreateOptions{})
 	if err != nil {
 		return "", fmt.Errorf("%w: token review: %v", ErrUnavailable, err)
 	}
 	if !tr.Status.Authenticated || tr.Status.User.Username == "" {
 		return "", fmt.Errorf("%w: token not authenticated", ErrUnauthenticated)
+	}
+	// An API server that ignores audiences would accept any token: demand the
+	// confirmation, as VerifyDelegate does.
+	if !slices.Contains(tr.Status.Audiences, a.audience) {
+		return "", fmt.Errorf("%w: token is not for the status audience", ErrUnauthenticated)
 	}
 	return tr.Status.User.Username, nil
 }
@@ -211,9 +230,17 @@ func (h *Hub) deviceStatus(ctx context.Context, ns, device string, pol api.Polic
 	}
 	// A pinned identity of the current enrollment that is not usable yet waits
 	// for an admin (approval or a trusted host key).
-	if pin, found, err := h.deps.Identity.Get(ctx, ns, device); err == nil && found &&
-		!pin.Voided && sameEpoch(pin, pol) && !activated(viewOfPin(pin), pol) {
-		st.IdentityPending = true
+	// Identity is the hub's own record of the pin (the identity store), not the
+	// Device CR status that device editors can write.
+	if pin, found, err := h.deps.Identity.Get(ctx, ns, device); err == nil && found {
+		if !pin.Voided && sameEpoch(pin, pol) && !activated(viewOfPin(pin), pol) {
+			st.IdentityPending = true
+		}
+		st.Identity = &api.LiveIdentity{
+			Fingerprint: pin.Fingerprint, AttestedHostKey: pin.AttestedHostKey, AttestedHostKeyType: pin.AttestedHostKeyType,
+			EnrollmentGeneration: pin.EnrollmentGeneration, EnrollmentEpoch: pin.EnrollmentEpoch, EnrolledAt: pin.EnrolledAt.UTC(),
+			ActivatedBy: pin.ActivatedBy, Voided: pin.Voided, Conflicts: pin.Conflicts,
+		}
 	}
 	for _, c := range clients {
 		st.Sessions = append(st.Sessions, c.info())
@@ -269,7 +296,7 @@ func (h *Hub) handleAdminEnd(w http.ResponseWriter, r *http.Request, d *dctx, us
 		return &denial{status: http.StatusNotFound, reason: api.ReasonSessionUnknown, msg: "no such client session"}
 	}
 	d.ns, d.device, d.kind, d.service = s.ns, s.device, s.kind, s.service
-	requester := r.Header.Get(StatusRequesterHeader)
+	requester := r.Header.Get(api.StatusRequesterHeader)
 	if !ValidEmail(requester) {
 		requester = "unknown"
 	}

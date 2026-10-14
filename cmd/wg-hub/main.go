@@ -159,7 +159,7 @@ func run() error {
 		SA:       hub.NewK8sSADelegation(cs, hubNS),
 		Authz:    hub.NewCachedAuthorizer(hub.NewK8sAuthorizer(cs), 5*time.Second, 1024),
 		TURN:     hub.NewTURNMinter(secrets.Secret, turnURLs, 30*time.Minute, nil),
-		Status:   hub.NewK8sStatusAuth(cs),
+		Status:   hub.NewK8sStatusAuth(cs, env("STATUS_AUDIENCE", api.StatusTokenAudience)),
 	})
 	if err != nil {
 		return err

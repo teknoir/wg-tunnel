@@ -417,6 +417,37 @@ func TestStatusReportsTheLiveDevice(t *testing.T) {
 	_ = uc.Close()
 }
 
+// The live identity carries the attested host key and the activation source,
+// from the hub's store (review finding 1, hub part).
+func TestStatusIdentityCarriesTheAttestation(t *testing.T) {
+	r := newRig(t)
+	auth := &fakeStatusAuth{users: map[string]string{backstageToken: backstageSA}}
+	r.h.deps.Status, r.h.cfg.BackstageSA = auth, backstageSA
+	srv := httptest.NewServer(r.h.StatusHandler())
+	t.Cleanup(srv.Close)
+	hk := newTestHostKey(t, "ed25519")
+	r.trust(hk)
+	if st, body := r.attestedEnroll(r.dev, hk); st != http.StatusCreated {
+		t.Fatalf("%d %s", st, body)
+	}
+	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+		t.Fatalf("%d %s", st, body)
+	}
+	req, _ := http.NewRequest("GET", srv.URL+api.StatusDevicePath+testNS+"/"+testDevice, nil)
+	req.Header.Set("Authorization", "Bearer "+backstageToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	id := decodeStatus(t, b).Identity
+	if id == nil || id.AttestedHostKey != hk.fp || id.AttestedHostKeyType != "ssh-ed25519" || id.ActivatedBy != api.ActivatedByHostKey ||
+		id.Fingerprint != r.dev.fingerprint() || id.Voided || id.EnrollmentGeneration != r.policy.EnrollmentGeneration {
+		t.Fatalf("identity %+v", id)
+	}
+}
+
 func TestStatusOfAnOfflineAndPendingDevice(t *testing.T) {
 	r := newRig(t)
 	auth := &fakeStatusAuth{users: map[string]string{backstageToken: backstageSA}}
@@ -439,13 +470,18 @@ func TestStatusOfAnOfflineAndPendingDevice(t *testing.T) {
 	}
 	// Nothing enrolled: offline, nothing pending, an empty (not null) session list.
 	st := get()
-	if st.Connected || st.IdentityPending || st.Sessions == nil || len(st.Sessions) != 0 {
+	if st.Connected || st.IdentityPending || st.Sessions == nil || len(st.Sessions) != 0 || st.Identity != nil {
 		t.Errorf("fresh device: %+v", st)
 	}
 	// Enrolled but not approved: waiting for an admin.
 	r.enrollOK()
 	if st = get(); st.Connected || !st.IdentityPending {
 		t.Errorf("enrolled device: %+v", st)
+	}
+	// The pin is reported from the hub's identity store (attested host key, if any).
+	if st.Identity == nil || st.Identity.Fingerprint != r.dev.fingerprint() || st.Identity.AttestedHostKey != "" ||
+		st.Identity.EnrollmentEpoch != r.policy.EnrollmentEpoch || st.Identity.ActivatedBy != "" {
+		t.Errorf("identity of the unattested pin: %+v", st.Identity)
 	}
 	r.approve()
 	if st = get(); st.IdentityPending {
@@ -536,7 +572,7 @@ func TestParseLastHandshake(t *testing.T) {
 	}
 }
 
-func TestK8sStatusAuthUsesTheDefaultAudience(t *testing.T) {
+func TestK8sStatusAuthRequiresItsOwnAudience(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset()
 	var spec authnv1.TokenReviewSpec
 	cs.PrependReactor("create", "tokenreviews", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -544,9 +580,11 @@ func TestK8sStatusAuthUsesTheDefaultAudience(t *testing.T) {
 		spec = tr.Spec
 		switch tr.Spec.Token {
 		case "backstage":
-			return true, &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: backstageSA}}}, nil
+			return true, &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: backstageSA}, Audiences: tr.Spec.Audiences}}, nil
+		case "apiserver-token": // valid for the API server only; an apiserver that ignores audiences says so
+			return true, &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: true, User: authnv1.UserInfo{Username: backstageSA}, Audiences: []string{"https://kubernetes.default.svc"}}}, nil
 		case "anonymous":
-			return true, &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: true}}, nil
+			return true, &authnv1.TokenReview{Status: authnv1.TokenReviewStatus{Authenticated: true, Audiences: tr.Spec.Audiences}}, nil
 		case "broken":
 			return true, nil, fmt.Errorf("apiserver down")
 		}
@@ -556,11 +594,17 @@ func TestK8sStatusAuthUsesTheDefaultAudience(t *testing.T) {
 	if u, err := a.Authenticate(context.Background(), "backstage"); err != nil || u != backstageSA {
 		t.Fatalf("%q %v", u, err)
 	}
-	// No audiences in the review: an ordinary pod token (API audience) is what is verified.
-	if len(spec.Audiences) != 0 {
-		t.Errorf("audiences %v", spec.Audiences)
+	// The review is for the status audience only, so an ordinary pod token
+	// (API-server audience, replayable against the API server) is refused.
+	if len(spec.Audiences) != 1 || spec.Audiences[0] != api.StatusTokenAudience {
+		t.Errorf("audiences %v, want [%s]", spec.Audiences, api.StatusTokenAudience)
 	}
-	for tok, want := range map[string]error{"nobody": ErrUnauthenticated, "anonymous": ErrUnauthenticated, "": ErrUnauthenticated, "broken": ErrUnavailable,
+	if a2 := NewK8sStatusAuth(cs, "custom-aud"); true {
+		if u, err := a2.Authenticate(context.Background(), "backstage"); err != nil || u != backstageSA || spec.Audiences[0] != "custom-aud" {
+			t.Errorf("STATUS_AUDIENCE override: %q %v %v", u, err, spec.Audiences)
+		}
+	}
+	for tok, want := range map[string]error{"apiserver-token": ErrUnauthenticated, "nobody": ErrUnauthenticated, "anonymous": ErrUnauthenticated, "": ErrUnauthenticated, "broken": ErrUnavailable,
 		strings.Repeat("x", maxBearerTokenSize+1): ErrUnauthenticated} {
 		if _, err := a.Authenticate(context.Background(), tok); !errors.Is(err, want) {
 			t.Errorf("token %.8q: %v, want %v", tok, err, want)
