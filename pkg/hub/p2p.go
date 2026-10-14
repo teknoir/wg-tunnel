@@ -312,12 +312,11 @@ func (h *Hub) pushGrantsAsync(dev *session) {
 				case <-time.After(p2pPushWait * time.Duration(attempt)):
 				}
 			}
-			// The first attempt goes out even if the device session was just
-			// ended (its peer stays installed for the flush grace): a
-			// revocation must reach the agent's pairs at once. Retries only
-			// make sense while the session is registered.
-			if attempt > 0 && h.deviceSession(dev.ns, dev.device) != dev {
-				return // the device session is gone; its agent dropped every pair
+			// A device session that is no longer the registered one is over:
+			// its agent dropped every pair with it, and its overlay address
+			// may belong to another device soon. Never push to it.
+			if h.deviceSession(dev.ns, dev.device) != dev {
+				return
 			}
 			if _, err = h.pushGrants(h.ctx, dev); err == nil {
 				return
@@ -386,6 +385,45 @@ func (h *Hub) p2pClientGone(s *session) {
 	}
 }
 
+// p2pDeviceGone forgets the plane-B pairs bound to a device session that ended
+// or was replaced: the agent drops every pair with its session, and a new
+// session starts without any, so the pairs of the old one are dead.
+//
+// When the hub ends the session (revocation, expiry), one empty set still goes
+// to the agent while its peer stays installed for the flush grace, so that
+// direct clients are cut at once instead of when the agent notices. A session
+// that was replaced by the same agent's new one gets no push at all: its peer
+// is gone and its overlay address may belong to another device after the
+// quarantine.
+func (h *Hub) p2pDeviceGone(dev *session, replaced bool) {
+	if dev == nil || dev.kind != api.KindDevice {
+		return
+	}
+	h.mu.Lock()
+	clients := make([]*session, 0, len(h.clients[dev.key()]))
+	for _, c := range h.clients[dev.key()] {
+		clients = append(clients, c)
+	}
+	h.mu.Unlock()
+	had := false
+	for _, c := range clients {
+		c.mu.Lock()
+		if c.p2p != nil && c.p2p.dev == dev {
+			c.p2p, had = nil, true
+		}
+		c.mu.Unlock()
+	}
+	if had && !replaced && h.ctx.Err() == nil {
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			ctx, cancel := context.WithTimeout(h.ctx, h.cfg.P2PPushTimeout)
+			defer cancel()
+			_, _ = h.pushGrants(ctx, dev) // best effort: the lease on the agent bounds the rest
+		}()
+	}
+}
+
 // p2pRenewed records a client's renewal: the path it reports and, once half of
 // the grant's lifetime has passed, a fresh push that restarts the TTL on the
 // device (the lease is extended only here, never by the device's renewals).
@@ -398,8 +436,9 @@ func (h *Hub) p2pRenewed(s *session, path string) {
 		s.path = path
 	}
 	if cp := s.p2p; cp != nil {
-		cp.lease = now.Add(h.cfg.P2PGrantTTL)
-		if now.Sub(cp.lastPush) >= h.cfg.P2PGrantTTL/2 {
+		if h.deviceSession(cp.dev.ns, cp.dev.device) != cp.dev {
+			s.p2p = nil // the device session it lived on is gone: nothing to refresh
+		} else if cp.lease = now.Add(h.cfg.P2PGrantTTL); now.Sub(cp.lastPush) >= h.cfg.P2PGrantTTL/2 {
 			cp.lastPush = now
 			refresh = cp.dev
 		}

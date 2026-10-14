@@ -19,6 +19,7 @@ func (h *Hub) admit(s *session) *denial {
 			if old := h.devices[k]; old != nil {
 				h.detachLocked(old)
 				h.mu.Unlock()
+				h.p2pDeviceGone(old, true)
 				h.teardown(old, h.cfg.FlushGrace)
 				h.logEnd(old, "replace", "replaced")
 				continue
@@ -193,6 +194,7 @@ func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
 	h.detachLocked(s)
 	h.mu.Unlock()
 	h.p2pClientGone(s)
+	h.p2pDeviceGone(s, false)
 	h.teardown(s, grace)
 	return true
 }

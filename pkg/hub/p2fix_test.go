@@ -148,3 +148,32 @@ func TestForeignEnrollWithoutAttestationIsRecordedAsConflict(t *testing.T) {
 		t.Fatalf("conflicts = %d after the pinned identity, want 1", got)
 	}
 }
+
+// A plane-B pair does not outlive the device session it lives on: when the
+// agent reconnects, the clients' pairs are dropped on the hub at once and a
+// renewal does not try to refresh them on the dead session (review finding 16).
+func TestP2PPairsAreDroppedWhenTheDeviceSessionIsReplaced(t *testing.T) {
+	p := newP2PRig(t, capsP2P)
+	resp, _ := p.mustClient(aliceToken, "ssh")
+	if pairs := p.h.P2PPairs(testNS, testDevice); len(pairs) != 1 {
+		t.Fatalf("pairs %v", pairs)
+	}
+	before := p.log.count()
+	p.deviceSessionOK() // the agent reconnects: a new device session replaces the old one
+	waitFor(t, "the pair to be dropped", func() bool { return len(p.h.P2PPairs(testNS, testDevice)) == 0 })
+
+	// Renewing after half the grant TTL would have refreshed the old pair.
+	p.clock.Advance(p.h.cfg.P2PGrantTTL)
+	p.users.set(aliceToken, aliceEmail, p.clock.Now().Add(5*time.Minute)) // a refreshed token
+	code, out := p.tunnelPost(api.RenewPath, resp.Address, aliceToken, api.RenewRequest{})
+	if code != http.StatusOK {
+		t.Fatalf("renew: %d %s", code, out)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := p.log.count(); n != before {
+		t.Errorf("%d grant sets were pushed to the replaced device session", n-before)
+	}
+	if pairs := p.h.P2PPairs(testNS, testDevice); len(pairs) != 0 {
+		t.Errorf("the renewal resurrected pairs %v", pairs)
+	}
+}
