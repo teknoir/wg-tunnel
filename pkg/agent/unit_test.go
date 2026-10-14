@@ -42,7 +42,7 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.HubURL != "https://wg-device.teknoir.cloud:8084" || c.RSAKeyPath != DefaultRSAKey || c.IdentityDir != DefaultIdentityDir ||
-		c.SSHHostKeysGlob != DefaultHostKeysGlob || c.ForwardHost != "127.0.0.1" || c.MaxConns != 32 ||
+		c.SSHHostKeysGlob != DefaultHostKeysGlob || c.ForwardHost != "127.0.0.1" || c.MaxConns != 256 || c.MaxConnsPerService != 128 || c.MaxConnsPerPair != 16 ||
 		c.Backoff.Min != 2*time.Second || c.Backoff.Max != 5*time.Minute || c.TURNServer != "" {
 		t.Fatalf("defaults: %+v", c)
 	}

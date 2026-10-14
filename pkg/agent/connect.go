@@ -49,7 +49,9 @@ type connectServer struct {
 	active map[*activeConn]struct{}
 	counts map[string]int
 	pairs  map[string]int
-	closed bool
+	// countsB counts the plane-B connections per service (subset of counts).
+	countsB map[string]int
+	closed  bool
 }
 
 type activeConn struct {
@@ -61,13 +63,14 @@ type activeConn struct {
 
 func newConnectServer(log *slog.Logger, policy *TargetPolicy, dialTimeout time.Duration, perService, global int) *connectServer {
 	return &connectServer{
-		log: log, policy: policy, dialTO: dialTimeout, perSvc: perService, perPair: perService,
+		log: log, policy: policy, dialTO: dialTimeout, perSvc: perService, perPair: min(DefaultMaxConnsPerPair, perService),
 		global:  make(chan struct{}, global),
 		hubAddr: netip.MustParseAddr(api.HubAddress), preambleTO: preambleTimeout,
-		specs:  map[string]api.ServiceSpec{api.ServiceSSHID: implicitSSH},
-		active: map[*activeConn]struct{}{},
-		counts: map[string]int{},
-		pairs:  map[string]int{},
+		specs:   map[string]api.ServiceSpec{api.ServiceSSHID: implicitSSH},
+		active:  map[*activeConn]struct{}{},
+		counts:  map[string]int{},
+		pairs:   map[string]int{},
+		countsB: map[string]int{},
 	}
 }
 
@@ -134,10 +137,14 @@ func (s *connectServer) reserve(id, pair string) (api.ServiceSpec, string) {
 		return sp, api.ReasonSessionLimit
 	case pair != "" && s.perPair > 0 && s.pairs[pair] >= s.perPair:
 		return sp, api.ReasonSessionLimit
+	case pair != "" && s.perSvc > 0 && s.countsB[id] >= s.perSvc-s.perSvc/4:
+		// plane B keeps out of the last quarter of the service's slots
+		return sp, api.ReasonSessionLimit
 	}
 	s.counts[id]++
 	if pair != "" {
 		s.pairs[pair]++
+		s.countsB[id]++
 	}
 	return sp, ""
 }
@@ -146,6 +153,9 @@ func (s *connectServer) release(id, pair string) {
 	s.mu.Lock()
 	if s.counts[id] > 0 {
 		s.counts[id]--
+	}
+	if pair != "" && s.countsB[id] > 0 {
+		s.countsB[id]--
 	}
 	if pair != "" && s.pairs[pair] > 0 {
 		s.pairs[pair]--
@@ -371,6 +381,9 @@ func isTimeout(err error) bool {
 // retries with a new one).
 func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api.SessionResponse, p2pPriv *wgkey.PrivateKey, holder *grantHolder, wg *sync.WaitGroup) bool {
 	connect := newConnectServer(a.log, a.target, a.cfg.DialTimeout, a.cfg.MaxConnsPerService, a.cfg.MaxConns)
+	if a.cfg.MaxConnsPerPair > 0 {
+		connect.perPair = min(a.cfg.MaxConnsPerPair, a.cfg.MaxConnsPerService)
+	}
 	connect.SetServices(resp.Services)
 	// Plane B, when this agent offers it and the hub accepted the key.
 	var pb *planeB

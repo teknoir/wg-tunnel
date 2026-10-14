@@ -35,10 +35,15 @@ const (
 	DefaultForwardHost  = "127.0.0.1"
 	DefaultExtraCAFile  = "/etc/teknoir/roots.pem"
 
-	DefaultMaxConns    = 32
+	DefaultMaxConns    = 256
 	DefaultDialTimeout = 5 * time.Second
 	// DefaultMaxConnsPerService caps concurrent connections of one service.
-	DefaultMaxConnsPerService = 16
+	// Web services are shared by every user of the web gateway (the hub bounds
+	// each user), so it is generous.
+	DefaultMaxConnsPerService = 128
+	// DefaultMaxConnsPerPair caps the concurrent plane-B connections of one
+	// client pair, so a single direct client cannot take a service's budget.
+	DefaultMaxConnsPerPair = 16
 )
 
 // Backoff bounds the delay between session attempts: exponential from Min to
@@ -74,7 +79,7 @@ type Config struct {
 	HTTPClient *http.Client
 	Logger     *slog.Logger
 	Backoff    Backoff
-	// MaxConns caps concurrent forwarded connections (default 32); it applies
+	// MaxConns caps concurrent forwarded connections (default 256); it applies
 	// to the legacy per-port listeners and, separately, to the connect listener.
 	MaxConns    int
 	DialTimeout time.Duration
@@ -88,8 +93,13 @@ type Config struct {
 	ServiceCIDRs  []netip.Prefix
 	ClusterDomain string
 	SSHPort       int
-	// MaxConnsPerService caps concurrent connections of one service (default 16).
+	// MaxConnsPerService caps concurrent connections of one service (default 128).
 	MaxConnsPerService int
+	// MaxConnsPerPair caps the concurrent plane-B connections of one pair
+	// (default 16, never above MaxConnsPerService). Plane B as a whole may
+	// use at most three quarters of a service's connections, the rest is kept
+	// for the hub splice (plane A).
+	MaxConnsPerPair int
 	// Resolver and NodeIPs replace the system resolver and the interface
 	// addresses (tests).
 	Resolver Resolver
@@ -267,6 +277,9 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.MaxConnsPerService <= 0 {
 		c.MaxConnsPerService = DefaultMaxConnsPerService
+	}
+	if c.MaxConnsPerPair <= 0 {
+		c.MaxConnsPerPair = DefaultMaxConnsPerPair
 	}
 	if c.SSHPort < 0 || c.SSHPort > 65535 {
 		return errors.New("agent: SSHPort out of range")

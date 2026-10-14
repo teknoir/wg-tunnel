@@ -523,3 +523,46 @@ func TestControlGrants(t *testing.T) {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }
+
+// One plane-B pair cannot take a service's whole budget, and plane B as a
+// whole leaves a quarter of the slots to the hub splice (review finding 19).
+func TestPlaneBPairAndReserveCaps(t *testing.T) {
+	s := newConnectServer(slog.New(slog.DiscardHandler), testPolicy(&fakeResolver{}), time.Second, 8, 100)
+	s.perPair = 3
+	s.SetServices([]api.ServiceSpec{externalSpec("db", 5432)})
+	for i := range 3 {
+		if _, r := s.reserve("db", "pairA"); r != "" {
+			t.Fatalf("pairA %d: %s", i, r)
+		}
+	}
+	if _, r := s.reserve("db", "pairA"); r != api.ReasonSessionLimit {
+		t.Fatalf("pairA over its cap: %q", r)
+	}
+	// Another pair still fits, up to 3/4 of 8 = 6 plane-B slots in total.
+	for i := range 3 {
+		if _, r := s.reserve("db", "pairB"); r != "" {
+			t.Fatalf("pairB %d: %s", i, r)
+		}
+	}
+	if _, r := s.reserve("db", "pairC"); r != api.ReasonSessionLimit {
+		t.Fatalf("plane B past its share: %q", r)
+	}
+	// The hub splice still has its two slots.
+	for i := range 2 {
+		if _, r := s.reserve("db", ""); r != "" {
+			t.Fatalf("plane A %d: %s", i, r)
+		}
+	}
+	if _, r := s.reserve("db", ""); r != api.ReasonSessionLimit {
+		t.Fatalf("service cap: %q", r)
+	}
+	s.release("db", "pairA")
+	if _, r := s.reserve("db", "pairC"); r != "" {
+		// plane A is at the service cap (8); releasing one frees one slot
+		t.Fatalf("after a release: %q", r)
+	}
+	// the default per-pair cap is below the default per-service cap
+	if d := newConnectServer(slog.New(slog.DiscardHandler), testPolicy(&fakeResolver{}), time.Second, DefaultMaxConnsPerService, 256); d.perPair != DefaultMaxConnsPerPair {
+		t.Errorf("default perPair = %d", d.perPair)
+	}
+}
