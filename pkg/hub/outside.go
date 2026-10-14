@@ -49,6 +49,7 @@ func (h *Hub) InternalHandler() http.Handler { return h.apiHandler(true) }
 func (h *Hub) apiHandler(internal bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.DeviceEnrollPath, h.wrap("enroll", internal, h.handleEnroll))
+	mux.HandleFunc(api.AttestChallengePath, h.wrap("attest-challenge", internal, h.handleAttestChallenge))
 	mux.HandleFunc(api.DeviceSessionPath, h.wrap("session", internal, h.handleDeviceSession))
 	mux.HandleFunc(api.ClientSessionPath, h.wrap("session", internal, h.handleClientSession))
 	mux.HandleFunc(api.HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
@@ -285,6 +286,14 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	pol = eff.Policy
 	fingerprint := identity.Fingerprint(idPub)
 
+	// Host-key attestation (api.CapAttest). An agent that advertises it must
+	// present a valid one; a phase-1 agent enrolls as before.
+	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol)
+	if den != nil {
+		return 0, nil, den
+	}
+	caps := sanitizeCaps(req.Capabilities)
+
 	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
 	if err != nil {
 		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
@@ -294,6 +303,34 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		// First wins per enrollment epoch.
 		if cur.Voided {
 			return 0, nil, deny(api.ReasonEnrollClosed, "the pinned identity was voided; an admin must reset enrollment")
+		}
+		if sameKey(cur.IdentityPublicKey, req.IdentityPublicKey) {
+			// The pinned identity enrolling again: record what it attests now.
+			cur = h.updateAttestation(ctx, cur, att, caps)
+			h.recordActivation(ctx, cur, activationSource(cur, pol))
+			return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
+		}
+		if canDisplace(cur, att, pol) {
+			// A different identity, attested by the host key the admin trusted,
+			// meets a pin that is not: the pin was squatted by someone who
+			// holds the enrollment key but not the device.
+			if IsVoidedFingerprint(cur, fingerprint) {
+				return 0, nil, h.voidedEnrollDenial(ctx, d)
+			}
+			entry := newPinEntry(ns, device, idPub, fingerprint, pol, h.now(), att, caps)
+			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att)
+			if err != nil {
+				h.log.Error("displacing identity pin failed", "ns", ns, "device", device, "err", err)
+				return 0, nil, denyUnavailable("identity store unavailable")
+			}
+			if replaced {
+				h.log.Warn("identity pin displaced by an enrollment attested by the trusted host key",
+					"ns", ns, "device", device, "displaced", cur.Fingerprint, "fingerprint", fingerprint)
+				h.endStaleDeviceSession(devKey{ns, device}, fingerprint)
+				h.recordActivation(ctx, got, activationSource(got, pol))
+				return h.enrollResult(ctx, got, req.IdentityPublicKey, true, d)
+			}
+			cur = got
 		}
 		return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 	}
@@ -307,14 +344,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	if found && IsVoidedFingerprint(cur, fingerprint) {
 		return 0, nil, h.voidedEnrollDenial(ctx, d)
 	}
-	got, created, err := h.deps.Identity.Pin(ctx, api.IdentityEntry{
-		Device: device, Namespace: ns,
-		IdentityPublicKey:    identity.EncodePublicKey(idPub),
-		Fingerprint:          fingerprint,
-		EnrollmentGeneration: pol.EnrollmentGeneration,
-		EnrollmentEpoch:      pol.EnrollmentEpoch,
-		EnrolledAt:           now,
-	})
+	got, created, err := h.deps.Identity.Pin(ctx, newPinEntry(ns, device, idPub, fingerprint, pol, now, att, caps))
 	if errors.Is(err, ErrFingerprintVoided) {
 		return 0, nil, h.voidedEnrollDenial(ctx, d)
 	}
@@ -323,9 +353,70 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		return 0, nil, denyUnavailable("identity store unavailable")
 	}
 	if created {
-		h.log.Info("identity pinned; waiting for admin approval", "ns", ns, "device", device, "fingerprint", fingerprint)
+		if ok, by := identityUsable(viewOfPin(got), pol); ok {
+			h.log.Info("identity pinned and activated automatically", "ns", ns, "device", device, "fingerprint", fingerprint, "by", by)
+			h.recordActivation(ctx, got, by)
+		} else {
+			h.log.Info("identity pinned; waiting for admin approval", "ns", ns, "device", device, "fingerprint", fingerprint)
+		}
 	}
 	return h.enrollResult(ctx, got, req.IdentityPublicKey, created, d)
+}
+
+// newPinEntry is the identity entry of a new enrollment.
+func newPinEntry(ns, device string, pub ed25519.PublicKey, fingerprint string, pol api.PolicyEntry, now time.Time, att *attested, caps []string) api.IdentityEntry {
+	e := api.IdentityEntry{
+		Device: device, Namespace: ns,
+		IdentityPublicKey:    identity.EncodePublicKey(pub),
+		Fingerprint:          fingerprint,
+		EnrollmentGeneration: pol.EnrollmentGeneration,
+		EnrollmentEpoch:      pol.EnrollmentEpoch,
+		EnrolledAt:           now,
+		AgentCapabilities:    caps,
+	}
+	if att != nil {
+		e.AttestedHostKey, e.AttestedHostKeyType = att.hostKey, att.keyType
+	}
+	return e
+}
+
+// updateAttestation records a later attestation (or new capabilities) on the
+// pin of the identity that made it and returns the pin in effect.
+func (h *Hub) updateAttestation(ctx context.Context, cur api.IdentityEntry, att *attested, caps []string) api.IdentityEntry {
+	if att == nil && len(caps) == 0 {
+		return cur
+	}
+	got, found, _, err := h.deps.Identity.Update(ctx, cur.Namespace, cur.Device, func(c api.IdentityEntry) *api.IdentityEntry {
+		if c.Fingerprint != cur.Fingerprint || c.Voided {
+			return nil
+		}
+		return withAttestation(c, att, caps)
+	})
+	if err != nil {
+		h.log.Warn("recording host-key attestation failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
+		return cur
+	}
+	if !found {
+		return cur
+	}
+	return got
+}
+
+// activationSource is how pin is usable under pol ("" when it is not).
+func activationSource(pin api.IdentityEntry, pol api.PolicyEntry) string {
+	_, by := identityUsable(viewOfPin(pin), pol)
+	return by
+}
+
+// endStaleDeviceSession ends the live device session of k unless it belongs to
+// the identity with the given fingerprint.
+func (h *Hub) endStaleDeviceSession(k devKey, fingerprint string) {
+	h.mu.Lock()
+	dev := h.devices[k]
+	h.mu.Unlock()
+	if dev != nil && dev.fingerprint != fingerprint {
+		h.endSession(dev, api.ReasonReenroll)
+	}
 }
 
 // voidedEnrollDenial answers an enrollment with an identity that was voided
@@ -374,14 +465,20 @@ func (h *Hub) loadPin(ctx context.Context, ns, device string) (api.IdentityEntry
 
 // checkPin judges an authenticated device's pin against the policy: the pin
 // must belong to the current enrollment (epoch and generation, not voided) and
-// its fingerprint must be the one an admin approved.
-func checkPin(pin api.IdentityEntry, pub ed25519.PublicKey, pol api.PolicyEntry) *denial {
+// satisfy the activation rule (identityUsable): its fingerprint is the one an
+// admin approved, or it was enrolled with an attestation by the trusted host
+// key. The first time a pin is found usable the activation is recorded on it.
+func (h *Hub) checkPin(ctx context.Context, pin api.IdentityEntry, pub ed25519.PublicKey, pol api.PolicyEntry) *denial {
 	if !pinCurrent(pin, pol) {
 		return deny(api.ReasonReenroll, "enrollment was reset; enroll a new identity")
 	}
-	if pol.ApprovedFingerprint == "" || identity.Fingerprint(pub) != pol.ApprovedFingerprint {
+	v := viewOfPin(pin)
+	v.Fingerprint = identity.Fingerprint(pub)
+	ok, by := identityUsable(v, pol)
+	if !ok {
 		return deny(api.ReasonPendingApproval, "the device identity is waiting for an admin to approve it in the Teknoir UI")
 	}
+	h.recordActivation(ctx, pin, by)
 	return nil
 }
 
@@ -456,7 +553,7 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	if !eff.Active {
 		return 0, nil, deny(eff.Reason, eff.Detail)
 	}
-	if den := checkPin(pin, pub, eff.Policy); den != nil {
+	if den := h.checkPin(ctx, pin, pub, eff.Policy); den != nil {
 		return 0, nil, den
 	}
 	wgPub, err := wgkey.ParsePublic(req.WGPublicKey)
@@ -494,7 +591,7 @@ func (h *Hub) handleDeviceSession(ctx context.Context, r *http.Request, body []b
 	s := &session{
 		id: id, kind: api.KindDevice, authKind: authDevice, ns: ns, device: device, subject: sub,
 		wgKey: wgPub, wgKeyB64: wgPub.Base64(), createdAt: now,
-		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), ports: ports,
+		generation: pin.EnrollmentGeneration, epoch: pin.EnrollmentEpoch, fingerprint: identity.Fingerprint(pub), attestedKey: pin.AttestedHostKey, ports: ports,
 		hostKeys: sanitizeHostKeys(req.SSHHostKeys), remote: d.remote,
 		caps: caps, services: services,
 		expiresAt: now.Add(h.cfg.SessionTTL), turnExpiry: turn.ExpiresAt,
@@ -532,7 +629,7 @@ func deviceStale(s *session, pol api.PolicyEntry) (reason, detail string) {
 	switch {
 	case pol.EnrollmentGeneration != s.generation || pol.EnrollmentEpoch != s.epoch:
 		return api.ReasonReenroll, "enrollment reset"
-	case pol.ApprovedFingerprint != s.fingerprint:
+	case !activated(s.identityView(), pol):
 		return api.ReasonPendingApproval, "identity approval changed"
 	case !samePorts(pol.AllowedPorts, s.ports):
 		return reasonPortsChanged, "allowed ports changed"

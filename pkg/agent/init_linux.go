@@ -12,8 +12,11 @@ import (
 )
 
 // InitDir prepares the identity directory for the unprivileged agent: it
-// creates dir (mode 0700) if missing and makes it, and the regular files
-// directly inside it, owned by uid:uid. It runs as root in an init container,
+// creates dir if missing and makes it, and the regular files directly inside
+// it, owned by uid:uid. The directory mode is StateDirMode (0711): only the
+// owner can list or write it, but the attestor sidecar (root without any
+// capability, so "other" to this directory) can traverse it to read
+// identity.pub. The identity key itself is 0600. It runs as root in an init container,
 // is idempotent, and refuses a symlink at dir. Symlinks inside dir are never
 // followed or changed.
 func InitDir(dir string, uid int) error {
@@ -30,17 +33,29 @@ func InitDir(dir string, uid int) error {
 		return fmt.Errorf("agent init: %s is a symlink; refusing to use it", dir)
 	case err == nil:
 		// Already prepared by an earlier run (the init container runs on every
-		// pod start): a 0700 directory owned by uid. Root in the init container
+		// pod start): a StateDirMode directory owned by uid. Root in the init container
 		// has no CAP_DAC_READ_SEARCH, so it could not even open it again.
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok && fi.IsDir() &&
-			int(st.Uid) == uid && int(st.Gid) == uid && fi.Mode().Perm() == 0o700 {
-			return nil
+			int(st.Uid) == uid && int(st.Gid) == uid {
+			switch fi.Mode().Perm() {
+			case StateDirMode:
+				return nil
+			case 0o700:
+				// Prepared by a phase-1 agent (0700). Root without DAC
+				// capabilities cannot open it, but CAP_FOWNER lets it change
+				// the mode by path; the parent is root-owned, and Lstat above
+				// ruled out a symlink.
+				if err := os.Chmod(dir, StateDirMode); err != nil {
+					return fmt.Errorf("agent init: chmod %s: %w", dir, err)
+				}
+				return nil
+			}
 		}
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 			return fmt.Errorf("agent init: %w", err)
 		}
-		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := os.Mkdir(dir, StateDirMode); err != nil && !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("agent init: %w", err)
 		}
 	default:
@@ -73,7 +88,7 @@ func InitDir(dir string, uid int) error {
 	if err := syscall.Fchown(fd, uid, uid); err != nil {
 		return fmt.Errorf("agent init: chown %s: %w", dir, err)
 	}
-	if err := syscall.Fchmod(fd, 0o700); err != nil {
+	if err := syscall.Fchmod(fd, uint32(StateDirMode)); err != nil {
 		return fmt.Errorf("agent init: chmod %s: %w", dir, err)
 	}
 	return nil

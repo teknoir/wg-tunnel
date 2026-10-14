@@ -139,6 +139,7 @@ type Hub struct {
 	subjLimit   *limiter
 	renewLimit  *limiter
 	replay      *replayCache
+	nonces      *nonceStore
 
 	// mu guards the session registry below.
 	mu      sync.Mutex
@@ -197,6 +198,7 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		subjLimit:   newLimiter(cfg.SubjectRate, cfg.SubjectBurst, 50000, cfg.Now),
 		renewLimit:  newLimiter(0.5, 5, 50000, cfg.Now),
 		replay:      newReplayCache(cfg.ReplayCacheSize, cfg.ReplayPerSubject, cfg.Now),
+		nonces:      newNonceStore(cfg.Now),
 		byID:        map[string]*session{},
 		byIP:        map[netip.Addr]*session{},
 		byWG:        map[[32]byte]*session{},
@@ -359,7 +361,7 @@ func (h *Hub) enforce(k devKey) {
 		switch {
 		case eff.Policy.EnrollmentGeneration != dev.generation || eff.Policy.EnrollmentEpoch != dev.epoch:
 			reason, detail = api.ReasonReenroll, "enrollment reset"
-		case eff.Policy.ApprovedFingerprint != dev.fingerprint:
+		case !activated(dev.identityView(), eff.Policy):
 			reason, detail = api.ReasonPendingApproval, "identity approval changed"
 		case !samePorts(eff.Policy.AllowedPorts, dev.ports):
 			reason, detail = reasonPortsChanged, "allowed ports changed"

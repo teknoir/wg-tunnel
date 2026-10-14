@@ -45,6 +45,9 @@ type Options struct {
 	TTL        time.Duration
 	// RotateTURNOnRenew mints new TURN credentials on every renewal.
 	RotateTURNOnRenew bool
+	// Attest enables host-key attestation (challenge endpoint, verification at
+	// enrollment). Off, the hub behaves like a phase-1 hub (404 on the challenge).
+	Attest bool
 }
 
 // Denial makes a hook refuse a request.
@@ -80,6 +83,7 @@ type device struct {
 	state      string
 	seenJTI    map[string]bool
 	enrolls    int
+	att        *attestState
 }
 
 type sess struct {
@@ -122,6 +126,7 @@ type Hub struct {
 	nextID   int
 	nextIP   int
 	turnPass []string
+	devCaps  map[string][]string
 }
 
 // New starts a hub; it is stopped by t.Cleanup.
@@ -158,6 +163,9 @@ func New(t testing.TB, opts Options) *Hub {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+api.DeviceEnrollPath, h.handleEnroll)
+	if opts.Attest {
+		mux.HandleFunc("POST "+api.AttestChallengePath, h.handleAttestChallenge)
+	}
 	mux.HandleFunc("POST "+api.DeviceSessionPath, h.handleCreate(api.KindDevice))
 	mux.HandleFunc("POST "+api.ClientSessionPath, h.handleCreate(api.KindClient))
 	h.srv = httptest.NewServer(mux)
@@ -402,6 +410,10 @@ func (h *Hub) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.seenJTI[claims.ID] = true
+	if reason := h.verifyEnrollAttest(d, ns, name, idk, req); reason != "" {
+		writeErr(w, 403, reason)
+		return
+	}
 	status := 201
 	if d.pinned != nil && d.pinnedGen == d.generation {
 		if !d.pinned.Equal(idk) {
@@ -443,6 +455,7 @@ func (h *Hub) handleCreate(kind string) http.HandlerFunc {
 			port                      int
 			direct                    bool
 			hostKeys                  []string
+			devCaps                   []string
 		)
 		if kind == api.KindDevice {
 			var req api.DeviceSessionRequest
@@ -456,6 +469,7 @@ func (h *Hub) handleCreate(kind string) http.HandlerFunc {
 				writeErr(w, 401, api.ReasonUnauthenticated)
 				return
 			}
+			devCaps = req.Capabilities
 		} else {
 			var req api.ClientSessionRequest
 			if err := json.NewDecoder(body).Decode(&req); err != nil {
@@ -485,6 +499,12 @@ func (h *Hub) handleCreate(kind string) http.HandlerFunc {
 
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		if kind == api.KindDevice {
+			if h.devCaps == nil {
+				h.devCaps = map[string][]string{}
+			}
+			h.devCaps[ns+"/"+name] = devCaps
+		}
 		d := h.devices[ns+"/"+name]
 		if d == nil {
 			writeErr(w, 404, api.ReasonDeviceUnknown)

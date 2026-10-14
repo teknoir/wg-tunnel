@@ -63,6 +63,13 @@ type IdentityStore interface {
 	// never accepted again, whatever the policy says. It is a no-op (false)
 	// when nothing is pinned or the pin is already void.
 	Void(ctx context.Context, ns, device, reason string, at time.Time) (changed bool, err error)
+	// Update atomically applies fn to the stored entry of a device (optimistic
+	// concurrency; fn may run more than once). fn returns the entry to store,
+	// or nil to leave the entry as it is. current is the entry in effect
+	// afterwards; found is false (and fn is not called) when nothing is
+	// pinned; wrote reports whether fn's result was stored. The hub uses it
+	// for attestation records, activation and pin displacement.
+	Update(ctx context.Context, ns, device string, fn func(cur api.IdentityEntry) *api.IdentityEntry) (current api.IdentityEntry, found, wrote bool, err error)
 }
 
 // UserIdentity is an authenticated end user.

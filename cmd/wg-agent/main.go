@@ -2,6 +2,8 @@
 //
 //	wg-agent init --dir D --uid U   prepare the identity directory (init container, root)
 //	wg-agent run                    run the agent (configured by environment)
+//	wg-agent attestor --state D --exchange D --hostkeys D
+//	                                host-key attestation sidecar (root, no capabilities)
 //	wg-agent version
 package main
 
@@ -17,6 +19,7 @@ import (
 	"syscall"
 
 	"github.com/teknoir/wg-tunnel/pkg/agent"
+	"github.com/teknoir/wg-tunnel/pkg/attestor"
 	"github.com/teknoir/wg-tunnel/pkg/version"
 )
 
@@ -28,7 +31,7 @@ func main() {
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, "usage: wg-agent init --dir DIR --uid UID | run | version")
+		_, _ = fmt.Fprintln(stderr, "usage: wg-agent init --dir DIR --uid UID | run | attestor [--state DIR --exchange DIR --hostkeys DIR] | version")
 		return 2
 	}
 	switch args[0] {
@@ -39,8 +42,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return runInit(args[1:], stderr)
 	case "run":
 		return runAgent(ctx, getenv, stderr)
+	case "attestor":
+		return runAttestor(ctx, args[1:], getenv, stderr)
 	default:
-		_, _ = fmt.Fprintf(stderr, "wg-agent: unknown command %q (want init, run or version)\n", args[0])
+		_, _ = fmt.Fprintf(stderr, "wg-agent: unknown command %q (want init, run, attestor or version)\n", args[0])
 		return 2
 	}
 }
@@ -84,6 +89,41 @@ func runAgent(ctx context.Context, getenv func(string) string, stderr io.Writer)
 	}
 	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("wg-agent failed", "error", err.Error())
+		return 1
+	}
+	return 0
+}
+
+// runAttestor runs the host-key attestation sidecar. NAMESPACE and DEVICE_ID
+// come from the environment; the directories from flags.
+func runAttestor(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("attestor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	state := fs.String("state", attestor.DefaultStateDir, "agent state directory (reads identity.pub)")
+	exchange := fs.String("exchange", attestor.DefaultExchangeDir, "request/response directory shared with the agent")
+	hostkeys := fs.String("hostkeys", attestor.DefaultHostKeysDir, "sshd host key directory")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		_, _ = fmt.Fprintln(stderr, "usage: wg-agent attestor [--state DIR] [--exchange DIR] [--hostkeys DIR]")
+		return 2
+	}
+	level, err := agent.ParseLogLevel(getenv("LOG_LEVEL"))
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "wg-agent:", err)
+		return 2
+	}
+	log := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: level}))
+	cfg := attestor.ConfigFromEnv(getenv)
+	cfg.StateDir, cfg.ExchangeDir, cfg.HostKeysDir, cfg.Logger = *state, *exchange, *hostkeys, log
+	a, err := attestor.New(cfg)
+	if err != nil {
+		log.Error("invalid configuration", "error", err.Error())
+		return 2
+	}
+	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Error("attestor failed", "error", err.Error())
 		return 1
 	}
 	return 0

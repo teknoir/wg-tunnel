@@ -94,6 +94,10 @@ type Options struct {
 	Services []api.ServiceSpec
 	// Agent lets a test adjust the agent configuration (resolver, service CIDR ...).
 	Agent func(*agent.Config)
+	// Attest runs the host-key attestor against a real sshd host key file and
+	// configures the agent to use it (Rig.HostKeyFingerprint is the key's
+	// SHA256 fingerprint; Rig.TrustHostKey makes it the activation anchor).
+	Attest bool
 }
 
 // Epoch names of the rig's enrollment windows; tests that reset enrollment
@@ -222,9 +226,12 @@ type Rig struct {
 	Web *Echo
 
 	// HostKey is the SSH host key the agent reports ("ssh-ed25519 AAAA...").
-	HostKey     string
-	RSAKeyPath  string
-	IdentityDir string
+	HostKey    string
+	RSAKeyPath string
+	// HostKeyFingerprint and AttestExchange are set by Options.Attest.
+	HostKeyFingerprint string
+	AttestExchange     string
+	IdentityDir        string
 
 	HubLogs, AgentLogs, ClientLogs *LogBuf
 
@@ -283,6 +290,9 @@ func New(t testing.TB, opts Options) *Rig {
 	must(t, os.WriteFile(filepath.Join(hostDir, "ssh_host_ed25519_key.pub"), []byte(r.HostKey+" root@e2e\n"), 0o644))
 	r.hostKeysGlob = filepath.Join(hostDir, "ssh_host_*_key.pub")
 	r.IdentityDir = filepath.Join(dir, "identity")
+	if opts.Attest {
+		r.setupAttest(dir)
+	}
 
 	// Keycloak: a JWKS endpoint for the test realm key.
 	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -521,7 +531,7 @@ func (r *Rig) agentConfig() agent.Config {
 		Logger: logger(r.AgentLogs), Backoff: r.Opts.AgentBackoff,
 		StaleAfter: r.Opts.StaleAfter, HandshakeTimeout: 20 * time.Second,
 		RenewRetry: 500 * time.Millisecond, RenewTimeout: 3 * time.Second,
-		DeadAfter: r.Opts.DeadAfter,
+		DeadAfter: r.Opts.DeadAfter, AttestExchange: r.AttestExchange,
 		// The ssh service reaches the fake sshd (the echo server) instead of port 22.
 		SSHPort:     r.Echo.Port,
 		AllowTarget: r.allowLoopback,

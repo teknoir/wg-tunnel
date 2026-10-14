@@ -9,3 +9,7 @@ coverage.*
 *.key
 *.pem
 identity.key*
+/wg-hub
+/wg-agent
+/wg-connect
+/wg-gateway

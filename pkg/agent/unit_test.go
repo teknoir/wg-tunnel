@@ -145,7 +145,7 @@ func TestInitDir(t *testing.T) {
 	check := func() {
 		t.Helper()
 		fi, err := os.Lstat(dir)
-		if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		if err != nil || !fi.IsDir() || fi.Mode().Perm() != StateDirMode {
 			t.Fatalf("dir: %v %v", fi, err)
 		}
 		if st := fi.Sys().(*syscall.Stat_t); int(st.Uid) != uid || int(st.Gid) != uid {

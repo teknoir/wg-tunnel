@@ -93,6 +93,9 @@ jobs:
         run: |
           docker buildx build --load --target wg-agent -t wg-agent:smoke .
           bash test/smoke-agent-init.sh wg-agent:smoke
+      - name: Smoke test the wg-agent attestor (root, no capabilities, read-only)
+        if: matrix.image == 'wg-agent'
+        run: bash test/smoke-attestor.sh wg-agent:smoke
 
       - uses: docker/build-push-action@v6
         with:
