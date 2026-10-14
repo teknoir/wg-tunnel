@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"github.com/teknoir/wg-tunnel/pkg/svc"
 	"io"
 	"log/slog"
 	"math/big"
@@ -602,8 +603,27 @@ func (r *Rig) allowLoopback(ap netip.AddrPort) bool {
 
 // SetServices replaces the services of the device's policy (the way
 // device-controller does when the annotation changes).
+//
+// It returns once the live device session has been told about the new set
+// (the hub offers a service only after the agent has it), so tests do not
+// race the control push.
 func (r *Rig) SetServices(specs ...api.ServiceSpec) {
 	r.Policy.Update(NS, DeviceName, func(p *api.PolicyEntry) { p.Services = specs })
+	if !r.Hub.DeviceOnline(NS, DeviceName) {
+		return // no device session yet: the agent gets the set at session create
+	}
+	Eventually(r.T, 15*time.Second, "the agent to get the new services", func() bool {
+		got := r.Hub.DeviceServices(NS, DeviceName)
+		if len(got) != len(specs) {
+			return false
+		}
+		for i := range specs {
+			if got[i].ID != specs[i].ID || !svc.Equivalent(got[i], specs[i]) {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // WebApp is an HTTP server the rig's web services can point at.

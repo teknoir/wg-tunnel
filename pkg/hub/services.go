@@ -300,3 +300,17 @@ func (h *Hub) postServices(dev *session, specs []api.ServiceSpec) error {
 	}
 	return nil
 }
+
+// DeviceServices returns the services the live device session of (ns, device)
+// was last told about (session response or control push), or nil if the
+// device has no session or is a phase-1 agent. Read-only; for status and tests.
+func (h *Hub) DeviceServices(ns, device string) []api.ServiceSpec {
+	dev := h.deviceSession(ns, device)
+	if dev == nil {
+		return nil
+	}
+	return slices.Clone(dev.servicesOf())
+}
+
+// DeviceOnline reports whether (ns, device) has a live device session.
+func (h *Hub) DeviceOnline(ns, device string) bool { return h.deviceSession(ns, device) != nil }
