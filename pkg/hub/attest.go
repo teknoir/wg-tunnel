@@ -28,7 +28,8 @@ import (
 const (
 	attestNonceTTL     = 5 * time.Minute
 	attestNonceMax     = 4096 // outstanding nonces in total
-	attestNoncePerDev  = 8    // outstanding nonces per device; the oldest is dropped
+	attestNoncePerDev  = 8    // outstanding nonces per (device, identity key); the oldest is dropped
+	attestNonceDevMax  = 64   // outstanding nonces per device over all identity keys
 	maxAttestations    = 4
 	maxAttestationSize = 8 << 10
 	maxAgentCaps       = 8
@@ -81,20 +82,46 @@ func (n *nonceStore) issue(rec nonceRec) (string, time.Time, bool) {
 	defer n.mu.Unlock()
 	now := n.now()
 	n.sweepLocked(now)
-	// Per device: drop the oldest beyond the cap, so a caller holding the
-	// (legacy) enrollment key cannot lock the real device out by requesting
-	// nonces; the newest nonce always works.
-	var mine []string
+	// The cap is per (device, identity key): a caller holding the (legacy)
+	// enrollment key can mint identity keys at will, but its nonces only
+	// evict its own. The newest nonce of every key survives.
+	var mine, dev []string
 	for k, r := range n.m {
 		if r.ns == rec.ns && r.device == rec.device {
-			mine = append(mine, k)
+			dev = append(dev, k)
+			if r.identityKey == rec.identityKey {
+				mine = append(mine, k)
+			}
 		}
 	}
+	byAge := func(keys []string) {
+		slices.SortFunc(keys, func(a, b string) int { return n.m[a].issued.Compare(n.m[b].issued) })
+	}
 	if len(mine) >= attestNoncePerDev {
-		slices.SortFunc(mine, func(a, b string) int { return n.m[a].issued.Compare(n.m[b].issued) })
+		byAge(mine)
 		for _, k := range mine[:len(mine)-attestNoncePerDev+1] {
 			delete(n.m, k)
 		}
+		dev = slices.DeleteFunc(dev, func(k string) bool { _, ok := n.m[k]; return !ok })
+	}
+	// Device wide: make room by dropping the oldest nonce of the identity key
+	// that holds the most; when every key holds just its newest nonce, refuse.
+	if len(dev) >= attestNonceDevMax {
+		per := map[string][]string{}
+		for _, k := range dev {
+			per[n.m[k].identityKey] = append(per[n.m[k].identityKey], k)
+		}
+		var fattest []string
+		for _, ks := range per {
+			if len(ks) > len(fattest) {
+				fattest = ks
+			}
+		}
+		if len(fattest) < 2 {
+			return "", time.Time{}, false
+		}
+		byAge(fattest)
+		delete(n.m, fattest[0])
 	}
 	if len(n.m) >= attestNonceMax {
 		return "", time.Time{}, false
@@ -155,10 +182,10 @@ func (h *Hub) handleAttestChallenge(ctx context.Context, r *http.Request, _ []by
 	if err != nil {
 		return 0, nil, unauthenticatedDenial()
 	}
-	if den := h.subjectDenial("attest|" + sub); den != nil {
+	if den := h.enrollDenial("attest", sub, claims.IdentityKey); den != nil {
 		return 0, nil, den
 	}
-	if den := h.replayDenial("attest|"+sub, claims); den != nil {
+	if den := h.replayDenial("attest|"+sub+"|"+claims.IdentityKey, claims); den != nil {
 		return 0, nil, den
 	}
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)

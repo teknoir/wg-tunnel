@@ -3,6 +3,7 @@ package hub
 import (
 	"errors"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -77,5 +78,73 @@ func TestGatewayRenewalClosesConnectionsOfRevokedUsers(t *testing.T) {
 	echo(t, ca, "still here")
 	if w.h.sessionByAddr(cli.addr) == nil {
 		t.Fatal("the gateway session ended")
+	}
+}
+
+// ---- attestation budgets (review finding 5) ----
+
+// A squatter holding the enrollment key drains its own bucket; the real
+// device's identity key keeps its budget.
+func TestAttestChallengeBudgetIsPerIdentityKey(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.SubjectRate, c.SubjectBurst = 0.01, 3 })
+	squatter := r.otherDevice(t)
+	limited := 0
+	for range 10 {
+		if st, _ := r.challenge(squatter); st == http.StatusTooManyRequests {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("the squatter was never rate limited")
+	}
+	// The genuine device is not affected.
+	for i := range 3 {
+		if st, body := r.challenge(r.dev); st != http.StatusOK {
+			t.Fatalf("real device challenge %d: %d %s", i, st, body)
+		}
+	}
+	// ... and its replay partition is its own, too.
+	if st, _ := r.challenge(r.dev); st != http.StatusTooManyRequests {
+		t.Error("the real device's own bucket is not limited at all")
+	}
+}
+
+func TestNoncesOfOneIdentityKeyNeverEvictAnothers(t *testing.T) {
+	clk := newFakeClock()
+	n := newNonceStore(clk.Now)
+	mk := func(key string) nonceRec {
+		return nonceRec{ns: "ns", device: "d", epoch: "e", generation: 1, identityKey: key}
+	}
+	real, _, _ := n.issue(mk("real"))
+	for range 50 { // a squatter minting nonces under one key, and under many
+		clk.Advance(time.Millisecond)
+		n.issue(mk("squat"))
+	}
+	for i := range 100 {
+		clk.Advance(time.Millisecond)
+		n.issue(mk("squat-" + time.Duration(i).String()))
+	}
+	if _, ok := n.take(real); !ok {
+		t.Fatal("the real device's nonce was evicted by a squatter")
+	}
+}
+
+// An unattested enrollment of another identity is a conflict on the console,
+// even when it is turned away for the missing attestation.
+func TestForeignEnrollWithoutAttestationIsRecordedAsConflict(t *testing.T) {
+	r := newRig(t)
+	r.enrollOK()
+	hk := newTestHostKey(t, "ed25519")
+	r.trust(hk)
+	squatter := r.otherDevice(t)
+	st, body := r.enrollWith(squatter, attestCaps)
+	wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+	if got := r.ids.entry(testNS, testDevice).Conflicts; got != 1 {
+		t.Fatalf("conflicts = %d, want 1", got)
+	}
+	// The pinned identity itself is no conflict.
+	r.enrollWith(r.dev, attestCaps)
+	if got := r.ids.entry(testNS, testDevice).Conflicts; got != 1 {
+		t.Fatalf("conflicts = %d after the pinned identity, want 1", got)
 	}
 }

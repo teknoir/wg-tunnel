@@ -163,9 +163,13 @@ type Hub struct {
 	ipLimit     *limiter
 	globalLimit *limiter
 	subjLimit   *limiter
-	renewLimit  *limiter
-	replay      *replayCache
-	nonces      *nonceStore
+	// identLimit/devLimit rate-limit enrollment and attestation challenges
+	// per (device, identity key) and, generously, per device (see enrollDenial).
+	identLimit *limiter
+	devLimit   *limiter
+	renewLimit *limiter
+	replay     *replayCache
+	nonces     *nonceStore
 
 	// mu guards the session registry below.
 	mu      sync.Mutex
@@ -229,6 +233,8 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		ipLimit:     newLimiter(cfg.IPRate, cfg.IPBurst, 50000, cfg.Now),
 		globalLimit: newLimiter(cfg.GlobalRate, cfg.GlobalBurst, 64, cfg.Now),
 		subjLimit:   newLimiter(cfg.SubjectRate, cfg.SubjectBurst, 50000, cfg.Now),
+		identLimit:  newLimiter(cfg.SubjectRate, cfg.SubjectBurst, 20000, cfg.Now),
+		devLimit:    newLimiter(cfg.SubjectRate*10, cfg.SubjectBurst*10, 20000, cfg.Now),
 		renewLimit:  newLimiter(0.5, 5, 50000, cfg.Now),
 		replay:      newReplayCache(cfg.ReplayCacheSize, cfg.ReplayPerSubject, cfg.Now),
 		nonces:      newNonceStore(cfg.Now),

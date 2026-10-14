@@ -216,6 +216,23 @@ func (h *Hub) replayDenial(subjectKey string, claims *api.DeviceClaims) *denial 
 	return nil
 }
 
+// enrollDenial rate-limits an enrollment or attestation-challenge request that
+// presented a valid enrollment token. The enrollment key is shared by anyone
+// who ever held the device's legacy key, so the budget is kept per (device,
+// identity key), not per device: a squatter's requests drain its own bucket
+// only, and the real device's identity key keeps its own. A generous device
+// wide bucket sits behind it (tokens are taken from it only by requests that
+// passed their own bucket).
+func (h *Hub) enrollDenial(op, sub, identityKey string) *denial {
+	if ok, _ := h.identLimit.Allow(op + "|" + sub + "|" + identityKey); !ok {
+		return deny(api.ReasonRateLimited, "too many requests for this identity")
+	}
+	if ok, _ := h.devLimit.Allow(op + "|" + sub); !ok {
+		return deny(api.ReasonRateLimited, "too many requests for this device")
+	}
+	return nil
+}
+
 func (h *Hub) subjectDenial(key string) *denial {
 	if ok, _ := h.subjLimit.Allow(key); !ok {
 		return deny(api.ReasonRateLimited, "too many requests for this subject")
@@ -270,10 +287,10 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	}
 	// Subject limit first, then the replay cache: a subject over its rate must
 	// not be able to fill its replay partition.
-	if den := h.subjectDenial("enroll|" + sub); den != nil {
+	if den := h.enrollDenial("enroll", sub, claims.IdentityKey); den != nil {
 		return 0, nil, den
 	}
-	if den := h.replayDenial("enroll|"+sub, claims); den != nil {
+	if den := h.replayDenial("enroll|"+sub+"|"+claims.IdentityKey, claims); den != nil {
 		return 0, nil, den
 	}
 	if den := validPosture(req.Posture, "wg-agent"); den != nil {
@@ -290,6 +307,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	// present a valid one; a phase-1 agent enrolls as before.
 	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol)
 	if den != nil {
+		h.recordForeignAttemptConflict(ctx, ns, device, pol, req.IdentityPublicKey)
 		return 0, nil, den
 	}
 	caps := sanitizeCaps(req.Capabilities)
@@ -361,6 +379,20 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		}
 	}
 	return h.enrollResult(ctx, got, req.IdentityPublicKey, created, d)
+}
+
+// recordForeignAttemptConflict counts an enrollment that was turned away (for
+// a missing or invalid attestation) as a conflict when it comes from an
+// identity other than the pinned one of this enrollment window, so the console
+// shows the squatting attempt even when the genuine device is starved.
+func (h *Hub) recordForeignAttemptConflict(ctx context.Context, ns, device string, pol api.PolicyEntry, identityKey string) {
+	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
+	if err != nil || !found || !sameEpoch(cur, pol) || cur.Voided || sameKey(cur.IdentityPublicKey, identityKey) {
+		return
+	}
+	if err := h.deps.Identity.RecordConflict(ctx, ns, device, h.now()); err != nil {
+		h.log.Error("recording enrollment conflict failed", "ns", ns, "device", device, "err", err)
+	}
 }
 
 // newPinEntry is the identity entry of a new enrollment.
