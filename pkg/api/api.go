@@ -490,10 +490,10 @@ const (
 	AgentConnectPort = 2224 // ConnectRequest line, then raw bytes to the service target
 	AgentControlPort = 2225 // HTTP: ControlGrantsPath, ControlServicesPath
 	// HubStatusPort serves read-only live status and admin actions to the
-	// Backstage backend only: Bearer = the Backstage pod's ordinary
-	// ServiceAccount token, verified with a TokenReview (default API audience)
-	// whose username must equal the configured Backstage ServiceAccount;
-	// separate AuthorizationPolicy. Never routed.
+	// Backstage backend only: Bearer = a projected ServiceAccount token with
+	// audience StatusTokenAudience, verified with a TokenReview for that
+	// audience; the username must equal the configured Backstage
+	// ServiceAccount; separate AuthorizationPolicy. Never routed.
 	HubStatusPort = 8082
 )
 
@@ -670,7 +670,34 @@ type DeviceLiveStatus struct {
 	NAT             string              `json:"nat,omitempty"` // "easy" | "hard" | "unknown"
 	Sessions        []ClientSessionInfo `json:"sessions"`
 	IdentityPending bool                `json:"identityPending"`
+	// Identity is the hub-owned identity pin (never the Device CR status,
+	// which device editors can write). Admin actions (trust host key, approve
+	// identity) must compare against these values.
+	Identity *LiveIdentity `json:"identity,omitempty"`
 }
+
+// LiveIdentity is the current pin as the hub stores it.
+type LiveIdentity struct {
+	Fingerprint          string    `json:"fingerprint"`
+	AttestedHostKey      string    `json:"attestedHostKey,omitempty"`
+	AttestedHostKeyType  string    `json:"attestedHostKeyType,omitempty"`
+	EnrollmentGeneration int64     `json:"enrollmentGeneration"`
+	EnrollmentEpoch      string    `json:"enrollmentEpoch"`
+	EnrolledAt           time.Time `json:"enrolledAt"`
+	ActivatedBy          string    `json:"activatedBy,omitempty"`
+	Voided               bool      `json:"voided,omitempty"`
+	Conflicts            int       `json:"conflicts,omitempty"`
+}
+
+// StatusTokenAudience is the audience of the projected ServiceAccount token
+// the Backstage backend presents on HubStatusPort. The hub's TokenReview
+// requires exactly this audience, so the hub never receives a token the API
+// server would accept on Backstage's behalf.
+const StatusTokenAudience = "teknoir-ztna-status"
+
+// StatusRequesterHeader carries the end user (email) behind a Backstage admin
+// action on HubStatusPort, for the hub's audit log.
+const StatusRequesterHeader = "X-Ztna-Requester"
 
 // ClientSessionInfo is one client session as shown in the console. Subject is
 // redacted by the Backstage backend for non-admin viewers.
