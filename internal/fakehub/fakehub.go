@@ -48,6 +48,11 @@ type Options struct {
 	// Attest enables host-key attestation (challenge endpoint, verification at
 	// enrollment). Off, the hub behaves like a phase-1 hub (404 on the challenge).
 	Attest bool
+	// PendingUntilAttested makes device sessions of a device whose pinned
+	// identity has no host-key attestation answer pending_approval (an admin
+	// who trusts the device's host key, or approves it, activates it later).
+	// Needs Attest.
+	PendingUntilAttested bool
 }
 
 // Denial makes a hook refuse a request.
@@ -597,6 +602,9 @@ func (h *Hub) authDevice(d *device, tok, ns, name, wgPub string) (int, string) {
 	}
 	if d.pinnedGen < d.generation {
 		return 403, api.ReasonReenroll
+	}
+	if h.opts.Attest && h.opts.PendingUntilAttested && d.attestSt().last.HostKey == "" {
+		return 403, api.ReasonPendingApproval
 	}
 	if d.seenJTI[c.ID] {
 		return 401, api.ReasonReplay

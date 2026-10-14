@@ -222,3 +222,66 @@ func TestConfigAttestExchange(t *testing.T) {
 		t.Fatal("relative ATTEST_EXCHANGE accepted")
 	}
 }
+
+// An identity enrolled without an attestation (the attestor could not sign
+// yet) is attested later by the agent itself: after the admin trusts the host
+// key nothing else is needed (review finding 20).
+func TestPendingUnattestedIdentityIsAttestedLater(t *testing.T) {
+	ar := &attestRig{rig: newRig(t, fakehub.Options{Attest: true, PendingUntilAttested: true}), exchange: t.TempDir(), hostkeys: t.TempDir()}
+	// No host key yet: the attestor refuses, the agent enrolls like a phase-1 agent.
+	ar.startAttestor(t)
+	cfg := ar.config()
+	cfg.ReattestInterval = 100 * time.Millisecond
+	_, stop := ar.start(cfg)
+	defer func() { _ = stop() }()
+	eventually(t, 20*time.Second, "the unattested enrollment", func() bool {
+		return ar.hub.PinnedKey(testNS, testDevice) != nil && strings.Contains(ar.logs.String(), "attestor cannot sign")
+	})
+	if n := len(ar.hub.SessionIDs(api.KindDevice)); n != 0 {
+		t.Fatalf("%d sessions of an unapproved identity", n)
+	}
+	// sshd generates its host key: the next re-attestation attests the pin.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ar.hostkeys, "ssh_host_ed25519_key"), pem.EncodeToMemory(blk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sp, _ := ssh.NewPublicKey(pub)
+	eventually(t, 30*time.Second, "the attestation and the session", func() bool {
+		return ar.hub.Attestation(testNS, testDevice).HostKey == ssh.FingerprintSHA256(sp) && len(ar.hub.SessionIDs(api.KindDevice)) == 1
+	})
+	if !strings.Contains(ar.logs.String(), "attesting it again") {
+		t.Error("no log line about the re-attestation")
+	}
+}
+
+func TestNoReattestationWithoutAnAttestorOrOnceAttested(t *testing.T) {
+	a, err := New(Config{DeviceID: "d", Namespace: "n", HubURL: "http://hub", RSAKeyPath: "/x", IdentityDir: t.TempDir(), ReattestInterval: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.shouldReattest() {
+		t.Error("re-attesting without an attestor")
+	}
+	a.cfg.AttestExchange = "/run/x"
+	time.Sleep(2 * time.Millisecond)
+	if !a.shouldReattest() {
+		t.Error("an unattested pending identity must be attested again")
+	}
+	if a.shouldReattest() {
+		t.Error("the interval is not honoured")
+	}
+	time.Sleep(2 * time.Millisecond)
+	a.mu.Lock()
+	a.attested = true
+	a.mu.Unlock()
+	if a.shouldReattest() {
+		t.Error("re-attesting an identity that was attested")
+	}
+}

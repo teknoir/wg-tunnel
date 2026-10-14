@@ -39,6 +39,11 @@ type Agent struct {
 
 	mu       sync.Mutex
 	loggedFP string
+	// attested: this process delivered a host-key attestation with an
+	// enrollment of the current identity; lastReattest is when it last tried
+	// to (while waiting for approval).
+	attested     bool
+	lastReattest time.Time
 
 	// pb is the plane B of the current device session (nil: none).
 	pb atomic.Pointer[planeB]
@@ -184,6 +189,17 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		switch wgclient.ReasonOf(cerr) {
 		case api.ReasonNotEnrolled:
 			a.log.Info("device identity is not enrolled; enrolling")
+		case api.ReasonPendingApproval:
+			// The pin exists but is not usable. If it was enrolled without a
+			// host-key attestation (the attestor could not sign yet, or this
+			// is a new process and nothing is known), try again to attest it:
+			// the hub accepts the same identity idempotently, records the
+			// attestation, and activates the pin when the host key is the one
+			// an admin trusted. Slow timer; no-op without an attestor.
+			if enrolled || !a.shouldReattest() {
+				return 0, cerr
+			}
+			a.log.Info("the identity is waiting for approval; attesting it again")
 		case api.ReasonUnauthenticated:
 			// The hub shows strangers nothing but "unauthenticated", also for a
 			// device whose pin belongs to another key (a rotated or lost
@@ -216,6 +232,22 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		}
 		enrolled = true
 	}
+}
+
+// shouldReattest reports whether a pending identity should be attested again
+// now: an attestor is configured, this process has not delivered an
+// attestation, and the last try is older than Config.ReattestInterval.
+func (a *Agent) shouldReattest() bool {
+	if !a.attesting() {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.attested || time.Since(a.lastReattest) < a.cfg.ReattestInterval {
+		return false
+	}
+	a.lastReattest = time.Now()
+	return true
 }
 
 func (a *Agent) logFingerprint(priv ed25519.PrivateKey) {
@@ -290,6 +322,9 @@ func (a *Agent) enroll(ctx context.Context, priv ed25519.PrivateKey) error {
 		// could not obtain one enrolls like a phase-1 agent (admin approval).
 		req.Capabilities, req.HostKeyAttestations = []string{api.CapAttest}, attestations
 	}
+	a.mu.Lock()
+	a.attested = len(attestations) > 0
+	a.mu.Unlock()
 	resp, err := wgclient.Enroll(ctx, a.cfg.HubURL, a.cfg.HTTPClient, token, req)
 	if err != nil {
 		return fmt.Errorf("enrolling: %w", err)

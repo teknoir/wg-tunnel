@@ -35,6 +35,9 @@ const (
 	DefaultForwardHost  = "127.0.0.1"
 	DefaultExtraCAFile  = "/etc/teknoir/roots.pem"
 
+	// DefaultReattestInterval: see Config.ReattestInterval.
+	DefaultReattestInterval = 60 * time.Second
+
 	DefaultMaxConns    = 256
 	DefaultDialTimeout = 5 * time.Second
 	// DefaultMaxConnsPerService caps concurrent connections of one service.
@@ -75,6 +78,11 @@ type Config struct {
 	AttestExchange string
 	// AttestTimeout is how long to wait for the attestor (default 15 s).
 	AttestTimeout time.Duration
+	// ReattestInterval is how often an agent whose identity is waiting for
+	// approval, and that has not yet delivered an attestation, tries again to
+	// attest it (default 60 s). The attestor may only be able to sign later
+	// (sshd host keys generated), and an admin may trust the host key later.
+	ReattestInterval time.Duration
 
 	HTTPClient *http.Client
 	Logger     *slog.Logger
@@ -277,6 +285,9 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.MaxConnsPerService <= 0 {
 		c.MaxConnsPerService = DefaultMaxConnsPerService
+	}
+	if c.ReattestInterval <= 0 {
+		c.ReattestInterval = DefaultReattestInterval
 	}
 	if c.MaxConnsPerPair <= 0 {
 		c.MaxConnsPerPair = DefaultMaxConnsPerPair
