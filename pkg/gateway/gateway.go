@@ -56,6 +56,10 @@ type Config struct {
 	// opened, so this is the delay after which a revoked user's next request
 	// is checked again.
 	ConnMaxAge time.Duration
+	// StripCookies lists extra cookie names (case-insensitive, exact) that are
+	// never forwarded to the device nor accepted from it, on top of the built-in
+	// platform rules (see platformCookie). Set from STRIP_COOKIES.
+	StripCookies []string
 	// SweepInterval is how often idle sessions are looked for (default 1 min).
 	SweepInterval time.Duration
 	// Logger receives one structured line per request (default: discard).
@@ -231,10 +235,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rp := &httputil.ReverseProxy{
 		Transport: tr,
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			rewrite(pr, svcID)
+			rewrite(pr, svcID, g.cfg.StripCookies)
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			sanitizeSetCookies(resp.Header)
+			sanitizeSetCookies(resp.Header, g.cfg.StripCookies)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -264,12 +268,12 @@ func upstreamHost(svcID string) string { return svcID + ".ztna.invalid" }
 // rewrite builds the outgoing request: scrubbed, pointed at the service, with
 // the forwarding headers set (the client's own are never trusted: ReverseProxy
 // removes X-Forwarded-* and Forwarded from Out before this runs).
-func rewrite(pr *httputil.ProxyRequest, svcID string) {
+func rewrite(pr *httputil.ProxyRequest, svcID string, stripCookies []string) {
 	in, out := pr.In, pr.Out
 	out.URL.Scheme = "http"
 	out.URL.Host = upstreamHost(svcID)
 	out.Host = in.Host
-	stripRequestHeaders(out.Header)
+	stripRequestHeaders(out.Header, stripCookies)
 	// The peer is the ingress gateway (nothing else is admitted); its
 	// X-Forwarded-For chain is the real client path.
 	ip := peerIP(in.RemoteAddr)

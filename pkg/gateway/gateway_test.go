@@ -700,7 +700,7 @@ func TestStripHelpers(t *testing.T) {
 	h := http.Header{}
 	h.Add("Cookie", "a=1; _oauth2_proxy=x")
 	h.Add("Cookie", "b=2; _oauth2_proxy_1=y;c=3")
-	filterCookies(h)
+	filterCookies(h, nil)
 	if got := h.Get("Cookie"); got != "a=1; b=2; c=3" {
 		t.Errorf("cookies = %q", got)
 	}
@@ -711,9 +711,53 @@ func TestStripHelpers(t *testing.T) {
 		"_oauth2_proxy=v; Path=/":             "",
 		"a=b; Path=/domain":                   "a=b; Path=/domain",
 	} {
-		if got := stripCookieDomain(in); got != want {
+		if got := stripCookieDomain(in, nil); got != want {
 			t.Errorf("stripCookieDomain(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The platform's real oauth2-proxy cookie is _teknoir_oauth2_proxy (and may be
+// split into _0/_1); none of the platform login cookies may cross the gateway,
+// in either direction.
+func TestPlatformLoginCookiesNeverCrossTheGateway(t *testing.T) {
+	h := http.Header{}
+	h.Add("Cookie", "app=1; _teknoir_oauth2_proxy=S; _teknoir_oauth2_proxy_csrf=C")
+	h.Add("Cookie", "_Teknoir_Oauth2_Proxy_0=a; _teknoir_oauth2_proxy_1=b; KEYCLOAK_IDENTITY=k; keycloak_session=s; AUTH_SESSION_ID=x; extra=9; theme=dark")
+	filterCookies(h, []string{"Extra"})
+	if got := h.Get("Cookie"); got != "app=1; theme=dark" {
+		t.Errorf("cookies = %q, want only the application's own", got)
+	}
+	h = http.Header{}
+	h.Set("Cookie", "_teknoir_oauth2_proxy=S")
+	filterCookies(h, nil)
+	if h.Get("Cookie") != "" {
+		t.Errorf("Cookie header survived: %q", h.Get("Cookie"))
+	}
+	for _, in := range []string{
+		"_teknoir_oauth2_proxy=v; Path=/; Domain=x.com",
+		"_teknoir_oauth2_proxy_0=v",
+		"KEYCLOAK_SESSION=v; Path=/",
+		"AUTH_SESSION_ID=v",
+		"mine=v; Path=/; Domain=x",
+	} {
+		got := stripCookieDomain(in, nil)
+		if strings.HasPrefix(in, "mine") {
+			if got != "mine=v; Path=/" {
+				t.Errorf("stripCookieDomain(%q) = %q", in, got)
+			}
+		} else if got != "" {
+			t.Errorf("stripCookieDomain(%q) = %q, want dropped", in, got)
+		}
+	}
+	if stripCookieDomain("sticky=1; Path=/", []string{"STICKY"}) != "" {
+		t.Error("configured STRIP_COOKIES name not dropped from Set-Cookie")
+	}
+	// End to end through the proxy.
+	r := newRig(t, http.HandlerFunc(echoHeaders))
+	resp := r.do("GET", "/", alice, "web", map[string]string{"Cookie": "_teknoir_oauth2_proxy=SECRET; app=1"}, nil)
+	if body := readBody(t, resp); strings.Contains(body, "SECRET") || strings.Contains(body, "_teknoir_oauth2") {
+		t.Errorf("device saw the platform session cookie: %s", body)
 	}
 }
 

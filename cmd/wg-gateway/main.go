@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ func run(args []string) error {
 		tokenFile = fs.String("sa-token-file", "/var/run/ztna/token", "projected service account token (audience teknoir-ztna)")
 		listen    = fs.String("listen", ":8090", "address to serve on")
 		idle      = fs.Duration("idle-timeout", 15*time.Minute, "close a service's hub session after this long without requests")
+		strip     = fs.String("strip-cookies", os.Getenv("STRIP_COOKIES"), "comma-separated extra cookie names never forwarded to the device (env STRIP_COOKIES); platform login cookies are always stripped")
 		level     = fs.String("log-level", "info", "debug, info, warn or error")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -56,7 +58,7 @@ func run(args []string) error {
 
 	g, err := gateway.New(gateway.Config{
 		HubURL: *hubURL, Namespace: *namespace, Device: *device, TokenFile: *tokenFile,
-		IdleTimeout: *idle, Logger: log,
+		IdleTimeout: *idle, Logger: log, StripCookies: splitList(*strip),
 	})
 	if err != nil {
 		return err
@@ -89,4 +91,14 @@ func run(args []string) error {
 	defer cancel()
 	_ = srv.Shutdown(sctx)
 	return nil
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
