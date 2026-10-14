@@ -110,6 +110,8 @@ func TestClientSessionServiceSelection(t *testing.T) {
 		{"ssh on a phase-1 agent needs port 22 allowed", nil, nil, func(q *api.ClientSessionRequest) { q.Service, q.Port = "ssh", 0 }, want{403, api.ReasonPortNotAllowed, "", 0}, nil},
 		{"legacy raw port", capsFull, []int{22, 2200}, func(q *api.ClientSessionRequest) { q.Port = 2200 }, want{201, "", "", 2200}, nil},
 		{"legacy raw port not allowed", capsFull, []int{22}, func(q *api.ClientSessionRequest) { q.Port = 2200 }, want{403, api.ReasonPortNotAllowed, "", 0}, nil},
+		{"the agent's control port is never a raw port", capsFull, []int{22, api.AgentControlPort}, func(q *api.ClientSessionRequest) { q.Port = api.AgentControlPort }, want{403, api.ReasonPortNotAllowed, "", 0}, nil},
+		{"the agent's connect port is never a raw port", capsFull, []int{22, api.AgentConnectPort}, func(q *api.ClientSessionRequest) { q.Port = api.AgentConnectPort }, want{403, api.ReasonPortNotAllowed, "", 0}, nil},
 		{"no service and no port", capsFull, []int{22}, func(q *api.ClientSessionRequest) { q.Port = 0 }, want{400, api.ReasonBadRequest, "", 0}, nil},
 	}
 	for _, tc := range tests {

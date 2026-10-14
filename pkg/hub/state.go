@@ -72,15 +72,22 @@ func computeEffective(pol PolicySource, flags DeviceFlags, ns, device string) ef
 	return effective{Active: true, State: api.StateActive, Policy: entry}
 }
 
+// reservedPort: the agent's overlay ports of the connect and control
+// listeners are never raw-forwardable. The control port trusts its caller by
+// the hub's overlay address, so a client that reached it through a raw-port
+// session would speak as the hub (grants, services).
+func reservedPort(p int) bool { return p == api.AgentConnectPort || p == api.AgentControlPort }
+
 func portAllowed(ports []int, p int) bool {
-	return slices.Contains(ports, p)
+	return !reservedPort(p) && slices.Contains(ports, p)
 }
 
-// validPorts keeps the TCP ports in 1..65535, deduplicated and sorted.
+// validPorts keeps the forwardable TCP ports in 1..65535 (the agent's reserved
+// ports are dropped), deduplicated and sorted.
 func validPorts(ports []int) []int {
 	out := make([]int, 0, len(ports))
 	for _, p := range ports {
-		if p >= 1 && p <= 65535 && !slices.Contains(out, p) {
+		if p >= 1 && p <= 65535 && !reservedPort(p) && !slices.Contains(out, p) {
 			out = append(out, p)
 		}
 	}

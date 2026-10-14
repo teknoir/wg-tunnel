@@ -243,3 +243,20 @@ func TestClientSessionRechecksTheServiceAfterAdmission(t *testing.T) {
 		t.Fatalf("a pair was granted for the stale service: %v", pairs)
 	}
 }
+
+// The agent's reserved overlay ports are never advertised to the agent as raw
+// ports nor allowed on the client path (review finding 23).
+func TestReservedAgentPortsAreNeverRawPorts(t *testing.T) {
+	got := validPorts([]int{22, api.AgentConnectPort, 2200, api.AgentControlPort, 22})
+	if len(got) != 2 || got[0] != 22 || got[1] != 2200 {
+		t.Fatalf("validPorts = %v", got)
+	}
+	for _, p := range []int{api.AgentConnectPort, api.AgentControlPort} {
+		if portAllowed([]int{p, 22}, p) {
+			t.Errorf("port %d allowed", p)
+		}
+	}
+	if !samePorts([]int{22, api.AgentControlPort}, []int{22}) {
+		t.Error("a reserved port counts as a difference in the allowed-port set")
+	}
+}

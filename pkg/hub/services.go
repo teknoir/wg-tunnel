@@ -146,6 +146,9 @@ func resolveRequest(req api.ClientSessionRequest, pol api.PolicyEntry) (service 
 		if req.Port < 1 || req.Port > 65535 {
 			return "", 0, spec, deny(api.ReasonBadRequest, "invalid namespace, device or port")
 		}
+		if reservedPort(req.Port) {
+			return "", 0, spec, deny(api.ReasonPortNotAllowed, "port is reserved for the device agent")
+		}
 		return "", req.Port, spec, nil
 	}
 	if !svc.ValidID(req.Service) || req.Port != 0 {
