@@ -667,3 +667,62 @@ func TestK8sSecretSourceAndMinter(t *testing.T) {
 		t.Fatal("user ids with ':' must be refused")
 	}
 }
+
+func TestK8sIdentityStoreUpdate(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	s := NewK8sIdentityStore(cs, api.HubNamespace)
+	ctx := context.Background()
+
+	// Nothing pinned: fn is not called and nothing is created.
+	called := false
+	_, found, wrote, err := s.Update(ctx, "acme", "cam-1", func(api.IdentityEntry) *api.IdentityEntry { called = true; return nil })
+	if err != nil || found || wrote || called {
+		t.Fatalf("empty: found=%v wrote=%v called=%v err=%v", found, wrote, called, err)
+	}
+	if _, f, _ := s.Get(ctx, "acme", "cam-1"); f {
+		t.Fatal("Update must not create a pin")
+	}
+
+	_, _, _ = s.Pin(ctx, idEntry(1, "keyA"))
+	at := time.Unix(50, 0).UTC()
+	cur, found, wrote, err := s.Update(ctx, "acme", "cam-1", func(c api.IdentityEntry) *api.IdentityEntry {
+		c.ActivatedBy, c.ActivatedAt, c.AttestedHostKey = api.ActivatedByHostKey, at, "SHA256:hk"
+		return &c
+	})
+	if err != nil || !found || !wrote || cur.ActivatedBy != "host-key" || cur.AttestedHostKey != "SHA256:hk" {
+		t.Fatalf("update: %+v found=%v wrote=%v err=%v", cur, found, wrote, err)
+	}
+	got, _, _ := s.Get(ctx, "acme", "cam-1")
+	if got.ActivatedBy != "host-key" || !got.ActivatedAt.Equal(at) || got.IdentityPublicKey != "keyA" {
+		t.Fatalf("stored %+v", got)
+	}
+	// nil leaves things alone.
+	cur, found, wrote, err = s.Update(ctx, "acme", "cam-1", func(api.IdentityEntry) *api.IdentityEntry { return nil })
+	if err != nil || !found || wrote || cur.ActivatedBy != "host-key" {
+		t.Fatalf("no-op: %+v %v %v %v", cur, found, wrote, err)
+	}
+
+	// Conflicts are retried and fn sees the fresh entry each time.
+	var attempts, updates atomic.Int32
+	cs.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if updates.Add(1) <= 1 {
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, "x", errors.New("stale"))
+		}
+		return false, nil, nil
+	})
+	_, _, wrote, err = s.Update(ctx, "acme", "cam-1", func(c api.IdentityEntry) *api.IdentityEntry {
+		attempts.Add(1)
+		c.Conflicts++
+		return &c
+	})
+	if err != nil || !wrote || attempts.Load() != 2 {
+		t.Fatalf("retry: wrote=%v attempts=%d err=%v", wrote, attempts.Load(), err)
+	}
+	if got, _, _ := s.Get(ctx, "acme", "cam-1"); got.Conflicts != 1 {
+		t.Fatalf("conflicts %d (fn effects must apply once)", got.Conflicts)
+	}
+	// Invalid names are refused.
+	if _, _, _, err := s.Update(ctx, "Bad_NS", "cam-1", func(c api.IdentityEntry) *api.IdentityEntry { return &c }); err == nil {
+		t.Fatal("invalid namespace accepted")
+	}
+}

@@ -245,7 +245,7 @@ func (h *Hub) reauthDevice(ctx context.Context, tok string, s *session, now time
 	if eff := computeEffective(h.deps.Policy, h.deps.Flags, s.ns, s.device); !eff.Active {
 		return deny(eff.Reason, eff.Detail)
 	}
-	if den := checkPin(pin, pub, pol); den != nil {
+	if den := h.checkPin(ctx, pin, pub, pol); den != nil {
 		return den
 	}
 	if k, err := wgkey.ParsePublic(claims.WGKey); err != nil || k != s.wgKey {

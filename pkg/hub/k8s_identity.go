@@ -259,6 +259,32 @@ func (s *K8sIdentityStore) Pin(ctx context.Context, entry api.IdentityEntry) (ap
 	return current, wrote, nil
 }
 
+// Update implements IdentityStore.
+func (s *K8sIdentityStore) Update(ctx context.Context, ns, device string, fn func(cur api.IdentityEntry) *api.IdentityEntry) (api.IdentityEntry, bool, bool, error) {
+	if !validLabel(ns) || !validLabel(device) {
+		return api.IdentityEntry{}, false, false, errors.New("hub: invalid identity entry")
+	}
+	var current api.IdentityEntry
+	found := false
+	wrote, err := s.mutate(ctx, ns, device, func(cur *api.IdentityEntry) *api.IdentityEntry {
+		if cur == nil {
+			found, current = false, api.IdentityEntry{}
+			return nil
+		}
+		found, current = true, *cur
+		next := fn(*cur)
+		if next == nil {
+			return nil
+		}
+		current = *next
+		return next
+	})
+	if err != nil {
+		return api.IdentityEntry{}, false, false, err
+	}
+	return current, found, wrote, nil
+}
+
 // Void implements IdentityStore.
 func (s *K8sIdentityStore) Void(ctx context.Context, ns, device, reason string, at time.Time) (bool, error) {
 	if !validLabel(ns) || !validLabel(device) {

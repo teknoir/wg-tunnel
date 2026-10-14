@@ -105,3 +105,58 @@ func pinCurrent(pin api.IdentityEntry, pol api.PolicyEntry) bool {
 func sameEpoch(pin api.IdentityEntry, pol api.PolicyEntry) bool {
 	return pin.EnrollmentGeneration == pol.EnrollmentGeneration && pin.EnrollmentEpoch == pol.EnrollmentEpoch
 }
+
+// identityView is the part of a device identity the activation rule looks at:
+// a stored pin, or the snapshot a live device session keeps of the pin it was
+// created from.
+type identityView struct {
+	Fingerprint     string
+	AttestedHostKey string
+	Voided          bool
+	Epoch           string
+	Generation      int64
+}
+
+func viewOfPin(pin api.IdentityEntry) identityView {
+	return identityView{
+		Fingerprint: pin.Fingerprint, AttestedHostKey: pin.AttestedHostKey,
+		Voided: pin.Voided, Epoch: pin.EnrollmentEpoch, Generation: pin.EnrollmentGeneration,
+	}
+}
+
+func (s *session) identityView() identityView {
+	return identityView{Fingerprint: s.fingerprint, AttestedHostKey: s.attestedKey, Epoch: s.epoch, Generation: s.generation}
+}
+
+// identityUsable is THE activation rule, used for session creation, renewal
+// and enforcement. An identity is usable for sessions iff it is not voided,
+// its epoch and generation are the policy's, and either
+//   - an admin approved exactly this identity fingerprint (api.ActivatedByApproval), or
+//   - automatic activation is on (the activation mode is not "manual", the
+//     generation is not forced manual, the trusted host key is not shared with
+//     another device) and the identity was enrolled with an attestation made
+//     by exactly the host key an admin trusted (api.ActivatedByHostKey).
+//
+// by is the activation source when ok.
+func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
+	if v.Voided || v.Fingerprint == "" ||
+		v.Generation != pol.EnrollmentGeneration || v.Epoch != pol.EnrollmentEpoch {
+		return false, ""
+	}
+	if pol.ApprovedFingerprint != "" && v.Fingerprint == pol.ApprovedFingerprint {
+		return true, api.ActivatedByApproval
+	}
+	if pol.ActivationMode != "manual" &&
+		pol.ForceManualGeneration < pol.EnrollmentGeneration &&
+		!pol.DuplicateHostKey &&
+		pol.TrustedHostKey != "" &&
+		v.AttestedHostKey == pol.TrustedHostKey {
+		return true, api.ActivatedByHostKey
+	}
+	return false, ""
+}
+
+func activated(v identityView, pol api.PolicyEntry) bool {
+	ok, _ := identityUsable(v, pol)
+	return ok
+}

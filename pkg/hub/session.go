@@ -48,6 +48,10 @@ type session struct {
 	generation  int64
 	epoch       string
 	fingerprint string
+	// attestedKey is the SSH host key (SHA256 fingerprint) that attested the
+	// identity this device session was created from; the activation rule
+	// (identityUsable) is re-evaluated against it on every policy change.
+	attestedKey string
 	ports       []int
 	direct      bool
 	remote      string

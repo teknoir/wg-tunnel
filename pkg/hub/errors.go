@@ -18,6 +18,7 @@ var reasonStatus = map[string]int{
 	api.ReasonReenroll:        http.StatusForbidden,
 	api.ReasonEnrollClosed:    http.StatusForbidden,
 	api.ReasonEnrollConflict:  http.StatusConflict,
+	api.ReasonAttestRequired:  http.StatusForbidden,
 	api.ReasonSessionLimit:    http.StatusTooManyRequests,
 	api.ReasonRateLimited:     http.StatusTooManyRequests,
 	api.ReasonForbidden:       http.StatusForbidden,

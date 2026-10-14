@@ -170,6 +170,21 @@ func (s *Identity) Void(_ context.Context, ns, device, reason string, at time.Ti
 	return true, nil
 }
 
+func (s *Identity) Update(_ context.Context, ns, device string, fn func(api.IdentityEntry) *api.IdentityEntry) (api.IdentityEntry, bool, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key{ns, device}
+	cur, ok := s.m[k]
+	if !ok {
+		return api.IdentityEntry{}, false, false, nil
+	}
+	if next := fn(cur); next != nil {
+		s.m[k] = *next
+		return *next, true, true, nil
+	}
+	return cur, true, false, nil
+}
+
 func (s *Identity) RecordConflict(_ context.Context, ns, device string, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
