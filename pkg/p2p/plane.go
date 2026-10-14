@@ -35,6 +35,10 @@ const (
 	kickEvery = time.Second
 	// maxLearned bounds the addresses a peer may reveal by probing.
 	maxLearned = 4
+	// sentPings is how many of our own recent pings are remembered per peer;
+	// a pong answers a ping at most pongWindow old.
+	sentPings  = 32
+	pongWindow = 10 * time.Second
 	// seenNonces is the replay window of probe nonces per peer.
 	seenNonces = 128
 	// resetEvery rate-limits the session resets an initiator makes when the
@@ -128,11 +132,15 @@ type peer struct {
 	lastReset time.Time
 	seen      [seenNonces][probeNonceLen]byte
 	seenN     int
-	cands     []netip.AddrPort
-	learned   []netip.AddrPort
-	endpoint  netip.AddrPort
-	lastKick  time.Time
-	stopPuns  context.CancelFunc
+	// sent are the pings we sent recently (a ring): a pong is believed only
+	// for one of them (see acceptPong).
+	sent     [sentPings]sentPing
+	sentN    int
+	cands    []netip.AddrPort
+	learned  []netip.AddrPort
+	endpoint netip.AddrPort
+	lastKick time.Time
+	stopPuns context.CancelFunc
 }
 
 // NewPlane brings up the plane-B WireGuard device on cfg.Socket.
@@ -566,6 +574,14 @@ func (p *peer) sendPings(noSession bool) {
 	if err != nil {
 		return
 	}
+	if len(targets) > 0 {
+		var n [probeNonceLen]byte
+		copy(n[:], pkt[14:14+probeNonceLen])
+		p.mu.Lock()
+		p.sent[p.sentN%sentPings] = sentPing{nonce: n, at: time.Now(), left: len(targets)}
+		p.sentN++
+		p.mu.Unlock()
+	}
 	for _, t := range targets {
 		_, _ = p.pl.sock.Conn().WriteTo(pkt, net.UDPAddrFromAddrPort(t))
 	}
@@ -591,6 +607,9 @@ func (pl *Plane) onProbe(pkt []byte, from netip.AddrPort) {
 	}
 	if p.replayed(hdr.nonce, hdr.typ) {
 		return
+	}
+	if hdr.typ == probePong && !p.acceptPong(hdr.nonce, from) {
+		return // not an answer to a ping of ours: replayed, forged source or late
 	}
 	established := pl.peerInfo(p.hex).Established
 	if hdr.typ == probePing {
@@ -620,6 +639,40 @@ func (p *peer) replayed(n [probeNonceLen]byte, typ byte) bool {
 	}
 	p.seen[p.seenN%seenNonces] = n
 	p.seenN++
+	return false
+}
+
+// sentPing is one ping this side sent: its nonce, when, and how many answers it
+// may still get (one per address it was sent to) from addresses not yet heard.
+type sentPing struct {
+	nonce [probeNonceLen]byte
+	at    time.Time
+	left  int
+	from  []netip.AddrPort
+}
+
+// acceptPong reports whether a pong with nonce n from address from answers a
+// recent ping of ours, and consumes that answer. A pong carries the nonce of
+// the ping it answers; without this check anyone who captured one authenticated
+// pong could replay it from any address, again and again, to move the
+// WireGuard endpoint before the handshake and to push the genuine learned
+// addresses out. The same ping may be answered by each address it was sent to
+// (once each) and only within pongWindow.
+func (p *peer) acceptPong(n [probeNonceLen]byte, from netip.AddrPort) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.sent {
+		e := &p.sent[i]
+		if e.left <= 0 || e.nonce != n {
+			continue
+		}
+		if time.Since(e.at) > pongWindow || containsAP(e.from, from) {
+			return false
+		}
+		e.left--
+		e.from = append(e.from, from)
+		return true
+	}
 	return false
 }
 

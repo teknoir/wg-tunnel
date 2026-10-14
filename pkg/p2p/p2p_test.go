@@ -700,3 +700,78 @@ func TestProbeTargets(t *testing.T) {
 		t.Fatalf("with loopback allowed: %v", got)
 	}
 }
+
+// A captured authenticated pong cannot be replayed to steer the WireGuard
+// endpoint: only an answer to a recent ping of ours, once per address, is
+// believed (review finding 24).
+func TestPongsAreMatchedToOutstandingPings(t *testing.T) {
+	t.Parallel()
+	a := newTestPlane(t, "100.97.4.10", time.Hour) // no automatic pings: the test sends its own
+	b := newTestPlane(t, "100.97.4.20", time.Hour)
+	if err := a.AddPeer(b.PublicKey(), b.addr, PeerOptions{Candidates: b.cands, Initiator: true, Budget: time.Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	p := a.byID[idOf(b.PublicKey())]
+	a.mu.Unlock()
+	if p == nil {
+		t.Fatal("peer not installed")
+	}
+	evil := netip.MustParseAddrPort("203.0.113.66:4444")
+	evil2 := netip.MustParseAddrPort("203.0.113.67:4444")
+	pong := func(n [probeNonceLen]byte) []byte {
+		pkt, err := buildProbe(p.key, idOf(b.PublicKey()), probePong, probeNoSession, &n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pkt
+	}
+	endpoint := func() netip.AddrPort { p.mu.Lock(); defer p.mu.Unlock(); return p.endpoint }
+	learned := func() int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.learned) }
+	base := learned()
+
+	// A pong for a nonce we never sent (an old capture) is ignored.
+	var stranger [probeNonceLen]byte
+	copy(stranger[:], "capture!")
+	a.onProbe(pong(stranger), evil)
+	if endpoint().IsValid() && endpoint() == evil || learned() != base {
+		t.Fatalf("a pong without a ping moved the endpoint (%v) or was learned (%d)", endpoint(), learned())
+	}
+
+	// One ping, one candidate: exactly one answer is accepted.
+	p.sendPings(true)
+	p.mu.Lock()
+	var sent [probeNonceLen]byte
+	for _, e := range p.sent {
+		if e.left > 0 {
+			sent = e.nonce
+		}
+	}
+	p.mu.Unlock()
+	if sent == ([probeNonceLen]byte{}) {
+		t.Fatal("the ping was not recorded")
+	}
+	a.onProbe(pong(sent), b.cands[0])
+	if learned() != base { // the candidate itself is not "learned" twice
+		t.Errorf("learned %d", learned())
+	}
+	a.onProbe(pong(sent), evil)
+	a.onProbe(pong(sent), evil2)
+	if endpoint() == evil || endpoint() == evil2 || learned() != base {
+		t.Fatalf("a replayed pong was accepted: endpoint %v, learned %d", endpoint(), learned())
+	}
+}
+
+func TestAcceptPongExpiresAndCountsTargets(t *testing.T) {
+	p := &peer{}
+	n := [probeNonceLen]byte{1}
+	x, y, z := netip.MustParseAddrPort("10.0.0.1:1"), netip.MustParseAddrPort("10.0.0.2:1"), netip.MustParseAddrPort("10.0.0.3:1")
+	p.sent[0] = sentPing{nonce: n, at: time.Now(), left: 2}
+	if !p.acceptPong(n, x) || p.acceptPong(n, x) || !p.acceptPong(n, y) || p.acceptPong(n, z) {
+		t.Fatal("a ping sent to two addresses is answered once by each")
+	}
+	p.sent[1] = sentPing{nonce: [probeNonceLen]byte{2}, at: time.Now().Add(-2 * pongWindow), left: 3}
+	if p.acceptPong([probeNonceLen]byte{2}, x) {
+		t.Fatal("a late pong was accepted")
+	}
+}
