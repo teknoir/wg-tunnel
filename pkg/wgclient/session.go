@@ -66,7 +66,10 @@ type Session struct {
 	ended   bool
 
 	endOnce sync.Once
-	done    chan struct{}
+	// endCause, when set, is the error end reports whatever ends the session
+	// first (see SetEndCause).
+	endCause error
+	done     chan struct{}
 }
 
 // Create asks the hub for a session and brings the tunnel up. ctx bounds only
@@ -624,6 +627,17 @@ func (s *Session) EndWith(err error) {
 	s.end(err)
 }
 
+// SetEndCause records why the session is going to end, ahead of the end
+// itself: when the session ends, Err reports this cause in place of whatever
+// error ends it (for instance a renewal that fails while the hub is already
+// tearing the session down after announcing it with a RevokeNotice). A nil err
+// clears it. It does not end the session.
+func (s *Session) SetEndCause(err error) {
+	s.mu.Lock()
+	s.endCause = err
+	s.mu.Unlock()
+}
+
 // notifyClose tells the hub to end the session now. Failure is fine: the hub
 // reaps sessions that stop renewing.
 func (s *Session) notifyClose() {
@@ -637,6 +651,9 @@ func (s *Session) notifyClose() {
 func (s *Session) end(err error) {
 	s.endOnce.Do(func() {
 		s.mu.Lock()
+		if s.endCause != nil {
+			err = s.endCause
+		}
 		s.err, s.ended = err, true
 		open := make([]io.Closer, 0, len(s.tracked))
 		for c := range s.tracked {
