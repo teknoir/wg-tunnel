@@ -116,14 +116,14 @@ func TestNoncesOfOneIdentityKeyNeverEvictAnothers(t *testing.T) {
 	mk := func(key string) nonceRec {
 		return nonceRec{ns: "ns", device: "d", epoch: "e", generation: 1, identityKey: key}
 	}
-	real, _, _ := n.issue(mk("real"))
+	real, _, _ := n.issue(mk("real"), "real")
 	for range 50 { // a squatter minting nonces under one key, and under many
 		clk.Advance(time.Millisecond)
-		n.issue(mk("squat"))
+		n.issue(mk("squat"), "real")
 	}
 	for i := range 100 {
 		clk.Advance(time.Millisecond)
-		n.issue(mk("squat-" + time.Duration(i).String()))
+		n.issue(mk("squat-"+time.Duration(i).String()), "real")
 	}
 	if _, ok := n.take(real); !ok {
 		t.Fatal("the real device's nonce was evicted by a squatter")

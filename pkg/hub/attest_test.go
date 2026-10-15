@@ -846,14 +846,14 @@ func TestNonceStoreBounds(t *testing.T) {
 	n := newNonceStore(clk.Now)
 	mk := func(dev string) nonceRec { return nonceRec{ns: "ns", device: dev, epoch: "e", generation: 1} }
 
-	first, _, ok := n.issue(mk("d"))
+	first, _, ok := n.issue(mk("d"), "")
 	if !ok {
 		t.Fatal("issue")
 	}
 	var last string
 	for range attestNoncePerDev {
 		clk.Advance(time.Millisecond)
-		last, _, _ = n.issue(mk("d"))
+		last, _, _ = n.issue(mk("d"), "")
 	}
 	if _, ok := n.take(first); ok {
 		t.Error("the oldest nonce of a device must be dropped at the per-device cap")
@@ -866,7 +866,7 @@ func TestNonceStoreBounds(t *testing.T) {
 	}
 
 	// Expiry and sweeping.
-	x, _, _ := n.issue(mk("e"))
+	x, _, _ := n.issue(mk("e"), "")
 	clk.Advance(attestNonceTTL + time.Second)
 	if _, ok := n.take(x); ok {
 		t.Error("expired nonce accepted")
@@ -875,18 +875,18 @@ func TestNonceStoreBounds(t *testing.T) {
 	// Global cap: other devices cannot push the store past it.
 	n2 := newNonceStore(clk.Now)
 	for i := range attestNonceMax {
-		if _, _, ok := n2.issue(mk("dev-" + string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + string(rune('a'+(i/676)%26)))); !ok {
+		if _, _, ok := n2.issue(mk("dev-"+string(rune('a'+i%26))+string(rune('a'+(i/26)%26))+string(rune('a'+(i/676)%26))), ""); !ok {
 			t.Fatalf("issue %d refused below the cap", i)
 		}
 	}
 	if n2.len() > attestNonceMax {
 		t.Fatalf("store holds %d", n2.len())
 	}
-	if _, _, ok := n2.issue(mk("brand-new")); ok {
+	if _, _, ok := n2.issue(mk("brand-new"), ""); ok {
 		t.Error("issue succeeded at the global cap")
 	}
 	clk.Advance(attestNonceTTL + time.Second)
-	if _, _, ok := n2.issue(mk("brand-new")); !ok {
+	if _, _, ok := n2.issue(mk("brand-new"), ""); !ok {
 		t.Error("expired entries must make room")
 	}
 }

@@ -154,14 +154,23 @@ func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
 	if pol.ApprovedFingerprint != "" && v.Fingerprint == pol.ApprovedFingerprint {
 		return true, api.ActivatedByApproval
 	}
-	if pol.ActivationMode != "manual" &&
-		pol.ForceManualGeneration < pol.EnrollmentGeneration &&
-		!pol.DuplicateHostKey &&
-		pol.TrustedHostKey != "" &&
-		v.AttestedHostKey == pol.TrustedHostKey {
+	if autoActivation(pol) && v.AttestedHostKey == pol.TrustedHostKey {
 		return true, api.ActivatedByDeviceKey
 	}
 	return false, ""
+}
+
+// autoActivation reports whether pol lets the trusted device key activate an
+// identity without an admin: a key is trusted, the activation mode is not
+// "manual", the generation is not forced manual and the key is not shared with
+// another device. Everything that admits an identity because of the device key
+// (the window bypass, replacing a pin) uses it too, so an identity is admitted
+// that way only when it would itself become usable.
+func autoActivation(pol api.PolicyEntry) bool {
+	return pol.TrustedHostKey != "" &&
+		!pol.DuplicateHostKey &&
+		pol.ActivationMode != "manual" &&
+		pol.ForceManualGeneration < pol.EnrollmentGeneration
 }
 
 func activated(v identityView, pol api.PolicyEntry) bool {

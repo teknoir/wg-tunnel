@@ -115,9 +115,16 @@ func TestOfflineTrustedPinIsReplacedByTheDeviceKey(t *testing.T) {
 		!slices.Contains(got.VoidedFingerprints, old) || got.Conflicts != 0 {
 		t.Fatalf("pin %+v", got)
 	}
-	// The old identity is voided for good.
+	// The old identity is voided for good. Back with the device key, it is told
+	// to generate a new identity (and is no squatter on the console); without
+	// the key it is a conflict.
 	st, body = r.attestedEnroll(r.dev, dk)
-	wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+	wantReason(t, st, body, http.StatusForbidden, api.ReasonReenroll)
+	if got := r.ids.entry(testNS, testDevice); got.Conflicts != 0 {
+		t.Fatalf("a voided identity back with the device key is no conflict: %+v", got)
+	}
+	st, body = r.enrollWith(r.dev, nil)
+	wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
 	// The new identity gets its session.
 	r.dev = reimaged
 	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
@@ -297,5 +304,131 @@ func TestLegacyHostKeyActivationStaysUsable(t *testing.T) {
 	}
 	if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByHostKey { //nolint:staticcheck // entries from before rev 3
 		t.Fatalf("stored source rewritten: %+v", got)
+	}
+}
+
+// The device key admits and replaces only where it would activate the identity:
+// not in manual mode, not in a generation forced to manual, and not when it is
+// shared with another device.
+func TestDeviceKeyAdmitsAndReplacesOnlyWhereItActivates(t *testing.T) {
+	modes := map[string]func(*api.PolicyEntry){
+		"manual activation": func(p *api.PolicyEntry) { p.ActivationMode = "manual" },
+		"forced manual":     func(p *api.PolicyEntry) { p.ForceManualGeneration = p.EnrollmentGeneration },
+		"shared key":        func(p *api.PolicyEntry) { p.DuplicateHostKey = true },
+	}
+	for name, mode := range modes {
+		t.Run(name+": no pin outside the window", func(t *testing.T) {
+			r := newRig(t)
+			dk := newTestHostKey(t, "ed25519")
+			r.trust(dk)
+			p := r.policy
+			mode(&p)
+			r.setPolicy(p)
+			r.closeWindow()
+			st, body := r.challenge(r.dev)
+			wantReason(t, st, body, http.StatusForbidden, api.ReasonEnrollClosed)
+			if _, ok, _ := r.ids.Get(t.Context(), testNS, testDevice); ok {
+				t.Fatal("pinned an identity that could never activate")
+			}
+		})
+		t.Run(name+": an approved pin of an offline device is not replaced", func(t *testing.T) {
+			r := newRig(t)
+			dk := newTestHostKey(t, "ed25519")
+			r.enrollOK()
+			r.approve()
+			r.trust(dk)
+			p := r.policy
+			mode(&p)
+			r.setPolicy(p)
+			approved := r.ids.entry(testNS, testDevice)
+			r.closeWindow()
+			st, body := r.attestedEnroll(r.otherDevice(t), dk)
+			wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+			got := r.ids.entry(testNS, testDevice)
+			if got.IdentityPublicKey != approved.IdentityPublicKey || got.Replacements != 0 || len(got.VoidedFingerprints) != 0 {
+				t.Fatalf("pin %+v", got)
+			}
+		})
+	}
+}
+
+// A device flagged compromised voids the pin the trusted device key attested.
+// That key stays suspect: after the flag is cleared (a new generation) it
+// activates nothing, outside the window or inside it, until the policy trusts
+// another key.
+func TestKeyOfAFlaggedPinActivatesNothingUntilItIsRotated(t *testing.T) {
+	for _, reason := range []string{api.RevokeCompromised, api.RevokeHealthCheckFailed} {
+		t.Run(reason, func(t *testing.T) {
+			r := newRig(t)
+			k, k2 := newTestHostKey(t, "ed25519"), newTestHostKey(t, "ed25519")
+			r.trust(k)
+			if st, body := r.attestedEnroll(r.dev, k); st != http.StatusCreated {
+				t.Fatalf("%d %s", st, body)
+			}
+			if ok, err := r.ids.Void(t.Context(), testNS, testDevice, reason, r.clock.Now()); !ok || err != nil {
+				t.Fatalf("void: %v %v", ok, err)
+			}
+			// The flag is cleared: a new generation, the same trusted key.
+			r.closeWindow()
+			p := r.policy
+			p.EnrollmentGeneration, p.EnrollmentEpoch = 2, "epoch-2"
+			p.EnrollUntil = r.clock.Now().Add(-time.Minute)
+			r.setPolicy(p)
+
+			thief := r.otherDevice(t)
+			st, body := r.challenge(thief)
+			wantReason(t, st, body, http.StatusForbidden, api.ReasonEnrollClosed)
+			// Inside a window the nonce is issued, but the key attests nothing.
+			p.EnrollUntil = r.clock.Now().Add(time.Minute)
+			r.setPolicy(p)
+			st, body = r.attestedEnroll(thief, k)
+			wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+			if got := r.ids.entry(testNS, testDevice); got.EnrollmentGeneration != 1 || !got.Voided {
+				t.Fatalf("a pin was made for the distrusted key: %+v", got)
+			}
+
+			// The key is rotated; an agent holding both signs with each, and the
+			// new one activates, also after the window closed.
+			p.TrustedHostKey, p.EnrollUntil = k2.fp, r.clock.Now().Add(-time.Minute)
+			r.setPolicy(p)
+			genuine := r.otherDevice(t)
+			ch1, ch2 := r.challengeOK(genuine), r.challengeOK(genuine)
+			st, body = r.enrollWith(genuine, []string{api.CapAttest, api.CapDeviceKey}, signAttestation(t, k, genuine, ch1), signAttestation(t, k2, genuine, ch2))
+			if st != http.StatusCreated {
+				t.Fatalf("enrollment with the rotated key: %d %s", st, body)
+			}
+			if got := r.ids.entry(testNS, testDevice); got.AttestedHostKey != k2.fp || got.ActivatedBy != api.ActivatedByDeviceKey {
+				t.Fatalf("pin %+v", got)
+			}
+		})
+	}
+}
+
+// Whoever holds the enrollment key mints identity keys at will, also outside
+// the window. They never starve the nonces of the pinned identity.
+func TestForeignIdentityKeysDoNotStarveThePinnedOne(t *testing.T) {
+	clk := newFakeClock()
+	n := newNonceStore(clk.Now)
+	mk := func(key string) nonceRec {
+		return nonceRec{ns: "ns", device: "d", epoch: "e", generation: 1, identityKey: key}
+	}
+	pinnedNonce, _, ok := n.issue(mk("pinned"), "pinned")
+	if !ok {
+		t.Fatal("issue")
+	}
+	for i := range 3 * attestNonceDevMax {
+		clk.Advance(time.Millisecond)
+		if _, _, ok := n.issue(mk("foreign-"+time.Duration(i).String()), "pinned"); !ok {
+			t.Fatalf("a foreign key was refused at %d", i)
+		}
+	}
+	if got := n.len(); got > 1+attestNonceForeignMax {
+		t.Fatalf("a device holds %d nonces", got)
+	}
+	if _, ok := n.take(pinnedNonce); !ok {
+		t.Fatal("the pinned identity's nonce was evicted")
+	}
+	if _, _, ok := n.issue(mk("pinned"), "pinned"); !ok {
+		t.Fatal("the pinned identity can no longer ask for a nonce")
 	}
 }

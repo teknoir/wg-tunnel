@@ -28,14 +28,17 @@ import (
 // rev 3).
 
 const (
-	attestNonceTTL     = 5 * time.Minute
-	attestNonceMax     = 4096 // outstanding nonces in total
-	attestNoncePerDev  = 8    // outstanding nonces per (device, identity key); the oldest is dropped
-	attestNonceDevMax  = 64   // outstanding nonces per device over all identity keys
-	maxAttestations    = 4
-	maxAttestationSize = 8 << 10
-	maxAgentCaps       = 8
-	maxAgentCapLen     = 32
+	attestNonceTTL    = 5 * time.Minute
+	attestNonceMax    = 4096 // outstanding nonces in total
+	attestNoncePerDev = 8    // outstanding nonces per (device, identity key); the oldest is dropped
+	attestNonceDevMax = 64   // outstanding nonces per device over all identity keys
+	// attestNonceForeignMax bounds the outstanding nonces of a device's identity
+	// keys other than the pinned one, together.
+	attestNonceForeignMax = 16
+	maxAttestations       = 4
+	maxAttestationSize    = 8 << 10
+	maxAgentCaps          = 8
+	maxAgentCapLen        = 32
 )
 
 type nonceRec struct {
@@ -74,7 +77,14 @@ func (n *nonceStore) sweepLocked(now time.Time) {
 
 // issue stores a new nonce for rec. It fails only when the store is full of
 // unexpired nonces of other devices.
-func (n *nonceStore) issue(rec nonceRec) (string, time.Time, bool) {
+//
+// pinned is the base64 identity key of the device's current pin ("" when there
+// is none). Its nonces are never evicted for the sake of other identity keys,
+// and the other keys of a device together hold at most attestNonceForeignMax
+// nonces (the oldest of them is dropped): whoever holds the (legacy) enrollment
+// key can mint identity keys at will, outside the enrollment window too, and
+// must not starve the device's own identity.
+func (n *nonceStore) issue(rec nonceRec, pinned string) (string, time.Time, bool) {
 	var raw [24]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", time.Time{}, false
@@ -105,6 +115,22 @@ func (n *nonceStore) issue(rec nonceRec) (string, time.Time, bool) {
 			delete(n.m, k)
 		}
 		dev = slices.DeleteFunc(dev, func(k string) bool { _, ok := n.m[k]; return !ok })
+	}
+	// Identity keys other than the pinned one: bounded together, oldest first.
+	if rec.identityKey != pinned {
+		var foreign []string
+		for _, k := range dev {
+			if n.m[k].identityKey != pinned {
+				foreign = append(foreign, k)
+			}
+		}
+		if len(foreign) >= attestNonceForeignMax {
+			byAge(foreign)
+			for _, k := range foreign[:len(foreign)-attestNonceForeignMax+1] {
+				delete(n.m, k)
+			}
+			dev = slices.DeleteFunc(dev, func(k string) bool { _, ok := n.m[k]; return !ok })
+		}
 	}
 	// Device wide: make room by dropping the oldest nonce of the identity key
 	// that holds the most; when every key holds just its newest nonce, refuse.
@@ -206,12 +232,17 @@ func (h *Hub) handleAttestChallenge(ctx context.Context, r *http.Request, _ []by
 		}
 		// A pin of this window exists: attesting is still useful (it can
 		// upgrade the pin or displace an unattested one).
-	} else if !now.Before(pol.EnrollUntil) && !deviceKeyTrusted(pol) {
-		// With a device key trusted, the window does not gate attestation: only
-		// an enrollment attested by that key is admitted outside it (handleEnroll).
+	} else if !now.Before(pol.EnrollUntil) && (!deviceKeyTrusted(pol) || distrustedKey(cur, found, pol) != "") {
+		// With a device key that activates identities trusted, the window does
+		// not gate attestation: only an enrollment attested by that key is
+		// admitted outside it (handleEnroll).
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
-	nonce, exp, ok := h.nonces.issue(nonceRec{ns: ns, device: device, epoch: pol.EnrollmentEpoch, generation: pol.EnrollmentGeneration, identityKey: claims.IdentityKey})
+	pinned := ""
+	if found && !cur.Voided {
+		pinned = cur.IdentityPublicKey
+	}
+	nonce, exp, ok := h.nonces.issue(nonceRec{ns: ns, device: device, epoch: pol.EnrollmentEpoch, generation: pol.EnrollmentGeneration, identityKey: claims.IdentityKey}, pinned)
 	if !ok {
 		return 0, nil, deny(api.ReasonRateLimited, "too many outstanding attestation challenges")
 	}
@@ -228,9 +259,23 @@ type attested struct {
 }
 
 // deviceKeyTrusted reports whether pol names a device key that can activate
-// identities: one is trusted and it is not shared with another device.
-func deviceKeyTrusted(pol api.PolicyEntry) bool {
-	return pol.TrustedHostKey != "" && !pol.DuplicateHostKey
+// identities (autoActivation).
+func deviceKeyTrusted(pol api.PolicyEntry) bool { return autoActivation(pol) }
+
+// distrustedKey is the trusted device key of pol when cur, the stored pin,
+// shows it cannot be trusted: the pin it attested was voided because the device
+// was flagged compromised or failed its health check. Whoever caused the flag
+// may hold that key, so it activates nothing again until the policy trusts
+// another one (device-controller rotates it when it clears the flag). It
+// matters only where the key would activate an identity (autoActivation): in a
+// generation forced to manual or with manual activation an admin decides
+// anyway. "" when there is nothing to distrust.
+func distrustedKey(cur api.IdentityEntry, found bool, pol api.PolicyEntry) string {
+	if found && cur.Voided && autoActivation(pol) && cur.AttestedHostKey == pol.TrustedHostKey &&
+		(cur.VoidedReason == api.RevokeCompromised || cur.VoidedReason == api.RevokeHealthCheckFailed) {
+		return pol.TrustedHostKey
+	}
+	return ""
 }
 
 // byTrustedKey reports whether att was signed by the device key pol trusts.
@@ -242,11 +287,12 @@ func byTrustedKey(att *attested, pol api.PolicyEntry) bool {
 // (nil, nil) for an enrollment that neither advertises api.CapAttest nor sends
 // attestations (a phase-1 agent) while the policy trusts no device key, and
 // ReasonAttestRequired when it does advertise or send them but none is valid,
-// or when the policy has a TrustedHostKey and there is none at all. Every nonce presented is consumed. A valid attestation
+// or when the policy has a TrustedHostKey and there is none at all. Every nonce presented is consumed. An attestation by
+// the key distrust (see distrustedKey) counts for nothing. A valid attestation
 // is a SSHSIG by an ed25519 or RSA (rsa-sha2-512) key over api.AttestStatement
 // with the policy's CURRENT epoch and generation, a nonce this hub issued to
 // this device for this identity key, and the enrolling identity's fingerprint.
-func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry) (*attested, *denial) {
+func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry, distrust string) (*attested, *denial) {
 	advertised := slices.Contains(req.Capabilities, api.CapAttest)
 	if !advertised && len(req.HostKeyAttestations) == 0 {
 		if pol.TrustedHostKey != "" {
@@ -263,6 +309,7 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		return nil, deny(api.ReasonBadRequest, "too many attestations")
 	}
 	var valid []attested
+	skipped := false
 	for _, a := range req.HostKeyAttestations {
 		rec, ok := h.nonces.take(a.Nonce)
 		if !ok || rec.ns != ns || rec.device != device ||
@@ -279,7 +326,14 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		if err != nil {
 			continue
 		}
+		if hk := ssh.FingerprintSHA256(pub); distrust != "" && hk == distrust {
+			skipped = true // consumed, but it attests nothing (distrustedKey)
+			continue
+		}
 		valid = append(valid, attested{hostKey: ssh.FingerprintSHA256(pub), keyType: pub.Type()})
+	}
+	if len(valid) == 0 && skipped {
+		return nil, deny(api.ReasonAttestRequired, "the trusted device key was in use when this device was flagged; the device key must be rotated before the device can enroll again")
 	}
 	if len(valid) == 0 {
 		return nil, deny(api.ReasonAttestRequired, "this agent supports attestation, but the enrollment carries no valid attestation")

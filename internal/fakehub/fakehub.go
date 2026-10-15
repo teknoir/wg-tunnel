@@ -9,6 +9,7 @@ package fakehub
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -89,6 +90,12 @@ type device struct {
 	seenJTI    map[string]bool
 	enrolls    int
 	att        *attestState
+	// trusted is the device key the hub trusts ("" = none; see SetTrustedKey).
+	trusted string
+	// voided are the identities a replacement voided; takeover lets an
+	// attested enrollment replace the pin (see ReplaceIdentity).
+	voided   []ed25519.PublicKey
+	takeover bool
 }
 
 type sess struct {
@@ -224,6 +231,30 @@ func (h *Hub) ResetEnrollment(ns, name string) {
 	d := h.devices[ns+"/"+name]
 	d.generation++
 	d.spec.EnrollOpen = true
+}
+
+// SetTrustedKey sets the device key the hub trusts (SHA256 fingerprint, "" =
+// none). With PendingUntilAttested a pin is usable only when the key it was
+// last attested with is the trusted one; an enrollment attested by several
+// keys records the trusted one, else the first.
+func (h *Hub) SetTrustedKey(ns, name, fp string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.devices[ns+"/"+name].trusted = fp
+}
+
+// ReplaceIdentity plays a replacement of the device's pin while the device
+// was away: the pinned identity is voided and another one pinned (the agent's
+// session requests are then "unauthenticated" and enrolling its identity is
+// told to start over). From now on an attested enrollment replaces the pin.
+func (h *Hub) ReplaceIdentity(ns, name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	d := h.devices[ns+"/"+name]
+	other, _, _ := ed25519.GenerateKey(rand.Reader) // the public key
+	d.voided = append(d.voided, d.pinned)
+	d.pinned = other
+	d.takeover = true
 }
 
 // SetEnrollOpen opens or closes the enrollment window.
@@ -419,9 +450,23 @@ func (h *Hub) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, reason)
 		return
 	}
+	for _, v := range d.voided {
+		if v.Equal(idk) { // like the real hub: told to start over by an agent that proves the device key
+			if len(req.HostKeyAttestations) > 0 {
+				writeErr(w, 403, api.ReasonReenroll)
+			} else {
+				writeErr(w, 409, api.ReasonEnrollConflict)
+			}
+			return
+		}
+	}
 	status := 201
 	if d.pinned != nil && d.pinnedGen == d.generation {
-		if !d.pinned.Equal(idk) {
+		if !d.pinned.Equal(idk) && d.takeover && len(req.HostKeyAttestations) > 0 {
+			d.voided = append(d.voided, d.pinned)
+			d.pinned = nil
+		}
+		if d.pinned != nil && !d.pinned.Equal(idk) {
 			writeErr(w, 409, api.ReasonEnrollConflict)
 			return
 		}
@@ -603,7 +648,7 @@ func (h *Hub) authDevice(d *device, tok, ns, name, wgPub string) (int, string) {
 	if d.pinnedGen < d.generation {
 		return 403, api.ReasonReenroll
 	}
-	if h.opts.Attest && h.opts.PendingUntilAttested && d.attestSt().last.HostKey == "" {
+	if last := d.attestSt().last.HostKey; h.opts.Attest && h.opts.PendingUntilAttested && (last == "" || d.trusted != "" && last != d.trusted) {
 		return 403, api.ReasonPendingApproval
 	}
 	if d.seenJTI[c.ID] {

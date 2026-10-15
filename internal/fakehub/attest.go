@@ -24,7 +24,7 @@ type fakeNonce struct{ ns, name, idk string }
 
 // Attested is what the fake hub recorded for a device's last enrollment.
 type Attested struct {
-	// HostKey is the SHA256 fingerprint of the first key that signed ("" =
+	// HostKey is the SHA256 fingerprint of the trusted key if it signed, else the first key that signed ("" =
 	// none), KeyType its type; Keys lists every key that signed (a device
 	// holding two device keys signs with both).
 	HostKey string
@@ -132,10 +132,11 @@ func (h *Hub) verifyEnrollAttest(d *device, ns, name string, idk ed25519.PublicK
 		if err != nil {
 			continue
 		}
-		if got.HostKey == "" {
-			got.HostKey, got.KeyType = ssh.FingerprintSHA256(pub), pub.Type()
+		fp := ssh.FingerprintSHA256(pub)
+		if got.HostKey == "" || fp == d.trusted && got.HostKey != d.trusted {
+			got.HostKey, got.KeyType = fp, pub.Type()
 		}
-		got.Keys = append(got.Keys, ssh.FingerprintSHA256(pub))
+		got.Keys = append(got.Keys, fp)
 	}
 	if got.HostKey == "" {
 		return api.ReasonAttestRequired

@@ -224,7 +224,10 @@ identity that the device key attested activates by itself.
   later, an approved pin records a first key, and a rotation (a new trusted key
   and a new envelope) activates the identity again. A pending identity is also
   attested again at start and every `ReattestInterval` (60 s) as long as the
-  set was not attested.
+  hub holds it back, also when the set is unchanged: the hub records ONE
+  attestation per pin (the key trusted at that moment), so a pin that fell back to
+  pending because trust moved to another key the agent holds is attested again
+  until the hub records that key.
 - The hub verifies each attestation against the CURRENT epoch and generation,
   the enrolling identity and a nonce it issued to that identity key, and records
   `AttestedHostKey` (`SHA256:<b64>`; the name is kept) on the pin, preferring the
@@ -235,14 +238,28 @@ identity that the device key attested activates by itself.
   an unattested identity that an admin might approve by hand. An identity pinned
   before the key was trusted can still be approved, activated by re-attesting, or
   displaced.
-- **Window bypass.** With a device key trusted (and not shared with another
-  device) the hub issues attestation nonces outside the enrollment window and
-  admits an enrollment attested by that key without one; an unattested or
-  differently attested enrollment is still refused (`enroll_closed`).
+- **Window bypass.** With a device key trusted that activates identities (not
+  shared with another device, `activationMode` not `manual`, the generation not
+  forced manual) the hub issues attestation nonces outside the enrollment window
+  and admits an enrollment attested by that key without one; an unattested or
+  differently attested enrollment is still refused (`enroll_closed`). Pin
+  displacement and replacement below follow the same rule: the device key admits
+  an identity only where the identity would itself become usable.
+- **A flagged device's key is not trusted again.** When the pin a trusted key
+  attested was voided because the device was flagged compromised or failed its
+  health check, that key attests nothing for later generations (the enrollment is
+  refused with `attest_required`, no nonce is issued outside the window) until
+  the policy trusts another key (in a generation forced to manual or with manual
+  activation an admin decides anyway, so nothing changes there). device-controller rotates the key when it clears
+  the flag; a hub that did not wait for that would let whoever caused the flag
+  enroll in the gap.
 - **Budgets**: enrollment and challenge rate limits, replay partitions and the
   outstanding-nonce caps (8) are per (device, identity key), with a generous
   per-device bucket (and 64 nonces) behind them, so a squatter holding the
-  enrollment key drains its own budget and cannot starve the real device. An
+  enrollment key drains its own budget and cannot starve the real device. The
+  identity keys of a device other than its pinned one hold at most 16 nonces
+  together (the oldest is dropped), so identity keys minted at will, also outside
+  the window, cannot crowd out the pinned identity. An
   unattested enrollment of another identity than the pinned one is counted as a
   conflict even though it is refused.
 - **Activation rule** (`identityUsable`, one function for session create, renew
@@ -263,7 +280,11 @@ identity that the device key attested activates by itself.
   device key proves it is the same device. The old fingerprint is voided,
   `replacements`, `lastReplacedAt` and `lastReplacedFingerprint` are recorded and
   the new identity activates. While the device is online the same enrollment is
-  today's `enroll_conflict`.
+  today's `enroll_conflict`. A voided identity that comes back (the pod moved
+  from node A to B and back) and proves the trusted device key is answered
+  `reenroll`, not `enroll_conflict`: the agent generates a new identity and
+  enrolls it (and the console shows no squatting). Without the key it stays a
+  conflict.
 - The live status (`api.LiveIdentity`) reports `activatedBy`, `activatedAt`,
   `replacements` and `lastReplacedAt`.
 

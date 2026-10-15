@@ -221,3 +221,83 @@ func TestRotatedDeviceKeyActivatesTheIdentityAgain(t *testing.T) {
 		})
 	}
 }
+
+// The device holds the bootstrap key and a delivered one. The hub records the
+// key it trusts when the delivered key arrives; then trust moves to the other
+// key. The session ends, the identity is pending and the agent attests it
+// again (the hub keeps one attestation per pin) until the new key is recorded.
+func TestTrustMovingToAnotherHeldKeyActivatesTheIdentityAgain(t *testing.T) {
+	t.Parallel()
+	r := e2erig.New(t, e2erig.Options{ManualApproval: true})
+	boot := r.InstallBootstrapDeviceKey()
+	r.TrustDeviceKey(boot)
+	r.StartAgent()
+	r.WaitDeviceUp(1)
+	identityFP := r.AgentFingerprint()
+
+	delivered := r.DeliverDeviceKey("serial-2")
+	// The agent attests with both keys; the hub still trusts, and records, the bootstrap key.
+	time.Sleep(time.Second)
+	if pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName); pin.AttestedHostKey != boot {
+		t.Fatalf("pin %+v, want the trusted bootstrap key %s", pin, boot)
+	}
+	r.TrustDeviceKey(delivered)
+	e2erig.Eventually(t, 30*time.Second, "the identity to be active by the delivered key", func() bool {
+		pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName)
+		d, _ := r.Hub.SessionCounts()
+		return pin.AttestedHostKey == delivered && d == 1
+	})
+	if pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName); pin.Fingerprint != identityFP || pin.Replacements != 0 {
+		t.Fatalf("the identity changed: %+v", pin)
+	}
+	if err := e2erig.EchoVia(r.MustClient(e2erig.AliceEmail), "moved", 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.AssertLogHygiene()
+}
+
+// A device whose pin was replaced while it was away (another node, a re-image)
+// comes back with its old identity. The hub voided that identity; the device,
+// which proves itself with the device key, starts over with a new one instead
+// of retrying a refused enrollment for ever, and is no squatter on the console.
+func TestReplacedIdentityComesBackAndStartsOver(t *testing.T) {
+	t.Parallel()
+	r := e2erig.New(t, e2erig.Options{ManualApproval: true})
+	fp := r.InstallBootstrapDeviceKey()
+	r.TrustDeviceKey(fp)
+	offline := func(ag *e2erig.Agent) {
+		t.Helper()
+		if err := ag.Stop(); err != nil {
+			t.Fatal(err)
+		}
+		e2erig.Eventually(t, 10*time.Second, "the device to go offline", func() bool { d, _ := r.Hub.SessionCounts(); return d == 0 })
+	}
+	ag := r.StartAgent()
+	r.WaitDeviceUp(1)
+	first, firstDir := r.AgentFingerprint(), r.IdentityDir
+	offline(ag)
+
+	// The pod runs on another node with state of its own and replaces the pin.
+	r.IdentityDir = t.TempDir() + "/node-b"
+	r.CloseEnrollmentWindow()
+	ag = r.StartAgent()
+	r.WaitDeviceUp(2)
+	second := r.AgentFingerprint()
+	offline(ag)
+
+	// ... and moves back to the first node.
+	r.IdentityDir = firstDir
+	r.StartAgent()
+	r.WaitDeviceUp(3)
+	third := r.AgentFingerprint()
+	pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName)
+	if third == first || third == second || pin.Fingerprint != third || pin.Replacements != 2 || pin.Conflicts != 0 ||
+		!slices.Contains(pin.VoidedFingerprints, first) || !slices.Contains(pin.VoidedFingerprints, second) ||
+		pin.ActivatedBy != api.ActivatedByDeviceKey {
+		t.Fatalf("pin %+v, identities %s %s %s", pin, first, second, third)
+	}
+	if err := e2erig.EchoVia(r.MustClient(e2erig.AliceEmail), "back", 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	r.AssertLogHygiene()
+}

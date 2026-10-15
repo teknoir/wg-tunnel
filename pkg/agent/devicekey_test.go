@@ -351,24 +351,24 @@ func TestShouldReattestOnAChangedKeySetAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("re-attesting without a key")
 	}
 	d.bootstrapKey(t)
-	if !a.shouldReattest() {
+	if !a.shouldReattest(false) {
 		t.Error("a new key must be attested")
 	}
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("the interval is not honoured for an unchanged set")
 	}
 	d.bootstrapKey(t) // another key
-	if !a.shouldReattest() {
+	if !a.shouldReattest(false) {
 		t.Error("a changed set must be attested at once")
 	}
 	a.mu.Lock()
 	a.attestedSet = a.currentAttestSet()
 	a.mu.Unlock()
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("re-attesting a set that was attested")
 	}
 }
@@ -402,5 +402,88 @@ func TestStateDirIsPrivateWithoutAnAttestor(t *testing.T) {
 	eventually(t, 20*time.Second, "enrollment", func() bool { return len(r.hub.SessionIDs(api.KindDevice)) == 1 })
 	if fi, _ := os.Stat(r.idDir); fi.Mode().Perm() != 0o700 {
 		t.Errorf("state dir mode %v, want 0700", fi.Mode().Perm())
+	}
+}
+
+// An identity the hub holds back (pending) is attested again although the key
+// set did not change: the hub records one attestation per pin, and the key it
+// preferred then may not be the one it trusts now.
+func TestPendingIdentityIsAttestedAgainWithAnUnchangedKeySet(t *testing.T) {
+	d := newDKRig(t, fakehub.Options{})
+	cfg := d.config()
+	cfg.ReattestInterval = time.Hour
+	a, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.bootstrapKey(t)
+	if !a.shouldReattest(true) {
+		t.Fatal("a new key must be attested")
+	}
+	a.mu.Lock()
+	a.attestedSet = a.currentAttestSet()
+	a.mu.Unlock()
+	if a.shouldReattest(false) {
+		t.Error("the watcher re-attested a set that was attested")
+	}
+	if a.shouldReattest(true) {
+		t.Error("the interval is not honoured while pending")
+	}
+	a.mu.Lock()
+	a.lastReattest = time.Now().Add(-2 * time.Hour)
+	a.mu.Unlock()
+	if !a.shouldReattest(true) {
+		t.Error("a pending identity must be attested again after the interval")
+	}
+}
+
+// The agent holds two device keys, the hub recorded the one it trusted at the
+// time and then trusts the other: the session ends, the identity is pending
+// and the agent attests it again until the hub records the right key.
+func TestTrustMovingToAnotherHeldKeyActivatesTheIdentityAgain(t *testing.T) {
+	d := newDKRig(t, fakehub.Options{PendingUntilAttested: true, RenewAfter: time.Second, TTL: 2 * time.Second})
+	boot := d.bootstrapKey(t)
+	d.hub.SetTrustedKey(testNS, testDevice, boot)
+	_, stop := d.start(d.config())
+	defer func() { _ = stop() }()
+	eventually(t, 20*time.Second, "activation by the bootstrap key", func() bool {
+		return d.hub.Attestation(testNS, testDevice).HostKey == boot && len(d.hub.SessionIDs(api.KindDevice)) == 1
+	})
+	// The delivered key arrives before the hub trusts it: the hub still records the bootstrap key.
+	delivered := d.deliver(t, "serial-2")
+	eventually(t, 20*time.Second, "attestation with both keys", func() bool {
+		return slices.Equal(d.hub.Attestation(testNS, testDevice).Keys, []string{boot, delivered})
+	})
+	if got := d.hub.Attestation(testNS, testDevice).HostKey; got != boot {
+		t.Fatalf("the hub recorded %s, want the trusted %s", got, boot)
+	}
+	// Trust moves; the enforcer ends the session.
+	d.hub.SetTrustedKey(testNS, testDevice, delivered)
+	for _, id := range d.hub.SessionIDs(api.KindDevice) {
+		d.hub.KillSession(id)
+	}
+	eventually(t, 30*time.Second, "activation by the delivered key", func() bool {
+		return d.hub.Attestation(testNS, testDevice).HostKey == delivered && len(d.hub.SessionIDs(api.KindDevice)) == 1
+	})
+}
+
+// The hub replaced the device's pin while it was away and voided the identity.
+// An agent holding the device key starts over with a new identity.
+func TestVoidedIdentityIsRotatedWhenEnrollingIt(t *testing.T) {
+	d := newDKRig(t, fakehub.Options{RenewAfter: time.Second, TTL: 2 * time.Second})
+	d.bootstrapKey(t)
+	_, stop := d.start(d.config())
+	defer func() { _ = stop() }()
+	eventually(t, 20*time.Second, "session", func() bool { return len(d.hub.SessionIDs(api.KindDevice)) == 1 })
+	before := d.hub.Enrollments(testNS, testDevice)
+	d.hub.ReplaceIdentity(testNS, testDevice)
+	for _, id := range d.hub.SessionIDs(api.KindDevice) {
+		d.hub.KillSession(id)
+	}
+	eventually(t, 30*time.Second, "a new identity and its session", func() bool {
+		return d.hub.Enrollments(testNS, testDevice) > before && len(d.hub.SessionIDs(api.KindDevice)) == 1
+	})
+	if !strings.Contains(d.logs.String(), "the hub voided this device identity") {
+		t.Error("no log line about the voided identity")
 	}
 }

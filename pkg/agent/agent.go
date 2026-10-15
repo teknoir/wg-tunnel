@@ -138,6 +138,7 @@ var hints = map[string]string{
 	api.ReasonSessionLimit:    "the hub's session limit is reached",
 	api.ReasonPosture:         "the hub rejected this agent's version",
 	api.ReasonPendingApproval: "an admin must approve this device identity (fingerprint above) in the Teknoir UI",
+	api.ReasonAttestRequired:  "a device key is trusted for this device and this agent holds none it can attest with; an admin can rotate the device key in the Teknoir UI to deliver one",
 }
 
 func (a *Agent) logFailure(err error, wait time.Duration) {
@@ -215,7 +216,7 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 			// records the attestation, and activates the pin when the device
 			// key is the one the policy trusts. Slow timer unless the keys
 			// changed; no-op without a device key or attestor.
-			if enrolled || !a.shouldReattest() {
+			if enrolled || !a.shouldReattest(true) {
 				return 0, cerr
 			}
 			a.log.Info("the identity is waiting for approval; attesting it again")
@@ -231,14 +232,7 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 				return 0, fmt.Errorf("hub asked to re-enroll right after enrollment: %w", cerr)
 			}
 			a.log.Info("enrollment was reset; generating a new identity")
-			rotated, rerr := identity.Rotate(a.cfg.IdentityDir)
-			if rerr != nil {
-				return 0, &fatalError{fmt.Errorf("rotating identity key: %w", rerr)}
-			}
-			priv = rotated
-			a.curID.Store(&priv)
-			a.logFingerprint(priv)
-			if err := a.publishIdentityPub(priv); err != nil {
+			if priv, err = a.rotateIdentity(); err != nil {
 				return 0, err
 			}
 		default:
@@ -247,25 +241,55 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		if enrolled {
 			return 0, fmt.Errorf("still not enrolled after enrollment: %w", cerr)
 		}
-		if eerr := a.enroll(ctx, priv); eerr != nil {
+		eerr := a.enroll(ctx, priv)
+		if wgclient.ReasonOf(eerr) == api.ReasonReenroll {
+			// The hub voided this identity (a replacement of the device's pin
+			// while it was offline, a flag) and, because the enrollment was
+			// attested by the trusted device key, tells the device itself to
+			// start over with a new identity.
+			a.log.Info("the hub voided this device identity; generating a new one")
+			if priv, err = a.rotateIdentity(); err != nil {
+				return 0, err
+			}
+			eerr = a.enroll(ctx, priv)
+		}
+		if eerr != nil {
 			return 0, eerr
 		}
 		enrolled = true
 	}
 }
 
+// rotateIdentity replaces the identity key with a new one and makes it the
+// identity of the current attempt.
+func (a *Agent) rotateIdentity() (ed25519.PrivateKey, error) {
+	priv, err := identity.Rotate(a.cfg.IdentityDir)
+	if err != nil {
+		return nil, &fatalError{fmt.Errorf("rotating identity key: %w", err)}
+	}
+	a.curID.Store(&priv)
+	a.logFingerprint(priv)
+	if err := a.publishIdentityPub(priv); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
 // shouldReattest reports whether the identity should be attested again now:
 // there are keys to attest with and this process has not delivered an
 // attestation made with exactly this set of keys. A changed set is attested at
-// once, an unchanged one at most every Config.ReattestInterval.
-func (a *Agent) shouldReattest() bool {
+// once. An unchanged one is attested only while the hub still holds the
+// identity back (pending: the hub records one attestation per pin, and the key
+// it preferred then may not be the one it trusts now), at most every
+// Config.ReattestInterval.
+func (a *Agent) shouldReattest(pending bool) bool {
 	set := a.currentAttestSet()
 	if set == "" {
 		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.attestedSet == set || (set == a.triedSet && time.Since(a.lastReattest) < a.cfg.ReattestInterval) {
+	if (a.attestedSet == set && !pending) || (set == a.triedSet && time.Since(a.lastReattest) < a.cfg.ReattestInterval) {
 		return false
 	}
 	a.triedSet, a.lastReattest = set, time.Now()
@@ -287,13 +311,19 @@ func (a *Agent) watchDeviceKeys(ctx context.Context) {
 		case <-t.C:
 		}
 		priv := a.curID.Load()
-		if priv == nil || len(a.deviceKeys()) == 0 || !a.shouldReattest() {
+		if priv == nil || len(a.deviceKeys()) == 0 || !a.shouldReattest(false) {
 			continue
 		}
 		a.log.Info("the device keys changed; attesting the device identity again")
 		if err := a.enroll(ctx, *priv); err != nil {
 			if ctx.Err() == nil {
 				a.log.Warn("attesting the device identity again failed", "error", err.Error())
+			}
+			if wgclient.ReasonOf(err) == api.ReasonReenroll { // the session loop rotates the identity
+				select {
+				case a.wake <- struct{}{}:
+				default:
+				}
 			}
 			continue
 		}

@@ -303,20 +303,23 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	pol = eff.Policy
 	fingerprint := identity.Fingerprint(idPub)
 
+	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
+	if err != nil {
+		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
+		return 0, nil, denyUnavailable("identity store unavailable")
+	}
+
 	// Device-key attestation (api.CapAttest). An agent that advertises it must
-	// present a valid one; a phase-1 agent enrolls as before.
-	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol)
+	// present a valid one; a phase-1 agent enrolls as before. The trusted key
+	// counts for nothing while the pin it attested is void for a flag
+	// (distrustedKey).
+	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol, distrustedKey(cur, found, pol))
 	if den != nil {
 		h.recordForeignAttemptConflict(ctx, ns, device, pol, req.IdentityPublicKey)
 		return 0, nil, den
 	}
 	caps := sanitizeCaps(req.Capabilities)
 
-	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
-	if err != nil {
-		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
-		return 0, nil, denyUnavailable("identity store unavailable")
-	}
 	if found && sameEpoch(cur, pol) {
 		// First wins per enrollment epoch.
 		if cur.Voided {
@@ -338,7 +341,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 			// holds the enrollment key but not the device), or a trusted pin of
 			// a device that is offline (it lost its identity).
 			if IsVoidedFingerprint(cur, fingerprint) {
-				return 0, nil, h.voidedEnrollDenial(ctx, d)
+				return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 			}
 			entry := newPinEntry(ns, device, idPub, fingerprint, pol, h.now(), att, caps)
 			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att, replace)
@@ -371,11 +374,11 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	// A voided identity is never re-admitted, whatever the epoch: a new window
 	// needs a NEW key (sticky void).
 	if found && IsVoidedFingerprint(cur, fingerprint) {
-		return 0, nil, h.voidedEnrollDenial(ctx, d)
+		return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 	}
 	got, created, err := h.deps.Identity.Pin(ctx, newPinEntry(ns, device, idPub, fingerprint, pol, now, att, caps))
 	if errors.Is(err, ErrFingerprintVoided) {
-		return 0, nil, h.voidedEnrollDenial(ctx, d)
+		return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 	}
 	if err != nil {
 		h.log.Error("pinning identity failed", "ns", ns, "device", device, "err", err)
@@ -463,8 +466,15 @@ func (h *Hub) endStaleDeviceSession(k devKey, fingerprint string) {
 }
 
 // voidedEnrollDenial answers an enrollment with an identity that was voided
-// before. It is recorded as a conflict, like any other rejected key.
-func (h *Hub) voidedEnrollDenial(ctx context.Context, d *dctx) *denial {
+// before. An agent that proves the device key the policy trusts is told to
+// generate a new identity (ReasonReenroll): it is the device itself, back with
+// an identity a replacement or a flag voided (a pod that moved to another node
+// and back), not a squatter. Anything else is recorded as a conflict, like any
+// other rejected key.
+func (h *Hub) voidedEnrollDenial(ctx context.Context, d *dctx, att *attested, pol api.PolicyEntry) *denial {
+	if att != nil && pol.TrustedHostKey != "" && !pol.DuplicateHostKey && att.hostKey == pol.TrustedHostKey {
+		return deny(api.ReasonReenroll, "this identity was voided; generate a new identity and enroll it")
+	}
 	if err := h.deps.Identity.RecordConflict(ctx, d.ns, d.device, h.now()); err != nil {
 		h.log.Error("recording enrollment conflict failed", "ns", d.ns, "device", d.device, "err", err)
 	}
