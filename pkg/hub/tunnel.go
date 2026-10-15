@@ -15,6 +15,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
+	"github.com/teknoir/wg-tunnel/internal/wgdev"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
@@ -63,16 +64,16 @@ func NewWGTunnel(listenPort int, logger *slog.Logger) (Tunnel, error) {
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), wgLog)
 	cfg := fmt.Sprintf("private_key=%s\nlisten_port=%d\n", priv.Hex(), listenPort)
 	if err := dev.IpcSet(cfg); err != nil {
-		dev.Close()
+		wgdev.Close(dev)
 		return nil, fmt.Errorf("hub: configuring wireguard: %w", err)
 	}
 	if err := dev.Up(); err != nil {
-		dev.Close()
+		wgdev.Close(dev)
 		return nil, fmt.Errorf("hub: bringing wireguard up: %w", err)
 	}
 	port, err := listenPortOf(dev)
 	if err != nil {
-		dev.Close()
+		wgdev.Close(dev)
 		return nil, err
 	}
 	return &wgTunnel{dev: dev, tnet: tnet, pub: pub, port: port}, nil
@@ -122,6 +123,6 @@ func (t *wgTunnel) Close() error {
 	if t.closed.Swap(true) {
 		return nil
 	}
-	t.dev.Close()
+	wgdev.Close(t.dev)
 	return nil
 }
