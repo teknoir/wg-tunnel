@@ -47,6 +47,7 @@ func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantSto
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.ControlServicesPath, c.handle(c.services))
 	mux.HandleFunc(api.ControlGrantsPath, c.handle(c.applyGrants))
+	c.registerK3s(mux)
 	mux.HandleFunc(api.ControlRevokePath, c.handleRevoke)
 	c.srv = &http.Server{
 		Handler:           mux,

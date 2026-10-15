@@ -131,6 +131,8 @@ must send that token; until it does, every status call is refused.
   reported on its last renewal (`api.RenewRequest.Path`), `hub` by default.
   A gateway session lists the users with an open connection, comma separated.
   Unknown device: 404.
+- `GET /v1/status/devices/<ns>/<device>/k3s-services` returns `api.K3sServiceList`
+  for the console's "Add service" dialog; see "k3s Service discovery".
 - `POST /v1/admin/sessions/<id>/end` ends a client session like a revocation
   (streams closed, peer removed after the flush grace) and logs a decision
   `op=admin_end` with the requester from the header `api.StatusRequesterHeader` (`X-Ztna-Requester`, an email,
@@ -378,6 +380,58 @@ every pair. The `GrantHooks` install and remove the plane-B peers (see below).
 Tests that need an external service on a loopback listener use the
 `Config.AllowTarget` test hook (never settable from the environment); the e2e rig
 lets exactly its echo servers through.
+
+### k3s Service discovery
+
+The apps of a Robot (a k3s HelmChart, a GitOps app, anything applied on the
+device) create their Services on the device, so the cloud cannot read them from
+the Device manifest. The console's "Add service" dialog therefore asks for
+them on demand, through the agent. The list is informational: a service that
+is picked is still validated as an `internal` ServiceSpec by device-controller,
+Backstage and the agent on every dial (see "Services (phase 2)").
+
+```
+Backstage -- GET /v1/status/devices/<ns>/<device>/k3s-services --> hub (8082)
+hub       -- GET api.ControlK3sServicesPath over plane A --------> agent
+agent     -- GET /api/v1/services?limit=500 ---------------------> Kubernetes API
+```
+
+- **Agent** (`k3s-discovery-v1`, `pkg/agent/k3sdiscovery.go`): the control
+  listener answers `GET api.ControlK3sServicesPath` with an `api.K3sServiceList`,
+  for the hub's overlay address only (same check as the other control routes).
+  It lists Services cluster-wide with its own ServiceAccount, using plain
+  `net/http` and the in-cluster configuration (`KUBERNETES_SERVICE_HOST`,
+  `KUBERNETES_SERVICE_PORT`, the token at
+  `/var/run/secrets/kubernetes.io/serviceaccount/token`, read on every call, and
+  the CA `ca.crt` next to it). One page of at most `api.MaxK3sServices` (500)
+  Services; `truncated` is set when the API server has more. Only metadata is
+  returned: namespace, name, type, clusterIP and the ports (name, port,
+  protocol, appProtocol; at most `api.MaxK3sServicePorts` (32) per Service), never
+  annotations, labels, selectors or Endpoints. The list is sorted by namespace and
+  name, cached for 10 s (concurrent callers share one request) and the call has a
+  5 s timeout. The ServiceAccount needs `get` and `list` on `services`
+  (cluster-wide); device-controller ships that RBAC with the agent. Without a
+  token, or when the API server answers 401/403, the agent still answers 200,
+  with `error` set ("the agent has no permission to list Services yet") and an
+  empty list; the same holds when it runs outside a cluster or cannot reach the
+  API server.
+- **Hub** (`pkg/hub/k3sdiscovery.go`): the route is on the status listener and
+  authenticated and authorized exactly like `GET /v1/status/devices/<ns>/<device>`
+  (TokenReview for `api.StatusTokenAudience`, username must be `BACKSTAGE_SA`;
+  unknown device 404). Each call is logged as a decision `op=k3s_services` with the
+  requester from `X-Ztna-Requester` and the Backstage identity. A device that
+  cannot answer is still a 200 with `error` and an empty list: "the device is
+  offline" (no live session), "the device agent is too old to list services" (no
+  `k3s-discovery-v1`), "the device did not answer in time" (5 s) or "the device
+  agent gave an answer the hub could not accept" (non-200, unreadable JSON or an
+  answer over 4 MiB). The agent is a device and is not trusted: the hub checks the
+  list again before it leaves (at most 500 Services of at most 32 ports; Services
+  with an empty, oversized or control-character name are dropped, as are ports
+  outside 1..65535; type, protocol and clusterIP are reduced to known values and
+  valid addresses; the agent's `error` text is stripped of control characters and
+  cut to 300 bytes), and sets `observedAt` from its own clock, since device
+  clocks are not trusted. Backstage should show `error` as is and treat the list
+  as a convenience, not as permission.
 
 ### Peer-to-peer (plane B, "P2P-lite")
 
