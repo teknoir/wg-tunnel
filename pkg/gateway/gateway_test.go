@@ -600,12 +600,23 @@ func TestHubRefusalsBecomeHTTPStatuses(t *testing.T) {
 		}
 	}
 	r.do("GET", "/", alice, "web", nil, nil) // create the session
-	for reason, want := range map[string]int{
-		api.ReasonForbidden:     403,
-		api.ReasonDeviceOffline: 503,
-		api.ReasonServiceDenied: 403,
-		api.ReasonSessionLimit:  503,
-		api.ReasonInternal:      502,
+	type page struct {
+		status int
+		title  string
+	}
+	for reason, want := range map[string]page{
+		api.ReasonForbidden:       {403, "No access"},
+		api.ReasonDeviceOffline:   {503, "Device offline"},
+		api.ReasonDeviceRevoked:   {403, "Access blocked"},
+		api.ReasonDeviceDisabled:  {403, "Access disabled"},
+		api.ReasonPendingApproval: {503, "Device not ready"},
+		api.ReasonReenroll:        {503, "Device reconnecting"},
+		// A refused target is not "access switched off" (seen on staging:
+		// a virtual device's agent refusing ClusterIPs outside its networks).
+		api.ReasonServiceDenied:  {403, "Service refused"},
+		api.ReasonPortNotAllowed: {403, "Service refused"},
+		api.ReasonSessionLimit:   {503, "Busy"},
+		api.ReasonInternal:       {502, "Device unreachable"},
 	} {
 		dial(reason)
 		r.gw.pool.mu.Lock()
@@ -619,14 +630,18 @@ func TestHubRefusalsBecomeHTTPStatuses(t *testing.T) {
 		}
 		r.gw.pool.mu.Unlock()
 		resp := r.do("GET", "/", alice, "web", map[string]string{"Accept": "text/html"}, nil)
-		if resp.StatusCode != want {
-			t.Errorf("reason %s: status %d, want %d", reason, resp.StatusCode, want)
+		if resp.StatusCode != want.status {
+			t.Errorf("reason %s: status %d, want %d", reason, resp.StatusCode, want.status)
 		}
 		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 			t.Errorf("reason %s: content type %q", reason, ct)
 		}
-		if b := readBody(t, resp); strings.Contains(b, reason) {
+		b := readBody(t, resp)
+		if strings.Contains(b, reason) {
 			t.Errorf("internal reason code leaked into the page: %q", b)
+		}
+		if !strings.Contains(b, want.title) {
+			t.Errorf("reason %s: page does not say %q: %q", reason, want.title, b)
 		}
 	}
 }

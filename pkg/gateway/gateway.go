@@ -417,9 +417,18 @@ func (g *Gateway) fail(w http.ResponseWriter, r *http.Request, err error) {
 	switch reason {
 	case api.ReasonForbidden:
 		status, title, msg = http.StatusForbidden, "No access", "Your account may not open this device."
-	case api.ReasonDeviceRevoked, api.ReasonDeviceDisabled, api.ReasonPendingApproval, api.ReasonNotEnrolled,
-		api.ReasonReenroll, api.ReasonServiceDenied, api.ReasonPortNotAllowed:
+	case api.ReasonDeviceRevoked:
+		status, title, msg = http.StatusForbidden, "Access blocked", "An admin has blocked remote access to this device."
+	case api.ReasonDeviceDisabled:
 		status, title, msg = http.StatusForbidden, "Access disabled", "Remote access to this device is switched off."
+	case api.ReasonPendingApproval, api.ReasonNotEnrolled:
+		status, title, msg = http.StatusServiceUnavailable, "Device not ready", "The device's identity is not active yet. Try again in a moment."
+		w.Header().Set("Retry-After", "10")
+	case api.ReasonReenroll:
+		status, title, msg = http.StatusServiceUnavailable, "Device reconnecting", "The device is reconnecting. Try again in a moment."
+		w.Header().Set("Retry-After", "5")
+	case api.ReasonServiceDenied, api.ReasonPortNotAllowed:
+		status, title, msg = http.StatusForbidden, "Service refused", "The device refused to connect to this service's address. An admin can check the service in the device's WireGuard console."
 	case api.ReasonServiceUnknown:
 		status, title, msg = http.StatusNotFound, "Not found", "This service is not published on the device any more."
 	case api.ReasonDeviceOffline:
