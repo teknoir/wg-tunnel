@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
+	"github.com/teknoir/wg-tunnel/pkg/wgclient"
 )
 
 const maxControlBody = 64 << 10
@@ -30,6 +31,15 @@ type controlServer struct {
 	planeB  *planeB
 	hubAddr netip.Addr
 	srv     *http.Server
+	// revoke ends the current device session on the hub's notice (nil: the
+	// control server has no session to end and answers every notice 409).
+	revoke *revokeTarget
+}
+
+// revokeTarget is the device session a RevokeNotice may end.
+type revokeTarget struct {
+	sessionID string
+	end       func(error)
 }
 
 func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore, pb *planeB) *controlServer {
@@ -37,6 +47,7 @@ func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantSto
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.ControlServicesPath, c.handle(c.services))
 	mux.HandleFunc(api.ControlGrantsPath, c.handle(c.applyGrants))
+	mux.HandleFunc(api.ControlRevokePath, c.handleRevoke)
 	c.srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -71,18 +82,8 @@ type controlFunc func(ctx context.Context, body []byte) (status int, resp any, e
 
 func (c *controlServer) handle(fn controlFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if ap, err := netip.ParseAddrPort(r.RemoteAddr); err != nil || ap.Addr().Unmap() != c.hubAddr {
-			writeControlJSON(w, http.StatusForbidden, &api.Error{Reason: api.ReasonForbidden, Message: "only the hub may call this"})
-			return
-		}
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			writeControlJSON(w, http.StatusMethodNotAllowed, &api.Error{Reason: api.ReasonBadRequest, Message: "POST required"})
-			return
-		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxControlBody))
-		if err != nil {
-			writeControlJSON(w, http.StatusRequestEntityTooLarge, &api.Error{Reason: api.ReasonBadRequest, Message: "unreadable or oversized body"})
+		body, ok := c.readRequest(w, r)
+		if !ok {
 			return
 		}
 		status, resp, aerr := fn(r.Context(), body)
@@ -96,6 +97,27 @@ func (c *controlServer) handle(fn controlFunc) http.HandlerFunc {
 		}
 		writeControlJSON(w, status, resp)
 	}
+}
+
+// readRequest applies the checks every control call shares (the caller is the
+// hub's overlay address, POST, bounded body) and returns the body. It has
+// answered the request itself when it returns false.
+func (c *controlServer) readRequest(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err != nil || ap.Addr().Unmap() != c.hubAddr {
+		writeControlJSON(w, http.StatusForbidden, &api.Error{Reason: api.ReasonForbidden, Message: "only the hub may call this"})
+		return nil, false
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeControlJSON(w, http.StatusMethodNotAllowed, &api.Error{Reason: api.ReasonBadRequest, Message: "POST required"})
+		return nil, false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxControlBody))
+	if err != nil {
+		writeControlJSON(w, http.StatusRequestEntityTooLarge, &api.Error{Reason: api.ReasonBadRequest, Message: "unreadable or oversized body"})
+		return nil, false
+	}
+	return body, true
 }
 
 func writeControlJSON(w http.ResponseWriter, status int, v any) {
@@ -137,4 +159,39 @@ func (c *controlServer) applyGrants(ctx context.Context, body []byte) (int, any,
 		ack.DeviceWGPublicKey, ack.DeviceAddress, ack.DeviceCandidates = c.planeB.params(ctx)
 	}
 	return http.StatusOK, ack, nil
+}
+
+// revokeReasons are the reasons the hub may end a device session with that the
+// agent acts on; any other value in a notice is refused.
+var revokeReasons = map[string]bool{
+	api.ReasonReenroll:        true,
+	api.ReasonDeviceRevoked:   true,
+	api.ReasonDeviceDisabled:  true,
+	api.ReasonDeviceUnknown:   true,
+	api.ReasonPendingApproval: true,
+}
+
+// handleRevoke takes the hub's notice that it is ending the device session
+// (api.RevokeNotice): the session is ended at once with the notice's reason
+// instead of when a renewal fails. The answer goes out first, then the session
+// is torn down (which closes this very connection).
+func (c *controlServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	body, ok := c.readRequest(w, r)
+	if !ok {
+		return
+	}
+	var n api.RevokeNotice
+	if err := json.Unmarshal(body, &n); err != nil || !revokeReasons[n.Reason] {
+		writeControlJSON(w, http.StatusBadRequest, &api.Error{Reason: api.ReasonBadRequest, Message: "malformed or unknown revoke notice"})
+		return
+	}
+	if c.revoke == nil || n.SessionID == "" || n.SessionID != c.revoke.sessionID {
+		writeControlJSON(w, http.StatusConflict, &api.Error{Reason: api.ReasonSessionUnknown, Message: "not the current session"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+	_ = http.NewResponseController(w).Flush()
+	c.log.Warn("the hub is ending this session", "session", n.SessionID, "reason", n.Reason, "detail", n.Detail)
+	end := c.revoke.end
+	go end(&noticeError{err: wgclient.Revoked(n.Reason, n.Detail)})
 }

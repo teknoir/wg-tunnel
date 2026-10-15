@@ -413,6 +413,7 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 	}
 	a.grants.Store(grants)
 	control := newControlServer(a.log, connect, grants, pb)
+	control.revoke = &revokeTarget{sessionID: resp.SessionID, end: sess.EndWith}
 
 	closePlaneB := func() {
 		if pb != nil {
@@ -475,4 +476,5 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 // serviceSession is the part of wgclient.Session serveServices needs.
 type serviceSession interface {
 	Listen(port int) (net.Listener, error)
+	EndWith(err error)
 }

@@ -44,6 +44,13 @@ func (e *Error) Denial() bool {
 	return e.Status >= 300 && e.Status < 500
 }
 
+// Revoked builds the error of a session the hub announced it ends (a
+// api.RevokeNotice): a definitive refusal (403) with the sanitised reason and
+// detail, so ReasonOf and Denial work on it like on a hub response.
+func Revoked(reason, detail string) *Error {
+	return &Error{Status: http.StatusForbidden, Reason: sanitizeReason(reason), Message: sanitizeText(detail, 200)}
+}
+
 // ReasonOf returns the hub reason carried by err, or "" if err holds none.
 func ReasonOf(err error) string {
 	var e *Error

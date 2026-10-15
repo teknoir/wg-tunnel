@@ -460,7 +460,7 @@ func (h *Hub) endStaleDeviceSession(k devKey, fingerprint string) {
 	dev := h.devices[k]
 	h.mu.Unlock()
 	if dev != nil && dev.fingerprint != fingerprint {
-		h.endSession(dev, api.ReasonReenroll)
+		h.endDeviceRevoked(dev, api.ReasonReenroll, "identity replaced")
 	}
 }
 

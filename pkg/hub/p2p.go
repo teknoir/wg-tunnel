@@ -472,3 +472,55 @@ func (h *Hub) syncP2P(k devKey, pol api.PolicyEntry, live *session, clients []*s
 		h.pushGrantsAsync(live)
 	}
 }
+
+// revokeNoticeTimeout bounds the notice to an agent about the end of its
+// session (the peer is held that long at most).
+const revokeNoticeTimeout = time.Second
+
+// sendRevokeNotice tells the agent of dev about the end of its session over
+// the control listener, the way pushGrants reaches it. Best effort: the
+// outcome is logged at debug and never changes the revocation.
+func (h *Hub) sendRevokeNotice(dev *session, n api.RevokeNotice) {
+	ctx, cancel := context.WithTimeout(h.ctx, revokeNoticeTimeout)
+	defer cancel()
+	err := h.postRevoke(ctx, dev, n)
+	if err != nil {
+		h.log.Debug("revoke notice not delivered", "ns", dev.ns, "device", dev.device, "session", dev.id, "reason", n.Reason, "err", err)
+		return
+	}
+	h.log.Debug("revoke notice delivered", "ns", dev.ns, "device", dev.device, "session", dev.id, "reason", n.Reason)
+}
+
+func (h *Hub) postRevoke(ctx context.Context, dev *session, n api.RevokeNotice) error {
+	body, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	addr := netip.AddrPortFrom(dev.ip, api.AgentControlPort)
+	cl := &http.Client{
+		Timeout: revokeNoticeTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return h.tunnel.DialContext(ctx, addr)
+			},
+			DisableKeepAlives: true,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	defer cl.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr.String()+api.ControlRevokePath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := cl.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent answered %d", resp.StatusCode)
+	}
+	return nil
+}
