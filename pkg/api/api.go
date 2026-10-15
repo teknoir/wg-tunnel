@@ -515,7 +515,7 @@ const (
 // agent's only A peer is the hub).
 const (
 	AgentConnectPort = 2224 // ConnectRequest line, then raw bytes to the service target
-	AgentControlPort = 2225 // HTTP: ControlGrantsPath, ControlServicesPath
+	AgentControlPort = 2225 // HTTP: ControlGrantsPath, ControlServicesPath, ControlRevokePath
 	// HubStatusPort serves read-only live status and admin actions to the
 	// Backstage backend only: Bearer = a projected ServiceAccount token with
 	// audience StatusTokenAudience, verified with a TokenReview for that
@@ -645,7 +645,23 @@ type ConnectResponse struct {
 const (
 	ControlGrantsPath   = "/v1/control/grants"   // POST GrantSet -> GrantAck
 	ControlServicesPath = "/v1/control/services" // POST ServicesUpdate -> 204
+	ControlRevokePath   = "/v1/control/revoke"   // POST RevokeNotice -> 204 (409: not the current session)
 )
+
+// RevokeNotice is the hub telling a device agent, over plane A, that it is
+// about to end the named device session. It is sent best effort and BEFORE the
+// hub removes the device's WireGuard peer, so the agent can act at once instead
+// of finding out when a renewal fails and the tunnel is declared dead. The
+// agent ends the named session with Reason (an api.Reason* code: reenroll
+// rotates the identity and enrolls again without a back-off, the others take
+// the agent's normal denial path). Only for agents that advertised CapControl.
+// A notice for any other session is answered 409 and ignored. The hub's ending
+// of the session does not depend on the notice being delivered.
+type RevokeNotice struct {
+	Reason    string `json:"reason"`
+	SessionID string `json:"sessionId"`
+	Detail    string `json:"detail,omitempty"`
+}
 
 // Grant authorizes one client's plane-B peer on the device. TTL is relative:
 // the agent expires it on its monotonic clock from receipt (device clocks are

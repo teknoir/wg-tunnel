@@ -157,6 +157,24 @@ type svcAgent struct {
 	// grants, when set, serves ControlGrantsPath.
 	grants  func(w http.ResponseWriter, body []byte)
 	rawEcho int // also echo on this overlay port (legacy listener)
+	// notices are the RevokeNotices the control listener took; revokeStatus
+	// (default 204) answers them and revokeHang makes the handler hold the
+	// request that long (or until the hub gives up).
+	notices      []revokeRec
+	revokeStatus int
+	revokeHang   time.Duration
+}
+
+// revokeRec is one RevokeNotice as the agent saw it.
+type revokeRec struct {
+	api.RevokeNotice
+	at time.Time
+}
+
+func (a *svcAgent) revokes() []revokeRec {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.notices)
 }
 
 func (a *svcAgent) connects() []api.ConnectRequest {
@@ -262,6 +280,28 @@ func (a *svcAgent) handleControl(w http.ResponseWriter, r *http.Request) {
 		a.grants(w, body)
 		return
 	}
+	if r.URL.Path == api.ControlRevokePath {
+		var n api.RevokeNotice
+		if json.Unmarshal(body, &n) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		a.mu.Lock()
+		a.notices = append(a.notices, revokeRec{RevokeNotice: n, at: time.Now()})
+		status, hang := a.revokeStatus, a.revokeHang
+		a.mu.Unlock()
+		if hang > 0 {
+			select {
+			case <-time.After(hang):
+			case <-r.Context().Done():
+			}
+		}
+		if status == 0 {
+			status = http.StatusNoContent
+		}
+		w.WriteHeader(status)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != api.ControlServicesPath || json.Unmarshal(body, &upd) != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -282,7 +322,17 @@ func (a *svcAgent) handleControl(w http.ResponseWriter, r *http.Request) {
 // device session. services is the initial policy.
 func newSvcRig(t *testing.T, caps []string, services []api.ServiceSpec, agent *svcAgent, opts ...rigOpt) *wgRig {
 	t.Helper()
+	return newSvcRigHook(t, caps, services, agent, nil, opts...)
+}
+
+// newSvcRigHook is newSvcRig with a hook that runs on the hub before anything
+// is served (to wrap the tunnel).
+func newSvcRigHook(t *testing.T, caps []string, services []api.ServiceSpec, agent *svcAgent, hook func(*Hub), opts ...rigOpt) *wgRig {
+	t.Helper()
 	r := newWGRig(t, opts...)
+	if hook != nil {
+		hook(r.h)
+	}
 	r.devCaps = caps
 	p := r.policy
 	p.Services = services

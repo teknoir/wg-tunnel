@@ -612,6 +612,18 @@ func (s *Session) Close() error {
 	return nil
 }
 
+// EndWith ends the session because the hub announced out of band that it ends
+// it (api.RevokeNotice): Done is closed once everything is torn down and Err
+// returns err. Unlike Close it does not tell the hub, which has ended the
+// session itself. A nil err behaves like a local end. It is idempotent: the
+// first end wins.
+func (s *Session) EndWith(err error) {
+	if err != nil {
+		s.log.Warn("wireguard session ended by the hub's notice", "session", s.Response().SessionID, "reason", ReasonOf(err), "error", err.Error())
+	}
+	s.end(err)
+}
+
 // notifyClose tells the hub to end the session now. Failure is fine: the hub
 // reaps sessions that stop renewing.
 func (s *Session) notifyClose() {

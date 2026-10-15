@@ -291,6 +291,65 @@ func (h *Hub) SetState(ns, name, state string) {
 	}
 }
 
+// RevokeDevice plays the real hub's revocation of the device session of
+// (ns, name): it tells the agent over the control port (api.RevokeNotice,
+// best effort, one second at most) and then ends the session, removing its
+// peer. It returns the notice's error (nil when the agent took it), or an error
+// without ending anything when the device has no session.
+func (h *Hub) RevokeDevice(ns, name, reason string) error {
+	h.mu.Lock()
+	s := h.deviceSession(ns, name)
+	h.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("no device session for %s/%s", ns, name)
+	}
+	err := h.sendRevokeNotice(s, api.RevokeNotice{Reason: reason, SessionID: s.id})
+	h.endSession(s)
+	return err
+}
+
+// SendRevokeNotice sends a RevokeNotice for the session id to the device
+// session of (ns, name) and leaves the session alone (for hostile or stale
+// notices). It returns the HTTP status the agent answered.
+func (h *Hub) SendRevokeNotice(ns, name string, n api.RevokeNotice) (int, error) {
+	h.mu.Lock()
+	s := h.deviceSession(ns, name)
+	h.mu.Unlock()
+	if s == nil {
+		return 0, fmt.Errorf("no device session for %s/%s", ns, name)
+	}
+	return h.postRevoke(s, n)
+}
+
+func (h *Hub) sendRevokeNotice(s *sess, n api.RevokeNotice) error {
+	status, err := h.postRevoke(s, n)
+	if err == nil && status != http.StatusNoContent {
+		err = fmt.Errorf("agent answered %d", status)
+	}
+	return err
+}
+
+func (h *Hub) postRevoke(s *sess, n api.RevokeNotice) (int, error) {
+	body, _ := json.Marshal(n)
+	addr := net.JoinHostPort(s.ip.String(), strconv.Itoa(api.AgentControlPort))
+	cl := &http.Client{
+		Timeout: time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return h.node.Net.DialContext(ctx, "tcp", addr)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	resp, err := cl.Post("http://"+addr+api.ControlRevokePath, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	return resp.StatusCode, nil
+}
+
 // KillSession ends a session at the hub, as if it had been reaped.
 func (h *Hub) KillSession(id string) {
 	h.mu.Lock()

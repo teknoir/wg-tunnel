@@ -142,12 +142,24 @@ func (h *Hub) detachLocked(s *session) {
 // Removing the peer first would drop the FIN/RST and leave the client's
 // connection hanging until its renewal fails.
 func (h *Hub) teardown(s *session, grace time.Duration) {
+	h.teardownAfter(s, grace, nil)
+}
+
+// teardownAfter is teardown that also holds the peer until hold is closed (at
+// the latest revokeNoticeTimeout after it was started, see noticeRevoke), so a
+// message to the device still travels through the installed peer.
+func (h *Hub) teardownAfter(s *session, grace time.Duration, hold <-chan struct{}) {
 	s.closeConns()
-	if grace <= 0 {
+	if grace <= 0 && hold == nil {
 		h.finalize(s)
 		return
 	}
-	time.AfterFunc(grace, func() { h.finalize(s) })
+	time.AfterFunc(max(grace, 0), func() {
+		if hold != nil {
+			<-hold
+		}
+		h.finalize(s)
+	})
 }
 
 // finalize removes the peer (synchronously) and only then releases the
@@ -186,6 +198,40 @@ func (h *Hub) endSession(s *session, _ string) bool {
 // asked for its own end (a denied renewal, a close) uses it to keep the peer
 // long enough for the HTTP response to be delivered.
 func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
+	return h.endSessionNotice(s, grace, nil)
+}
+
+// noticeReasons are the revocation reasons that are wire reasons the agent acts
+// on (log-only reasons such as ports_changed end the session without a notice:
+// the agent finds out by itself and reconnects with the new set).
+var noticeReasons = map[string]bool{
+	api.ReasonReenroll:        true,
+	api.ReasonDeviceRevoked:   true,
+	api.ReasonDeviceDisabled:  true,
+	api.ReasonDeviceUnknown:   true,
+	api.ReasonPendingApproval: true,
+}
+
+// endDeviceRevoked ends a device session because the hub revoked it (enrollment
+// reset, flag, disabled, voided identity, identity approval withdrawn). Unlike
+// endSession it first tells an agent that can take it (CapControl) with an
+// api.RevokeNotice, so the agent acts at once instead of when a renewal fails.
+func (h *Hub) endDeviceRevoked(dev *session, reason, detail string) bool {
+	var n *api.RevokeNotice
+	if dev.kind == api.KindDevice && dev.hasCap(api.CapControl) && noticeReasons[reason] {
+		n = &api.RevokeNotice{Reason: reason, SessionID: dev.id, Detail: detail}
+	}
+	return h.endSessionNotice(dev, h.cfg.FlushGrace, n)
+}
+
+// endSessionNotice is endSessionGrace that, with a notice, also tells the
+// device about the end. The session is detached first (unreachable at once,
+// spliced connections closed), the notice goes out concurrently, and the peer
+// is removed only after both the grace and the notice's attempt (answered,
+// failed or timed out after revokeNoticeTimeout) are over. Revocation neither
+// waits for nor depends on the notice: only the peer removal is held back, by
+// at most revokeNoticeTimeout.
+func (h *Hub) endSessionNotice(s *session, grace time.Duration, n *api.RevokeNotice) bool {
 	h.mu.Lock()
 	if s.ended {
 		h.mu.Unlock()
@@ -195,7 +241,17 @@ func (h *Hub) endSessionGrace(s *session, grace time.Duration) bool {
 	h.mu.Unlock()
 	h.p2pClientGone(s)
 	h.p2pDeviceGone(s, false)
-	h.teardown(s, grace)
+	var hold chan struct{}
+	if n != nil && h.ctx.Err() == nil {
+		hold = make(chan struct{})
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			defer close(hold)
+			h.sendRevokeNotice(s, *n)
+		}()
+	}
+	h.teardownAfter(s, grace, hold)
 	return true
 }
 
