@@ -249,11 +249,14 @@ identity that the device key attested activates by itself.
   the device was flagged compromised or failed its health check, the key that
   attested it is stored in the identity (`distrustedKeys`, bounded like
   `voidedFingerprints`) and carried over whenever the pin is replaced or
-  displaced. The hub refuses every enrollment that carries an attestation by such
-  a key, beside any other (`attest_required`), and issues no nonce outside the
-  window for it, until the policy trusts a key that is not listed: the list is
-  dropped then, so an agent that still holds the old key beside the rotated one
-  enrolls. This applies where the key would activate an identity; in a generation
+  displaced, and never cleared. While the policy trusts a listed key, the hub
+  refuses every enrollment that carries an attestation by a listed key, beside
+  any other (`attest_required`), and issues no nonce outside the window for it.
+  Once the policy trusts a rotated key that is not listed, an attestation by an
+  old key can neither activate nor displace anything and is not refused, so an
+  agent that still holds the old key beside the new one enrolls; trusting a
+  listed key again later is refused the same way. This applies where the key
+  would activate an identity; in a generation
   forced to manual or with manual activation an admin decides anyway. device-controller
   rotates the key when it clears the flag; a hub that did not wait for that would
   let whoever caused the flag enroll in the gap.

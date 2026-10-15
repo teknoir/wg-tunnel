@@ -266,10 +266,13 @@ func deviceKeyTrusted(pol api.PolicyEntry) bool { return autoActivation(pol) }
 // IdentityEntry.DistrustedKeys of the stored pin cur, which includes the key
 // that attested a pin voided because the device was flagged compromised or
 // failed its health check (whoever caused the flag may hold that key; see
-// VoidEntry). They are cleared as soon as the policy trusts a key that is not
-// among them: device-controller rotates the device key when it clears the
-// flag, so the stored list is dropped (best effort) and the old key is
-// ordinary again, for instance an agent that still holds it beside the new one.
+// VoidEntry). The list is permanent for the device (carried over to every
+// later pin). It is enforced, as an outright refusal of any enrollment that
+// carries an attestation by a listed key, while the policy trusts a listed
+// key. Once device-controller has rotated to a key that is not listed, an
+// attestation by an old key can neither activate nor displace anything, so it
+// is not refused: an agent may still hold its old bootstrap key beside the new
+// one and signs with both.
 //
 // The list matters only where the key would activate an identity
 // (autoActivation): in a generation forced to manual, with manual activation or
@@ -283,25 +286,10 @@ func (h *Hub) distrustedKeys(ctx context.Context, cur api.IdentityEntry, found b
 	if len(list) == 0 {
 		return nil
 	}
-	if pol.TrustedHostKey == "" || slices.Contains(list, pol.TrustedHostKey) {
-		if !autoActivation(pol) {
-			return nil
-		}
-		return list
+	if !slices.Contains(list, pol.TrustedHostKey) || !autoActivation(pol) {
+		return nil
 	}
-	if len(cur.DistrustedKeys) > 0 {
-		_, _, _, err := h.deps.Identity.Update(ctx, cur.Namespace, cur.Device, func(c api.IdentityEntry) *api.IdentityEntry {
-			if c.Fingerprint != cur.Fingerprint || len(c.DistrustedKeys) == 0 || slices.Contains(c.DistrustedKeys, pol.TrustedHostKey) {
-				return nil
-			}
-			c.DistrustedKeys = nil
-			return &c
-		})
-		if err != nil {
-			h.log.Warn("clearing distrusted keys failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
-		}
-	}
-	return nil
+	return list
 }
 
 // byTrustedKey reports whether att was signed by the device key pol trusts.

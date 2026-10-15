@@ -84,7 +84,7 @@ func (r *rig) flagged(t *testing.T, k testHostKey, reason string) {
 
 // The distrust of a flagged pin's key is stored, not derived from the voided
 // pin: no later pin, and no second attestation beside the distrusted one, brings
-// the key back before the policy trusts another.
+// the key back, and it is never cleared.
 func TestDistrustOfAFlaggedKeyIsDurable(t *testing.T) {
 	for _, reason := range []string{api.RevokeCompromised, api.RevokeHealthCheckFailed} {
 		t.Run(reason, func(t *testing.T) {
@@ -120,7 +120,8 @@ func TestDistrustOfAFlaggedKeyIsDurable(t *testing.T) {
 			}
 
 			// The key is rotated: an agent that still holds both signs with each.
-			// The new key wins, the old one is ordinary again and the list is gone.
+			// The new key wins and the old one is not refused, but it stays on the
+			// list: the distrust is permanent for the device.
 			p := r.policy
 			p.TrustedHostKey = k2.fp
 			r.setPolicy(p)
@@ -130,15 +131,15 @@ func TestDistrustOfAFlaggedKeyIsDurable(t *testing.T) {
 				t.Fatalf("enrollment with the rotated key: %d %s", st, body)
 			}
 			got := r.ids.entry(testNS, testDevice)
-			if got.AttestedHostKey != k2.fp || got.ActivatedBy != api.ActivatedByDeviceKey || len(got.DistrustedKeys) != 0 {
+			if got.AttestedHostKey != k2.fp || got.ActivatedBy != api.ActivatedByDeviceKey || !slices.Equal(got.DistrustedKeys, []string{k.fp}) {
 				t.Fatalf("pin %+v", got)
 			}
-			// Trusting the old key again later is a new decision: nothing remembers it.
+			// Trusting the old key again later is refused the same way.
 			p.TrustedHostKey = k.fp
 			r.setPolicy(p)
-			if st, _ := r.challenge(genuine); st != http.StatusOK {
-				t.Fatalf("challenge after trusting the old key again: %d", st)
-			}
+			again := r.otherDevice(t)
+			st, body = r.attestedEnroll(again, k)
+			wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
 		})
 	}
 }

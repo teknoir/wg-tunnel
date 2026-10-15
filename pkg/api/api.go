@@ -425,9 +425,9 @@ type IdentityEntry struct {
 	// of attestation keys ("SHA256:<b64>") that signed a pin voided because the
 	// device was flagged compromised or failed its health check. Whoever caused
 	// the flag may hold such a key, so the hub refuses every enrollment that
-	// carries an attestation by one (attest_required). It is carried over
-	// whenever a pin is replaced or displaced, and cleared when the policy
-	// trusts a key that is not listed (the key was rotated).
+	// carries an attestation by one (attest_required) while the policy trusts a
+	// listed key. It is carried over whenever a pin is replaced or displaced and
+	// never cleared: a key on it is not trusted for this device again.
 	DistrustedKeys []string `json:"distrustedKeys,omitempty"`
 	// Attestation (CapAttest): the key that signed this identity's
 	// AttestStatement ("SHA256:<b64>", key type), and the agent's capabilities.
