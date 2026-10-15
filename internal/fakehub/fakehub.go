@@ -303,8 +303,12 @@ func (h *Hub) RevokeDevice(ns, name, reason string) error {
 	if s == nil {
 		return fmt.Errorf("no device session for %s/%s", ns, name)
 	}
+	start := time.Now()
 	err := h.sendRevokeNotice(s, api.RevokeNotice{Reason: reason, SessionID: s.id})
-	h.endSession(s)
+	// Like the real hub (pkg/hub endSessionNotice): the peer is removed only
+	// after both the notice's attempt and the flush grace are over, so the
+	// agent's close of the notice connection still reaches the hub.
+	h.endSessionAfter(s, max(0, flushGrace-time.Since(start)))
 	return err
 }
 
@@ -788,7 +792,16 @@ func (h *Hub) handleClose(w http.ResponseWriter, r *http.Request) {
 
 // endSession removes the peer, closes spliced connections and, for a device
 // session, ends the client sessions bound to it.
-func (h *Hub) endSession(s *sess) {
+// flushGrace mirrors the real hub's default Config.FlushGrace: how long the
+// peer of a session ended on the hub's initiative stays.
+const flushGrace = 300 * time.Millisecond
+
+func (h *Hub) endSession(s *sess) { h.endSessionAfter(s, 0) }
+
+// endSessionAfter ends s at once (unreachable, spliced connections closed) and
+// removes its WireGuard peer (and those of its bound client sessions) after
+// hold.
+func (h *Hub) endSessionAfter(s *sess, hold time.Duration) {
 	h.mu.Lock()
 	if h.sessions[s.id] != s {
 		h.mu.Unlock()
@@ -818,9 +831,14 @@ func (h *Hub) endSession(s *sess) {
 	if len(conns) > 0 {
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = h.node.Dev.IpcSet("public_key=" + s.pub.Hex() + "\nremove=true\n")
+	remove := func() { _ = h.node.Dev.IpcSet("public_key=" + s.pub.Hex() + "\nremove=true\n") }
+	if hold > 0 {
+		time.AfterFunc(hold, remove)
+	} else {
+		remove()
+	}
 	for _, o := range bound {
-		h.endSession(o)
+		h.endSessionAfter(o, hold)
 	}
 }
 

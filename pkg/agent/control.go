@@ -48,7 +48,11 @@ const defaultRevokeGrace = 500 * time.Millisecond
 // revokeTarget is the device session a RevokeNotice may end.
 type revokeTarget struct {
 	sessionID string
-	end       func(error)
+	// setCause records why the session ends before it does, so that an end
+	// forced earlier by something else (a renewal failing while the hub tears
+	// the session down) still reports the notice's reason.
+	setCause func(error)
+	end      func(error)
 }
 
 func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore, pb *planeB) *controlServer {
@@ -206,10 +210,14 @@ func (c *controlServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 	_ = http.NewResponseController(w).Flush()
 	c.log.Warn("the hub is ending this session", "session", n.SessionID, "reason", n.Reason, "detail", n.Detail)
+	cause := &noticeError{err: wgclient.Revoked(n.Reason, n.Detail)}
+	if c.revoke.setCause != nil {
+		c.revoke.setCause(cause)
+	}
 	select {
 	case <-r.Context().Done():
 	case <-time.After(c.revokeGrace):
 	}
 	end := c.revoke.end
-	go end(&noticeError{err: wgclient.Revoked(n.Reason, n.Detail)})
+	go end(cause)
 }

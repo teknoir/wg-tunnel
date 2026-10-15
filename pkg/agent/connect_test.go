@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -350,6 +352,20 @@ func TestConnectRefusalReleasesItsSlotsBeforeItIsAnswered(t *testing.T) {
 	for i := range 200 {
 		r := newConnectRig(t, 2, 3, allowPorts(echo.port()))
 		r.srv.SetServices([]api.ServiceSpec{externalSpec("one", echo.port()), externalSpec("two", echo.port())})
+		// Deterministic check: the moment a refusal has been answered, the
+		// refused connection must already have given back its slots (2 held
+		// by the accepted connections below, none by the refused one).
+		var bad atomic.Value
+		var refusals atomic.Int32
+		r.srv.afterRefusal = func() {
+			r.srv.mu.Lock()
+			one, glob := r.srv.counts["one"], len(r.srv.global)
+			r.srv.mu.Unlock()
+			if one != 2 || glob != 2 {
+				bad.Store(fmt.Sprintf("after the refusal: counts[one]=%d (want 2), global=%d (want 2)", one, glob))
+			}
+			refusals.Add(1)
+		}
 		for range 2 {
 			if _, resp := r.connect(api.ConnectRequest{Service: "one"}); !resp.OK {
 				t.Fatalf("round %d: %+v", i, resp)
@@ -357,6 +373,10 @@ func TestConnectRefusalReleasesItsSlotsBeforeItIsAnswered(t *testing.T) {
 		}
 		if _, resp := r.connect(api.ConnectRequest{Service: "one"}); resp.OK || resp.Reason != api.ReasonSessionLimit {
 			t.Fatalf("round %d: per-service cap: %+v", i, resp)
+		}
+		eventually(t, 5*time.Second, "the refusal hook", func() bool { return refusals.Load() == 1 })
+		if v := bad.Load(); v != nil {
+			t.Fatalf("round %d: %s", i, v)
 		}
 		if _, resp := r.connect(api.ConnectRequest{Service: "two"}); !resp.OK {
 			t.Fatalf("round %d: the refused connection still held its slot: %+v", i, resp)

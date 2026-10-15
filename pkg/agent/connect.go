@@ -54,6 +54,11 @@ type connectServer struct {
 	// countsB counts the plane-B connections per service (subset of counts).
 	countsB map[string]int
 	closed  bool
+
+	// afterRefusal, when set (tests), runs on the refusing goroutine right
+	// after a refusal was answered, with everything the connection held
+	// already given back.
+	afterRefusal func()
 }
 
 type activeConn struct {
@@ -327,6 +332,9 @@ func (s *connectServer) relay(ctx context.Context, c net.Conn, br *bufio.Reader,
 	refuse := func(reason string) {
 		finish()
 		s.answer(c, api.ConnectResponse{Reason: reason})
+		if s.afterRefusal != nil {
+			s.afterRefusal()
+		}
 	}
 	held = append(held, func() { <-s.global })
 
@@ -432,7 +440,7 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 	}
 	a.grants.Store(grants)
 	control := newControlServer(a.log, connect, grants, pb)
-	control.revoke = &revokeTarget{sessionID: resp.SessionID, end: sess.EndWith}
+	control.revoke = &revokeTarget{sessionID: resp.SessionID, setCause: sess.SetEndCause, end: sess.EndWith}
 
 	closePlaneB := func() {
 		if pb != nil {
@@ -496,4 +504,5 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 type serviceSession interface {
 	Listen(port int) (net.Listener, error)
 	EndWith(err error)
+	SetEndCause(err error)
 }

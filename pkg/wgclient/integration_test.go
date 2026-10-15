@@ -416,3 +416,21 @@ func TestRelaySupervisorOutlivesCreateContext(t *testing.T) {
 	defer s.Close()
 	eventually(t, 15*time.Second, "the relay to be re-allocated after Create's context ended", func() bool { return s.RelaySwaps() >= 3 })
 }
+
+// A cause recorded with SetEndCause wins over the error that ends the session
+// first (in the agent: a renewal failing inside a revoke notice's grace wait).
+func TestEndCauseWinsOverTheErrorThatEndsTheSessionFirst(t *testing.T) {
+	r := newRig(t, fakehub.Options{})
+	var n atomic.Int64
+	s, err := wgclient.Create(ctxT(t), r.deviceOpts(deviceCred(&n)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetEndCause(wgclient.Revoked(api.ReasonReenroll, ""))
+	s.EndWith(wgclient.Revoked(api.ReasonDeviceRevoked, "the renewal was denied"))
+	<-s.Done()
+	if got := wgclient.ReasonOf(s.Err()); got != api.ReasonReenroll {
+		t.Fatalf("reason %q (%v), want %q", got, s.Err(), api.ReasonReenroll)
+	}
+}

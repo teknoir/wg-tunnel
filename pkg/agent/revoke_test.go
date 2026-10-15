@@ -79,6 +79,36 @@ func TestControlRevoke(t *testing.T) {
 	}
 }
 
+// A notice records its reason on the session before the grace wait, so that
+// a renewal failing inside the window (which ends the session first) cannot
+// hide the reenroll reason from skipBackoff.
+func TestRevokeNoticeRecordsItsCauseBeforeTheGraceWait(t *testing.T) {
+	c, _ := revokeRig(t)
+	c.revokeGrace = 300 * time.Millisecond
+	cause := make(chan error, 1)
+	c.revoke.setCause = func(err error) { cause <- err }
+	hub := api.HubAddress + ":1"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		post(t, c, api.ControlRevokePath, hub, api.RevokeNotice{Reason: api.ReasonReenroll, SessionID: "s7"})
+	}()
+	select {
+	case err := <-cause:
+		select {
+		case <-done:
+			t.Fatal("the cause was recorded only after the grace wait")
+		default:
+		}
+		if wgclient.ReasonOf(err) != api.ReasonReenroll {
+			t.Fatalf("cause %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no cause recorded")
+	}
+	<-done
+}
+
 func TestSkipBackoffOnlyOnceForAReenrollNotice(t *testing.T) {
 	r := newRig(t, fakehub.Options{})
 	a, err := New(r.config())

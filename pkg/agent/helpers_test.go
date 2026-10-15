@@ -66,6 +66,9 @@ type rig struct {
 	logs    *syncBuffer
 	echo    net.Listener
 	port    int
+	// servingBase is how many "exposing port" lines the log held when the
+	// agent was last started; waitServing only counts lines after them.
+	servingBase int
 }
 
 type syncBuffer struct {
@@ -162,6 +165,7 @@ func (r *rig) start(cfg Config) (a *Agent, stop func() error) {
 	if err != nil {
 		r.t.Fatal(err)
 	}
+	r.servingBase = strings.Count(r.logs.String(), r.exposingLine())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
@@ -204,10 +208,14 @@ func (r *rig) waitTunnelUp(t *testing.T, n int) {
 // session to be listed is therefore not enough to dial through it.
 func (r *rig) waitServing(t *testing.T) {
 	t.Helper()
-	want := fmt.Sprintf(`"msg":"exposing port","port":%d,`, r.port)
+	want := r.exposingLine()
 	eventually(t, 15*time.Second, "the agent to listen on the forwarded port", func() bool {
-		return strings.Contains(r.logs.String(), want)
+		return strings.Count(r.logs.String(), want) > r.servingBase
 	})
+}
+
+func (r *rig) exposingLine() string {
+	return fmt.Sprintf(`"msg":"exposing port","port":%d,`, r.port)
 }
 
 // clientSession creates a client session for the rig's device. The device's
