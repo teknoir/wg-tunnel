@@ -509,6 +509,9 @@ const (
 	// envelope) and signs AttestStatement with it in-process. Implies CapAttest.
 	CapDeviceKey = "device-key-v1"
 	CapP2P       = "p2p-v1" // direct end-to-end WireGuard (plane B)
+	// CapK3sDiscovery: the agent answers ControlK3sServicesPath with the
+	// device's k3s Services (read-only list through its own ServiceAccount).
+	CapK3sDiscovery = "k3s-discovery-v1"
 )
 
 // Overlay ports on the agent (plane A, reachable only from the hub: the
@@ -645,7 +648,54 @@ type ConnectResponse struct {
 const (
 	ControlGrantsPath   = "/v1/control/grants"   // POST GrantSet -> GrantAck
 	ControlServicesPath = "/v1/control/services" // POST ServicesUpdate -> 204
+	// ControlK3sServicesPath (CapK3sDiscovery): GET -> K3sServiceList. The hub
+	// asks on demand when an admin opens "Add service" in the console.
+	ControlK3sServicesPath = "/v1/control/k3s-services"
 )
+
+// K3s Service discovery (CapK3sDiscovery). The services an app installs on the
+// device (a k3s HelmChart, a GitOps app, anything applied on the device) are
+// created on the device, so the cloud cannot see them in the Device manifest.
+// The agent lists them with a ServiceAccount that may only get/list Services
+// (device-controller ships that RBAC with the agent) and returns metadata only:
+// no Endpoints, no Secrets, no annotations. The list is informational: a
+// chosen service is still validated as a ServiceSpec (internal kind) by
+// device-controller, Backstage and the agent on every dial.
+const (
+	// StatusK3sServicesSuffix is appended to StatusDevicePath<ns>/<device>:
+	// GET -> K3sServiceList, Backstage backend only (HubStatusPort).
+	StatusK3sServicesSuffix = "/k3s-services"
+	MaxK3sServices          = 500
+	MaxK3sServicePorts      = 32
+)
+
+// K3sServicePort is one port of a discovered Service.
+type K3sServicePort struct {
+	Name        string `json:"name,omitempty"`
+	Port        int    `json:"port"`
+	Protocol    string `json:"protocol,omitempty"`    // TCP | UDP | SCTP
+	AppProtocol string `json:"appProtocol,omitempty"` // e.g. http
+}
+
+// K3sService is one Service on the device's k3s cluster.
+type K3sService struct {
+	Namespace string           `json:"namespace"`
+	Name      string           `json:"name"`
+	Type      string           `json:"type,omitempty"`      // ClusterIP | NodePort | LoadBalancer | ExternalName
+	ClusterIP string           `json:"clusterIP,omitempty"` // "None" for a headless Service
+	Ports     []K3sServicePort `json:"ports,omitempty"`     // at most MaxK3sServicePorts
+}
+
+// K3sServiceList is the agent's answer, passed through by the hub. Truncated
+// is set when the device has more than MaxK3sServices Services. Error is set
+// (and Services empty) when the agent could not list them, for example
+// because its ServiceAccount has no permission yet.
+type K3sServiceList struct {
+	Services   []K3sService `json:"services"`
+	Truncated  bool         `json:"truncated,omitempty"`
+	ObservedAt time.Time    `json:"observedAt"`
+	Error      string       `json:"error,omitempty"`
+}
 
 // Grant authorizes one client's plane-B peer on the device. TTL is relative:
 // the agent expires it on its monotonic clock from receipt (device clocks are
