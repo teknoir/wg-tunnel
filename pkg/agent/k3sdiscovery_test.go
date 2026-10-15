@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -312,6 +313,57 @@ func TestK3sListTruncation(t *testing.T) {
 	got = r.list(t)
 	if got.Truncated || len(got.Services) != api.MaxK3sServices {
 		t.Errorf("%d services, truncated=%v", len(got.Services), got.Truncated)
+	}
+}
+
+func TestK3sListOversizedAnswer(t *testing.T) {
+	r := newK3sRig(t)
+	r.lister.cfg.MaxBody = 1 << 10
+	// Valid JSON that is larger than the cap: never buffered whole.
+	big := `{"items":[{"metadata":{"namespace":"a","name":"b","annotations":{"x":"` + strings.Repeat("y", 4<<10) + `"}},"spec":{}}]}`
+	r.api.set(http.StatusOK, big)
+	if got := r.list(t); got.Error != k3sErrTooLarge || len(got.Services) != 0 || got.Services == nil {
+		t.Errorf("oversized: %+v", got)
+	}
+	r = newK3sRig(t)
+	r.lister.cfg.MaxBody = 1 << 10
+	// An answer that fits is fine.
+	r.api.set(http.StatusOK, `{"items":[{"metadata":{"namespace":"a","name":"b"},"spec":{}}]}`)
+	if got := r.list(t); got.Error != "" || len(got.Services) != 1 {
+		t.Errorf("small: %+v", got)
+	}
+	// The default cap is small enough for a 128Mi container.
+	if newK3sLister(k3sConfig{}).cfg.MaxBody > 16<<20 {
+		t.Errorf("default cap %d", newK3sLister(k3sConfig{}).cfg.MaxBody)
+	}
+}
+
+// A caller that gives up (the hub's timeout) must not abort the fetch or leave
+// a cancellation error in the cache for the next caller.
+func TestK3sListCancelledCallerDoesNotPoisonCache(t *testing.T) {
+	r := newK3sRig(t)
+	slow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"items":[{"metadata":{"namespace":"a","name":"b"},"spec":{}}]}`)
+	}))
+	t.Cleanup(slow.Close)
+	if err := os.WriteFile(r.lister.cfg.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: slow.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.lister.cfg.APIURL = slow.URL
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	if got := r.lister.List(ctx); got.Error != "" || len(got.Services) != 1 {
+		t.Errorf("cancelled caller: %+v", got)
+	}
+	// The retry inside the cache window sees the good list.
+	if got := r.list(t); got.Error != "" || len(got.Services) != 1 {
+		t.Errorf("retry: %+v", got)
+	}
+	// The agent gives up before the hub's 5 s call timeout.
+	if k3sListTimeout >= 5*time.Second {
+		t.Errorf("k3sListTimeout %s must be below the hub's call timeout", k3sListTimeout)
 	}
 }
 

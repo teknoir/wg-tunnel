@@ -32,11 +32,16 @@ const (
 	k3sTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	k3sCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-	k3sListTimeout = 5 * time.Second
+	// k3sListTimeout is deliberately shorter than the hub's 5 s call timeout
+	// (which also covers the tunnel dial), so a slow API server is answered
+	// with a reason instead of the hub giving up first.
+	k3sListTimeout = 4 * time.Second
 	k3sCacheTTL    = 10 * time.Second
-	// maxK3sAPIBody bounds what is read from the API server: 500 Services with
-	// full metadata (managedFields, annotations) stay far below it.
-	maxK3sAPIBody = 32 << 20
+	// maxK3sAPIBody bounds what is read from the API server. The JSON decoder
+	// holds the whole value in a buffer that grows by doubling, and the agent
+	// container has 128Mi, so this stays small: 500 Services with full
+	// metadata (managedFields) are about 2-3 MB.
+	maxK3sAPIBody = 8 << 20
 )
 
 // Plain-English answers in K3sServiceList.Error.
@@ -45,6 +50,7 @@ const (
 	k3sErrNoCluster    = "the agent is not running inside a Kubernetes cluster"
 	k3sErrUnreachable  = "the agent could not reach the Kubernetes API of the device"
 	k3sErrBadAnswer    = "the Kubernetes API of the device gave an answer the agent could not read"
+	k3sErrTooLarge     = "the Kubernetes API of the device gave an answer that is too large to list"
 )
 
 // k3sConfig points the lister at the Kubernetes API.
@@ -56,6 +62,7 @@ type k3sConfig struct {
 	CAFile    string
 	Timeout   time.Duration
 	CacheTTL  time.Duration
+	MaxBody   int64 // largest API answer read (default maxK3sAPIBody)
 	Now       func() time.Time
 }
 
@@ -86,6 +93,9 @@ func newK3sLister(cfg k3sConfig) *k3sLister {
 	if cfg.CacheTTL <= 0 {
 		cfg.CacheTTL = k3sCacheTTL
 	}
+	if cfg.MaxBody <= 0 {
+		cfg.MaxBody = maxK3sAPIBody
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -101,7 +111,11 @@ func (l *k3sLister) List(ctx context.Context) api.K3sServiceList {
 	if l.have && now.Sub(l.cacheAt) < l.cfg.CacheTTL && now.Sub(l.cacheAt) >= 0 {
 		return l.cached
 	}
-	ctx, cancel := context.WithTimeout(ctx, l.cfg.Timeout)
+	// The fetch is shared through the cache, so it must not die with the
+	// request that happened to start it (the hub may give up and cancel): its
+	// own timeout bounds it, and a cancelled caller cannot cache an error for
+	// the next one.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.Timeout)
 	defer cancel()
 	out := l.fetch(ctx)
 	out.ObservedAt = now.UTC()
@@ -180,8 +194,15 @@ func (l *k3sLister) fetch(ctx context.Context) api.K3sServiceList {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return k3sFailed(fmt.Sprintf("the Kubernetes API of the device answered %d", resp.StatusCode))
 	}
+	// Read one byte more than allowed: an answer that fills it is too large,
+	// whether or not the truncated JSON would still have decoded.
+	lr := &io.LimitedReader{R: resp.Body, N: l.cfg.MaxBody + 1}
 	var list k3sAPIList
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxK3sAPIBody)).Decode(&list); err != nil {
+	err = json.NewDecoder(lr).Decode(&list)
+	if lr.N <= 0 {
+		return k3sFailed(k3sErrTooLarge)
+	}
+	if err != nil {
 		return k3sFailed(k3sErrBadAnswer)
 	}
 	return mapK3sServices(list)
