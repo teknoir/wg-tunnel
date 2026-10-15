@@ -25,16 +25,9 @@ func (r *Rig) setupAttest(dir string) {
 	must(t, os.MkdirAll(keys, 0o755))
 	must(t, os.MkdirAll(exchange, 0o777))
 	must(t, os.Chmod(exchange, 0o777))
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	blk, err := ssh.MarshalPrivateKey(priv, "")
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(keys, "ssh_host_ed25519_key"), pem.EncodeToMemory(blk), 0o600))
-	sp, err := ssh.NewPublicKey(pub)
-	must(t, err)
-	r.HostKeyFingerprint = ssh.FingerprintSHA256(sp)
+	r.hostKeysDir = keys
+	r.writeHostKey()
 	r.AttestExchange = exchange
-	r.AddSecret(string(pem.EncodeToMemory(blk)))
 
 	a, err := attestor.New(attestor.Config{
 		StateDir: r.IdentityDir, ExchangeDir: exchange, HostKeysDir: keys,
@@ -57,4 +50,30 @@ func (r *Rig) TrustHostKey() {
 		r.T.Fatal("TrustHostKey needs Options.Attest")
 	}
 	r.Policy.Update(NS, DeviceName, func(e *api.PolicyEntry) { e.TrustedHostKey = r.HostKeyFingerprint })
+}
+
+// writeHostKey installs a new sshd host key where the attestor looks for it and
+// makes its fingerprint Rig.HostKeyFingerprint.
+func (r *Rig) writeHostKey() {
+	t := r.T
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	blk, err := ssh.MarshalPrivateKey(priv, "")
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(r.hostKeysDir, "ssh_host_ed25519_key"), pem.EncodeToMemory(blk), 0o600))
+	sp, err := ssh.NewPublicKey(pub)
+	must(t, err)
+	r.HostKeyFingerprint = ssh.FingerprintSHA256(sp)
+	r.AddSecret(string(pem.EncodeToMemory(blk)))
+}
+
+// RotateHostKey plays device-controller rotating the device's key after a
+// flag was cleared: the attestor signs with a new key from now on and
+// Rig.HostKeyFingerprint is its fingerprint. TrustHostKey makes it the anchor.
+func (r *Rig) RotateHostKey() {
+	r.T.Helper()
+	if r.hostKeysDir == "" {
+		r.T.Fatal("RotateHostKey needs Options.Attest")
+	}
+	r.writeHostKey()
 }

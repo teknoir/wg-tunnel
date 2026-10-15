@@ -241,6 +241,7 @@ func (h *Hub) deviceStatus(ctx context.Context, ns, device string, pol api.Polic
 			EnrollmentGeneration: pin.EnrollmentGeneration, EnrollmentEpoch: pin.EnrollmentEpoch, EnrolledAt: pin.EnrolledAt.UTC(),
 			ActivatedBy: pin.ActivatedBy, ActivatedAt: pin.ActivatedAt.UTC(), Voided: pin.Voided, Conflicts: pin.Conflicts,
 			Replacements: pin.Replacements, LastReplacedAt: pin.LastReplacedAt.UTC(),
+			Current: sameEpoch(pin, pol), AgentCapabilities: slices.Clone(pin.AgentCapabilities),
 		}
 	}
 	for _, c := range clients {

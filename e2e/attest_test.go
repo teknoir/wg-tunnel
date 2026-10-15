@@ -114,7 +114,11 @@ func TestClearedFlagForcesManualActivation(t *testing.T) {
 	}
 
 	// Generation 3 with the force cleared (ForceManualGeneration < generation):
-	// the anchor activates the next identity by itself again.
+	// the anchor activates the next identity by itself again, once the key that
+	// was in use when the device was flagged is rotated: until then the hub
+	// refuses it (its pin was voided for the flag).
+	r.RotateHostKey()
+	r.TrustHostKey()
 	r.Policy.Update(e2erig.NS, e2erig.DeviceName, func(e *api.PolicyEntry) {
 		e.EnrollmentGeneration, e.EnrollmentEpoch, e.ApprovedFingerprint = 3, "e2e-epoch-3", ""
 		e.EnrollUntil = time.Now().Add(time.Hour)

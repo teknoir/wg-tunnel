@@ -302,6 +302,9 @@ const (
 // MaxVoidedFingerprints bounds IdentityEntry.VoidedFingerprints.
 const MaxVoidedFingerprints = 32
 
+// MaxDistrustedKeys bounds IdentityEntry.DistrustedKeys.
+const MaxDistrustedKeys = 32
+
 // FlagSet is the single parser for boolean device annotations, used by the
 // hub, the flags watcher and device-controller alike.
 func FlagSet(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "true") }
@@ -418,6 +421,14 @@ type IdentityEntry struct {
 	// is carried over whenever a pin is replaced, and the hub refuses to pin
 	// any listed fingerprint again, in any epoch.
 	VoidedFingerprints []string `json:"voidedFingerprints,omitempty"`
+	// DistrustedKeys is the bounded list (newest last, max MaxDistrustedKeys)
+	// of attestation keys ("SHA256:<b64>") that signed a pin voided because the
+	// device was flagged compromised or failed its health check. Whoever caused
+	// the flag may hold such a key, so the hub refuses every enrollment that
+	// carries an attestation by one (attest_required). It is carried over
+	// whenever a pin is replaced or displaced, and cleared when the policy
+	// trusts a key that is not listed (the key was rotated).
+	DistrustedKeys []string `json:"distrustedKeys,omitempty"`
 	// Attestation (CapAttest): the key that signed this identity's
 	// AttestStatement ("SHA256:<b64>", key type), and the agent's capabilities.
 	// Since rev 3 the signing key is the device key (CapDeviceKey); older agents
@@ -774,6 +785,14 @@ type LiveIdentity struct {
 	Conflicts            int       `json:"conflicts,omitempty"`
 	Replacements         int       `json:"replacements,omitempty"`
 	LastReplacedAt       time.Time `json:"lastReplacedAt,omitempty"`
+	// Current is true when the pin is of the policy's current enrollment epoch
+	// AND generation, i.e. the pin the activation rule evaluates (it can still
+	// be voided or pending). A pin that is not current belongs to an older
+	// enrollment and must be replaced by a new enrollment.
+	Current bool `json:"current"`
+	// AgentCapabilities are the capabilities the enrolling agent advertised
+	// (IdentityEntry.AgentCapabilities).
+	AgentCapabilities []string `json:"agentCapabilities,omitempty"`
 }
 
 // StatusTokenAudience is the audience of the projected ServiceAccount token

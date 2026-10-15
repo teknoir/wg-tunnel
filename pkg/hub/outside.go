@@ -310,10 +310,9 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	}
 
 	// Device-key attestation (api.CapAttest). An agent that advertises it must
-	// present a valid one; a phase-1 agent enrolls as before. The trusted key
-	// counts for nothing while the pin it attested is void for a flag
-	// (distrustedKey).
-	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol, distrustedKey(cur, found, pol))
+	// present a valid one; a phase-1 agent enrolls as before. An attestation by
+	// a key that signed a pin voided for a flag is refused (distrustedKeys).
+	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol, h.distrustedKeys(ctx, cur, found, pol))
 	if den != nil {
 		h.recordForeignAttemptConflict(ctx, ns, device, pol, req.IdentityPublicKey)
 		return 0, nil, den

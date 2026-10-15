@@ -245,14 +245,18 @@ identity that the device key attested activates by itself.
   differently attested enrollment is still refused (`enroll_closed`). Pin
   displacement and replacement below follow the same rule: the device key admits
   an identity only where the identity would itself become usable.
-- **A flagged device's key is not trusted again.** When the pin a trusted key
-  attested was voided because the device was flagged compromised or failed its
-  health check, that key attests nothing for later generations (the enrollment is
-  refused with `attest_required`, no nonce is issued outside the window) until
-  the policy trusts another key (in a generation forced to manual or with manual
-  activation an admin decides anyway, so nothing changes there). device-controller rotates the key when it clears
-  the flag; a hub that did not wait for that would let whoever caused the flag
-  enroll in the gap.
+- **A flagged device's key is not trusted again.** When a pin is voided because
+  the device was flagged compromised or failed its health check, the key that
+  attested it is stored in the identity (`distrustedKeys`, bounded like
+  `voidedFingerprints`) and carried over whenever the pin is replaced or
+  displaced. The hub refuses every enrollment that carries an attestation by such
+  a key, beside any other (`attest_required`), and issues no nonce outside the
+  window for it, until the policy trusts a key that is not listed: the list is
+  dropped then, so an agent that still holds the old key beside the rotated one
+  enrolls. This applies where the key would activate an identity; in a generation
+  forced to manual or with manual activation an admin decides anyway. device-controller
+  rotates the key when it clears the flag; a hub that did not wait for that would
+  let whoever caused the flag enroll in the gap.
 - **Budgets**: enrollment and challenge rate limits, replay partitions and the
   outstanding-nonce caps (8) are per (device, identity key), with a generous
   per-device bucket (and 64 nonces) behind them, so a squatter holding the
@@ -273,7 +277,9 @@ identity that the device key attested activates by itself.
 - **Pin displacement**: an enrollment attested by the trusted device key replaces
   an existing pin of the same epoch that is not attested by it and not approved
   by an admin (the displaced fingerprint is voided for good and counted as a
-  conflict).
+  conflict). This also holds with `activationMode: manual` or a generation forced
+  to manual (the new pin then waits for an admin): a squatter must not lock the
+  real device out. A key shared with another device displaces nothing.
 - **Pin replacement**: an enrollment attested by the trusted device key also
   replaces a pin that IS trusted (attested by the key, or approved) when the
   device has **no live session**: the device lost its identity (re-image) and the
@@ -286,7 +292,8 @@ identity that the device key attested activates by itself.
   enrolls it (and the console shows no squatting). Without the key it stays a
   conflict.
 - The live status (`api.LiveIdentity`) reports `activatedBy`, `activatedAt`,
-  `replacements` and `lastReplacedAt`.
+  `replacements`, `lastReplacedAt`, `current` (the pin is of the policy's current
+  epoch and generation) and `agentCapabilities`.
 
 A device key is only as strong as how it got to the device. A bootstrap key is
 written by the trusted bootstrap; an MQTT-delivered key is as strong as the

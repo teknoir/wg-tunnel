@@ -260,6 +260,7 @@ type Rig struct {
 	RSAKeyPath string
 	// HostKeyFingerprint and AttestExchange are set by Options.Attest.
 	HostKeyFingerprint string
+	hostKeysDir        string
 	AttestExchange     string
 	IdentityDir        string
 	// DeviceKeyFile and DeviceKeyEnvelope are where the agent looks for the

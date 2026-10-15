@@ -232,7 +232,7 @@ func (h *Hub) handleAttestChallenge(ctx context.Context, r *http.Request, _ []by
 		}
 		// A pin of this window exists: attesting is still useful (it can
 		// upgrade the pin or displace an unattested one).
-	} else if !now.Before(pol.EnrollUntil) && (!deviceKeyTrusted(pol) || distrustedKey(cur, found, pol) != "") {
+	} else if !now.Before(pol.EnrollUntil) && (!deviceKeyTrusted(pol) || slices.Contains(h.distrustedKeys(ctx, cur, found, pol), pol.TrustedHostKey)) {
 		// With a device key that activates identities trusted, the window does
 		// not gate attestation: only an enrollment attested by that key is
 		// admitted outside it (handleEnroll).
@@ -262,20 +262,46 @@ type attested struct {
 // identities (autoActivation).
 func deviceKeyTrusted(pol api.PolicyEntry) bool { return autoActivation(pol) }
 
-// distrustedKey is the trusted device key of pol when cur, the stored pin,
-// shows it cannot be trusted: the pin it attested was voided because the device
-// was flagged compromised or failed its health check. Whoever caused the flag
-// may hold that key, so it activates nothing again until the policy trusts
-// another one (device-controller rotates it when it clears the flag). It
-// matters only where the key would activate an identity (autoActivation): in a
-// generation forced to manual or with manual activation an admin decides
-// anyway. "" when there is nothing to distrust.
-func distrustedKey(cur api.IdentityEntry, found bool, pol api.PolicyEntry) string {
-	if found && cur.Voided && autoActivation(pol) && cur.AttestedHostKey == pol.TrustedHostKey &&
-		(cur.VoidedReason == api.RevokeCompromised || cur.VoidedReason == api.RevokeHealthCheckFailed) {
-		return pol.TrustedHostKey
+// distrustedKeys are the attestation keys the hub refuses for this device:
+// IdentityEntry.DistrustedKeys of the stored pin cur, which includes the key
+// that attested a pin voided because the device was flagged compromised or
+// failed its health check (whoever caused the flag may hold that key; see
+// VoidEntry). They are cleared as soon as the policy trusts a key that is not
+// among them: device-controller rotates the device key when it clears the
+// flag, so the stored list is dropped (best effort) and the old key is
+// ordinary again, for instance an agent that still holds it beside the new one.
+//
+// The list matters only where the key would activate an identity
+// (autoActivation): in a generation forced to manual, with manual activation or
+// with a key shared with another device an admin decides anyway, and the hub
+// returns nil.
+func (h *Hub) distrustedKeys(ctx context.Context, cur api.IdentityEntry, found bool, pol api.PolicyEntry) []string {
+	if !found {
+		return nil
 	}
-	return ""
+	list := distrustedAfterVoid(cur)
+	if len(list) == 0 {
+		return nil
+	}
+	if pol.TrustedHostKey == "" || slices.Contains(list, pol.TrustedHostKey) {
+		if !autoActivation(pol) {
+			return nil
+		}
+		return list
+	}
+	if len(cur.DistrustedKeys) > 0 {
+		_, _, _, err := h.deps.Identity.Update(ctx, cur.Namespace, cur.Device, func(c api.IdentityEntry) *api.IdentityEntry {
+			if c.Fingerprint != cur.Fingerprint || len(c.DistrustedKeys) == 0 || slices.Contains(c.DistrustedKeys, pol.TrustedHostKey) {
+				return nil
+			}
+			c.DistrustedKeys = nil
+			return &c
+		})
+		if err != nil {
+			h.log.Warn("clearing distrusted keys failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
+		}
+	}
+	return nil
 }
 
 // byTrustedKey reports whether att was signed by the device key pol trusts.
@@ -287,12 +313,14 @@ func byTrustedKey(att *attested, pol api.PolicyEntry) bool {
 // (nil, nil) for an enrollment that neither advertises api.CapAttest nor sends
 // attestations (a phase-1 agent) while the policy trusts no device key, and
 // ReasonAttestRequired when it does advertise or send them but none is valid,
-// or when the policy has a TrustedHostKey and there is none at all. Every nonce presented is consumed. An attestation by
-// the key distrust (see distrustedKey) counts for nothing. A valid attestation
+// or when the policy has a TrustedHostKey and there is none at all. Every nonce
+// presented is consumed. An enrollment that carries a valid attestation by a
+// key in distrust (see distrustedKeys) is refused outright, whatever else it
+// carries: the key may be held by whoever flagged the device. A valid attestation
 // is a SSHSIG by an ed25519 or RSA (rsa-sha2-512) key over api.AttestStatement
 // with the policy's CURRENT epoch and generation, a nonce this hub issued to
 // this device for this identity key, and the enrolling identity's fingerprint.
-func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry, distrust string) (*attested, *denial) {
+func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry, distrust []string) (*attested, *denial) {
 	advertised := slices.Contains(req.Capabilities, api.CapAttest)
 	if !advertised && len(req.HostKeyAttestations) == 0 {
 		if pol.TrustedHostKey != "" {
@@ -309,7 +337,7 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		return nil, deny(api.ReasonBadRequest, "too many attestations")
 	}
 	var valid []attested
-	skipped := false
+	distrusted := false
 	for _, a := range req.HostKeyAttestations {
 		rec, ok := h.nonces.take(a.Nonce)
 		if !ok || rec.ns != ns || rec.device != device ||
@@ -326,14 +354,14 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		if err != nil {
 			continue
 		}
-		if hk := ssh.FingerprintSHA256(pub); distrust != "" && hk == distrust {
-			skipped = true // consumed, but it attests nothing (distrustedKey)
+		if slices.Contains(distrust, ssh.FingerprintSHA256(pub)) {
+			distrusted = true // refused below, after every nonce is consumed
 			continue
 		}
 		valid = append(valid, attested{hostKey: ssh.FingerprintSHA256(pub), keyType: pub.Type()})
 	}
-	if len(valid) == 0 && skipped {
-		return nil, deny(api.ReasonAttestRequired, "the trusted device key was in use when this device was flagged; the device key must be rotated before the device can enroll again")
+	if distrusted {
+		return nil, deny(api.ReasonAttestRequired, "the enrollment carries an attestation by a device key that was in use when this device was flagged; the device key must be rotated before the device can enroll again")
 	}
 	if len(valid) == 0 {
 		return nil, deny(api.ReasonAttestRequired, "this agent supports attestation, but the enrollment carries no valid attestation")
@@ -373,8 +401,13 @@ func withAttestation(cur api.IdentityEntry, att *attested, caps []string) *api.I
 // the trusted device key can, and only a pin that is not itself attested by
 // that key and was not explicitly approved by an admin. A trusted key shared
 // with another device (DuplicateHostKey) proves nothing and displaces nothing.
+//
+// Unlike the window bypass and canReplace it does not need automatic
+// activation: in activation=manual (or a generation forced to manual) the
+// displaced pin is a squatter's and the new pin waits for an admin, but the
+// real device must not be locked out by the squatter.
 func canDisplace(cur api.IdentityEntry, att *attested, pol api.PolicyEntry) bool {
-	return byTrustedKey(att, pol) &&
+	return att != nil && pol.TrustedHostKey != "" && !pol.DuplicateHostKey && att.hostKey == pol.TrustedHostKey &&
 		!cur.Voided && sameEpoch(cur, pol) &&
 		cur.AttestedHostKey != pol.TrustedHostKey &&
 		(pol.ApprovedFingerprint == "" || cur.Fingerprint != pol.ApprovedFingerprint)
@@ -411,6 +444,10 @@ func (h *Hub) displace(ctx context.Context, entry api.IdentityEntry, displaced s
 		}
 		next := entry
 		next.VoidedFingerprints = appendVoided(c.VoidedFingerprints, c.Fingerprint)
+		next.DistrustedKeys = distrustedAfterVoid(c)
+		for _, k := range entry.DistrustedKeys {
+			next.DistrustedKeys = appendBounded(next.DistrustedKeys, k, api.MaxDistrustedKeys)
+		}
 		next.Conflicts, next.LastConflictAt = c.Conflicts, c.LastConflictAt
 		next.Replacements, next.LastReplacedAt, next.LastReplacedFingerprint = c.Replacements, c.LastReplacedAt, c.LastReplacedFingerprint
 		if replace {

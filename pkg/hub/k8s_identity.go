@@ -149,28 +149,51 @@ var ErrFingerprintVoided = errors.New("hub: identity fingerprint was voided")
 func VoidEntry(cur api.IdentityEntry, reason string, at time.Time) api.IdentityEntry {
 	cur.Voided, cur.VoidedReason, cur.VoidedAt = true, reason, at
 	cur.VoidedFingerprints = appendVoided(cur.VoidedFingerprints, cur.Fingerprint)
+	cur.DistrustedKeys = distrustedAfterVoid(cur)
 	return cur
 }
 
-// appendVoided appends fp (newest last), drops duplicates and keeps the newest
-// api.MaxVoidedFingerprints. It never modifies list in place.
-func appendVoided(list []string, fp string) []string {
+// flagVoid reports whether a pin was voided because the device was flagged
+// compromised or failed its health check.
+func flagVoid(e api.IdentityEntry) bool {
+	return e.Voided && (e.VoidedReason == api.RevokeCompromised || e.VoidedReason == api.RevokeHealthCheckFailed)
+}
+
+// distrustedAfterVoid is e's DistrustedKeys, plus the key that attested e when
+// e is void for a flag (whoever caused the flag may hold that key). Entries
+// voided before DistrustedKeys existed are covered the same way.
+func distrustedAfterVoid(e api.IdentityEntry) []string {
+	if flagVoid(e) && e.AttestedHostKey != "" {
+		return appendBounded(e.DistrustedKeys, e.AttestedHostKey, api.MaxDistrustedKeys)
+	}
+	return slices.Clone(e.DistrustedKeys)
+}
+
+// appendBounded appends v (newest last), drops duplicates and empty values and
+// keeps the newest limit. It never modifies list in place.
+func appendBounded(list []string, v string, limit int) []string {
 	out := make([]string, 0, len(list)+1)
 	for _, f := range list {
-		if f != fp && f != "" {
+		if f != v && f != "" {
 			out = append(out, f)
 		}
 	}
-	if fp != "" {
-		out = append(out, fp)
+	if v != "" {
+		out = append(out, v)
 	}
-	if len(out) > api.MaxVoidedFingerprints {
-		out = out[len(out)-api.MaxVoidedFingerprints:]
+	if len(out) > limit {
+		out = out[len(out)-limit:]
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// appendVoided appends fp (newest last), drops duplicates and keeps the newest
+// api.MaxVoidedFingerprints. It never modifies list in place.
+func appendVoided(list []string, fp string) []string {
+	return appendBounded(list, fp, api.MaxVoidedFingerprints)
 }
 
 // IsVoidedFingerprint reports whether fp was voided according to e: either it
@@ -194,7 +217,8 @@ func IsVoidedFingerprint(e api.IdentityEntry, fp string) bool {
 //     before; it is not pinned.
 //   - otherwise next is the entry to store: entry, carrying over the voided
 //     fingerprint history (including cur's own fingerprint when cur is void)
-//     and the conflict history of the device it replaces.
+//     and the conflict history of the device it replaces, and the keys that
+//     are distrusted (DistrustedKeys).
 func ReplacePin(cur *api.IdentityEntry, entry api.IdentityEntry) (next api.IdentityEntry, same bool, err error) {
 	if cur == nil {
 		return entry, false, nil
@@ -218,6 +242,17 @@ func ReplacePin(cur *api.IdentityEntry, entry api.IdentityEntry) (next api.Ident
 		merged = appendVoided(merged, f)
 	}
 	next.VoidedFingerprints = merged
+	// The keys whose pins were voided for a flag stay distrusted across pins
+	// (cur's own key too when cur is void): a later pin must not make the hub
+	// forget them.
+	var distrusted []string
+	for _, k := range distrustedAfterVoid(*cur) {
+		distrusted = appendBounded(distrusted, k, api.MaxDistrustedKeys)
+	}
+	for _, k := range entry.DistrustedKeys {
+		distrusted = appendBounded(distrusted, k, api.MaxDistrustedKeys)
+	}
+	next.DistrustedKeys = distrusted
 	next.Conflicts = cur.Conflicts + entry.Conflicts
 	next.LastConflictAt = cur.LastConflictAt
 	if entry.LastConflictAt.After(next.LastConflictAt) {
