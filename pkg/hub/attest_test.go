@@ -442,7 +442,7 @@ func TestAutoActivationByTrustedHostKey(t *testing.T) {
 		t.Fatalf("enroll: %d %s", st, body)
 	}
 	got := r.ids.entry(testNS, testDevice)
-	if got.ActivatedBy != api.ActivatedByHostKey || !got.ActivatedAt.Equal(r.clock.Now()) {
+	if got.ActivatedBy != api.ActivatedByDeviceKey || !got.ActivatedAt.Equal(r.clock.Now()) {
 		t.Fatalf("activation not recorded at enrollment: %+v", got)
 	}
 	// No admin approval anywhere, yet the session is granted.
@@ -466,7 +466,7 @@ func TestActivationRecordedOnceAndKeepsFirstSource(t *testing.T) {
 	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
 		t.Fatalf("%d %s", st, body)
 	}
-	if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByHostKey || !got.ActivatedAt.Equal(first.ActivatedAt) {
+	if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByDeviceKey || !got.ActivatedAt.Equal(first.ActivatedAt) {
 		t.Fatalf("activation record changed: %+v -> %+v", first, got)
 	}
 }
@@ -614,7 +614,7 @@ func TestReenrollWithAttestationUpgradesPin(t *testing.T) {
 		t.Fatalf("re-enroll: %d %s", st, body)
 	}
 	got := r.ids.entry(testNS, testDevice)
-	if got.AttestedHostKey != hk.fp || got.ActivatedBy != api.ActivatedByHostKey {
+	if got.AttestedHostKey != hk.fp || got.ActivatedBy != api.ActivatedByDeviceKey {
 		t.Fatalf("pin %+v", got)
 	}
 	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
@@ -717,7 +717,7 @@ func TestTrustedAttestationDisplacesSquattedPin(t *testing.T) {
 		t.Fatalf("attested real device: %d %s", st, body)
 	}
 	got := r.ids.entry(testNS, testDevice)
-	if got.IdentityPublicKey != r.dev.idPubB64 || got.AttestedHostKey != hk.fp || got.ActivatedBy != api.ActivatedByHostKey {
+	if got.IdentityPublicKey != r.dev.idPubB64 || got.AttestedHostKey != hk.fp || got.ActivatedBy != api.ActivatedByDeviceKey {
 		t.Fatalf("pin %+v", got)
 	}
 	if got.Conflicts < 2 { // the earlier unattested attempt (recorded) and the displacement
@@ -781,23 +781,31 @@ func TestDisplacementNeverHappensWhen(t *testing.T) {
 		st, _ := r.attestedEnroll(r.dev, hk)
 		notDisplaced(t, r, squatter, st)
 	})
-	t.Run("an admin approved the pin", func(t *testing.T) {
+	t.Run("an admin approved the pin and the device is online", func(t *testing.T) {
 		r, squatter := setup(t, func(r *rig, sq *deviceCreds) {
 			p := r.policy
 			p.ApprovedFingerprint = sq.fingerprint()
 			r.setPolicy(p)
 		})
+		// A live session of the approved pin: it is replaced only while offline.
+		real := r.dev
+		r.dev = squatter
+		r.deviceSessionOK()
+		r.dev = real
 		st, _ := r.attestedEnroll(r.dev, hk)
 		notDisplaced(t, r, squatter, st)
 	})
-	t.Run("the pin is attested by the trusted key itself", func(t *testing.T) {
+	t.Run("the pin is attested by the trusted key itself and the device is online", func(t *testing.T) {
 		r := newRig(t)
 		r.trust(hk)
 		if st, body := r.attestedEnroll(r.dev, hk); st != http.StatusCreated {
 			t.Fatalf("%d %s", st, body)
 		}
-		// A clone of the host key (the image was copied) enrolls a new identity:
-		// first wins, no displacement.
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("%d %s", st, body)
+		}
+		// A clone of the device key (the image was copied) enrolls a new identity
+		// while the device is online: first wins, no displacement.
 		clone := r.otherDevice(t)
 		st, _ := r.attestedEnroll(clone, hk)
 		if st != http.StatusConflict {

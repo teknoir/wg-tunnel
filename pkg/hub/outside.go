@@ -303,7 +303,7 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	pol = eff.Policy
 	fingerprint := identity.Fingerprint(idPub)
 
-	// Host-key attestation (api.CapAttest). An agent that advertises it must
+	// Device-key attestation (api.CapAttest). An agent that advertises it must
 	// present a valid one; a phase-1 agent enrolls as before.
 	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol)
 	if den != nil {
@@ -328,22 +328,32 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 			h.recordActivation(ctx, cur, activationSource(cur, pol))
 			return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 		}
-		if canDisplace(cur, att, pol) {
-			// A different identity, attested by the host key the admin trusted,
-			// meets a pin that is not: the pin was squatted by someone who
-			// holds the enrollment key but not the device.
+		displaceOrReplace := canDisplace(cur, att, pol)
+		// A trusted pin is replaced only while the device is offline: a live
+		// session of the pin keeps today's conflict.
+		replace := !displaceOrReplace && canReplace(cur, att, pol) && !h.DeviceOnline(ns, device)
+		if displaceOrReplace || replace {
+			// A different identity, attested by the device key that is
+			// trusted, meets a pin that is not (it was squatted by someone who
+			// holds the enrollment key but not the device), or a trusted pin of
+			// a device that is offline (it lost its identity).
 			if IsVoidedFingerprint(cur, fingerprint) {
 				return 0, nil, h.voidedEnrollDenial(ctx, d)
 			}
 			entry := newPinEntry(ns, device, idPub, fingerprint, pol, h.now(), att, caps)
-			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att)
+			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att, replace)
 			if err != nil {
 				h.log.Error("displacing identity pin failed", "ns", ns, "device", device, "err", err)
 				return 0, nil, denyUnavailable("identity store unavailable")
 			}
 			if replaced {
-				h.log.Warn("identity pin displaced by an enrollment attested by the trusted host key",
-					"ns", ns, "device", device, "displaced", cur.Fingerprint, "fingerprint", fingerprint)
+				if replace {
+					h.log.Warn("identity pin replaced by an enrollment attested by the device key",
+						"ns", ns, "device", device, "replaced", cur.Fingerprint, "fingerprint", fingerprint)
+				} else {
+					h.log.Warn("identity pin displaced by an enrollment attested by the trusted device key",
+						"ns", ns, "device", device, "displaced", cur.Fingerprint, "fingerprint", fingerprint)
+				}
 				h.endStaleDeviceSession(devKey{ns, device}, fingerprint)
 				h.recordActivation(ctx, got, activationSource(got, pol))
 				return h.enrollResult(ctx, got, req.IdentityPublicKey, true, d)
@@ -353,8 +363,9 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 	}
 	// No pin, or a pin of another epoch or generation (void): enrollment is
-	// allowed only inside the open window of this policy.
-	if !now.Before(pol.EnrollUntil) {
+	// allowed only inside the open window of this policy, or when the
+	// enrollment is attested by the device key the policy trusts.
+	if !now.Before(pol.EnrollUntil) && !byTrustedKey(att, pol) {
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
 	// A voided identity is never re-admitted, whatever the epoch: a new window
@@ -425,7 +436,7 @@ func (h *Hub) updateAttestation(ctx context.Context, cur api.IdentityEntry, att 
 		return withAttestation(c, att, caps)
 	})
 	if err != nil {
-		h.log.Warn("recording host-key attestation failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
+		h.log.Warn("recording attestation failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
 		return cur
 	}
 	if !found {

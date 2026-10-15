@@ -442,7 +442,7 @@ func TestStatusIdentityCarriesTheAttestation(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	id := decodeStatus(t, b).Identity
-	if id == nil || id.AttestedHostKey != hk.fp || id.AttestedHostKeyType != "ssh-ed25519" || id.ActivatedBy != api.ActivatedByHostKey ||
+	if id == nil || id.AttestedHostKey != hk.fp || id.AttestedHostKeyType != "ssh-ed25519" || id.ActivatedBy != api.ActivatedByDeviceKey ||
 		id.Fingerprint != r.dev.fingerprint() || id.Voided || id.EnrollmentGeneration != r.policy.EnrollmentGeneration {
 		t.Fatalf("identity %+v", id)
 	}

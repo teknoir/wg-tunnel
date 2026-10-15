@@ -140,9 +140,10 @@ func (s *session) identityView() identityView {
 // its epoch and generation are the policy's, and either
 //   - an admin approved exactly this identity fingerprint (api.ActivatedByApproval), or
 //   - automatic activation is on (the activation mode is not "manual", the
-//     generation is not forced manual, the trusted host key is not shared with
-//     another device) and the identity was enrolled with an attestation made
-//     by exactly the host key an admin trusted (api.ActivatedByHostKey).
+//     generation is not forced manual, the trusted device key is not shared
+//     with another device) and the identity was enrolled with an attestation
+//     made by exactly the device key the policy trusts (api.ActivatedByDeviceKey;
+//     entries activated before rev 3 keep their stored api.ActivatedByHostKey).
 //
 // by is the activation source when ok.
 func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
@@ -158,7 +159,7 @@ func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
 		!pol.DuplicateHostKey &&
 		pol.TrustedHostKey != "" &&
 		v.AttestedHostKey == pol.TrustedHostKey {
-		return true, api.ActivatedByHostKey
+		return true, api.ActivatedByDeviceKey
 	}
 	return false, ""
 }

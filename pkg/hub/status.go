@@ -229,7 +229,7 @@ func (h *Hub) deviceStatus(ctx context.Context, ns, device string, pol api.Polic
 		}
 	}
 	// A pinned identity of the current enrollment that is not usable yet waits
-	// for an admin (approval or a trusted host key).
+	// for an admin (approval or a trusted device key).
 	// Identity is the hub's own record of the pin (the identity store), not the
 	// Device CR status that device editors can write.
 	if pin, found, err := h.deps.Identity.Get(ctx, ns, device); err == nil && found {
@@ -239,7 +239,8 @@ func (h *Hub) deviceStatus(ctx context.Context, ns, device string, pol api.Polic
 		st.Identity = &api.LiveIdentity{
 			Fingerprint: pin.Fingerprint, AttestedHostKey: pin.AttestedHostKey, AttestedHostKeyType: pin.AttestedHostKeyType,
 			EnrollmentGeneration: pin.EnrollmentGeneration, EnrollmentEpoch: pin.EnrollmentEpoch, EnrolledAt: pin.EnrolledAt.UTC(),
-			ActivatedBy: pin.ActivatedBy, Voided: pin.Voided, Conflicts: pin.Conflicts,
+			ActivatedBy: pin.ActivatedBy, ActivatedAt: pin.ActivatedAt.UTC(), Voided: pin.Voided, Conflicts: pin.Conflicts,
+			Replacements: pin.Replacements, LastReplacedAt: pin.LastReplacedAt.UTC(),
 		}
 	}
 	for _, c := range clients {
