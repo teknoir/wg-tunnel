@@ -21,22 +21,26 @@ import (
 )
 
 const (
-	// StateDirMode is the mode of the identity directory: traversable by
-	// others (the attestor sidecar is root without capabilities), listable and
-	// writable by the agent only. The identity key is 0600.
+	// StateDirMode is the mode of the identity directory while the deprecated
+	// attestor sidecar is configured: traversable by others (the sidecar is
+	// root without capabilities), listable and writable by the agent only. The
+	// identity key is 0600. Without an exchange directory the directory is 0700.
 	StateDirMode os.FileMode = 0o711
+	// privateStateDirMode is the mode of the identity directory otherwise.
+	privateStateDirMode os.FileMode = 0o700
 
 	// DefaultAttestTimeout is how long the agent waits for the attestor.
 	DefaultAttestTimeout = 15 * time.Second
 )
 
-// attesting reports whether a host-key attestor is configured (ATTEST_EXCHANGE).
-func (a *Agent) attesting() bool { return a.cfg.AttestExchange != "" }
-
 // capabilities are the api.Cap* values advertised in DeviceSessionRequest.
 func (a *Agent) capabilities() []string {
 	caps := baseCapabilities()
-	if a.attesting() {
+	keys := a.deviceKeys()
+	switch {
+	case len(keys) > 0:
+		caps = append(caps, api.CapAttest, api.CapDeviceKey)
+	case a.legacyAttesting(keys):
 		caps = append(caps, api.CapAttest)
 	}
 	if a.cfg.P2P {
@@ -46,14 +50,20 @@ func (a *Agent) capabilities() []string {
 }
 
 // publishIdentityPub writes identity.pub (base64 raw public key) next to the
-// identity key so the attestor can compute the fingerprint without reading
-// the private key. It also lets the attestor traverse the state directory.
-// Both are best effort for an agent that has no attestor.
+// identity key so the (deprecated) attestor sidecar can compute the
+// fingerprint without reading the private key. It also lets the attestor
+// traverse the state directory. An agent without an exchange directory keeps
+// the directory private (0700) instead.
 func (a *Agent) publishIdentityPub(priv ed25519.PrivateKey) error {
-	if !a.attesting() {
+	dir := a.cfg.IdentityDir
+	if a.cfg.AttestExchange == "" {
+		if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm() == StateDirMode {
+			if err := os.Chmod(dir, privateStateDirMode); err != nil {
+				return fmt.Errorf("making %s private again: %w", dir, err)
+			}
+		}
 		return nil
 	}
-	dir := a.cfg.IdentityDir
 	if fi, err := os.Stat(dir); err == nil && fi.Mode().Perm() != StateDirMode {
 		if err := os.Chmod(dir, StateDirMode); err != nil {
 			return fmt.Errorf("making %s traversable for the attestor: %w", dir, err)
@@ -83,8 +93,16 @@ func (a *Agent) publishIdentityPub(priv ed25519.PrivateKey) error {
 	return nil
 }
 
+// hubLacksAttestation reports whether err says the hub has no attestation
+// endpoint (a phase-1 hub).
+func hubLacksAttestation(err error) bool {
+	var he *wgclient.Error
+	return errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusMethodNotAllowed) && he.Reason == ""
+}
+
 // attest obtains host-key attestations for the identity pub (base64) from the
-// attestor: single-use nonce from the hub, signature by the sidecar.
+// deprecated attestor sidecar: single-use nonce from the hub, signature by the
+// sidecar. Used only while the device holds no device key (see attestDeviceKeys).
 // (nil, nil) means the hub does not know attestation (phase-1 hub) or the
 // attestor said it cannot sign; the caller then enrolls without it.
 func (a *Agent) attest(ctx context.Context, rsaPEM []byte, priv ed25519.PrivateKey, pub string) ([]api.HostKeyAttestation, error) {
@@ -96,8 +114,7 @@ func (a *Agent) attest(ctx context.Context, rsaPEM []byte, priv ed25519.PrivateK
 	}
 	ch, err := wgclient.AttestChallenge(ctx, a.cfg.HubURL, a.cfg.HTTPClient, token)
 	if err != nil {
-		var he *wgclient.Error
-		if errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusMethodNotAllowed) && he.Reason == "" {
+		if hubLacksAttestation(err) {
 			a.log.Warn("the hub does not support host-key attestation; enrolling without it")
 			return nil, nil
 		}

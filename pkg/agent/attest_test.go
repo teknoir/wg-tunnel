@@ -279,7 +279,7 @@ func TestNoReattestationWithoutAnAttestorOrOnceAttested(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond)
 	a.mu.Lock()
-	a.attested = true
+	a.attestedSet = legacyAttestSet
 	a.mu.Unlock()
 	if a.shouldReattest() {
 		t.Error("re-attesting an identity that was attested")
