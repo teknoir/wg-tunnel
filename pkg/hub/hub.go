@@ -382,7 +382,7 @@ func (h *Hub) enforce(k devKey) {
 		}
 		// Device first: closes every spliced stream to it (its peer follows
 		// after the flush grace).
-		if dev != nil && h.endSession(dev, eff.Reason) {
+		if dev != nil && h.endDeviceRevoked(dev, eff.Reason, eff.Detail) {
 			ended++
 		}
 		for _, c := range clients {
@@ -411,7 +411,7 @@ func (h *Hub) enforce(k devKey) {
 		case !samePorts(eff.Policy.AllowedPorts, dev.ports):
 			reason, detail = reasonPortsChanged, "allowed ports changed"
 		}
-		if reason != "" && h.endSession(dev, reason) {
+		if reason != "" && h.endDeviceRevoked(dev, reason, detail) {
 			h.met.revocations.WithLabelValues(reason).Inc()
 			h.logRevoke(k, reason, detail, dev.id)
 		}

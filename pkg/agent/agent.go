@@ -51,6 +51,9 @@ type Agent struct {
 	curID atomic.Pointer[ed25519.PrivateKey]
 	// wake ends the wait between two attempts early.
 	wake chan struct{}
+	// lastImmediate is when the last hub notice skipped the back-off (guarded
+	// by mu): a hub that keeps ending sessions cannot make the agent spin.
+	lastImmediate time.Time
 
 	// dkMu guards the device key files and dkWarned.
 	dkMu     sync.Mutex
@@ -113,6 +116,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		if up >= a.cfg.Backoff.Stable {
 			failures = 0
 		}
+		if a.skipBackoff(ctx, err) {
+			continue
+		}
 		d := a.cfg.Backoff.delay(failures, a.rnd)
 		failures++
 		a.logFailure(err, d)
@@ -120,6 +126,44 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.log.Info("wg-agent stopping")
 	return nil
+}
+
+// noticeError is why a session ended on the hub's RevokeNotice: err is the
+// denial the notice carried, so wgclient.ReasonOf sees the notice's reason.
+type noticeError struct{ err *wgclient.Error }
+
+func (e *noticeError) Error() string { return "the hub ended the session: " + e.err.Error() }
+func (e *noticeError) Unwrap() error { return e.err }
+
+// noticeCooldown is how long after a notice that skipped the back-off the next
+// one may skip it again. Notices are rare (an admin resets enrollment), so the
+// limit only matters for a hub that misbehaves.
+const noticeCooldown = 10 * time.Second
+
+// skipBackoff reports whether the session ended on a notice that enrollment
+// was reset, in which case the agent starts the next attempt at once: after a
+// minimal jitter, without counting a failure and without a back-off. At most
+// one attempt per notice and per noticeCooldown skips the back-off; whatever
+// that attempt does goes through the normal back-off.
+func (a *Agent) skipBackoff(ctx context.Context, err error) bool {
+	var ne *noticeError
+	if !errors.As(err, &ne) || ne.err.Reason != api.ReasonReenroll {
+		return false
+	}
+	a.mu.Lock()
+	ok := a.lastImmediate.IsZero() || time.Since(a.lastImmediate) >= noticeCooldown
+	if ok {
+		a.lastImmediate = time.Now()
+	}
+	a.mu.Unlock()
+	if !ok {
+		return false
+	}
+	// 100-300 ms: enough to spread a fleet reset together, still "at once".
+	d := 100*time.Millisecond + time.Duration(a.rnd()*float64(200*time.Millisecond))
+	a.log.Info("the hub reset this device's enrollment; enrolling again", "in", d.Round(time.Millisecond).String())
+	a.sleepUnlessWoken(ctx, d)
+	return true
 }
 
 type fatalError struct{ err error }

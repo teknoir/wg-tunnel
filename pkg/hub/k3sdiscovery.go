@@ -25,15 +25,15 @@ import (
 // it again: the agent is the device, and the device is not trusted.
 
 const (
-	// maxK3sAnswerBody bounds the agent's answer: MaxK3sServices Services with
-	// MaxK3sServicePorts ports of the longest allowed strings stay below it.
-	maxK3sAnswerBody = 4 << 20
+	// maxK3sAnswerBody bounds the agent's answer. It equals the agent's own cap
+	// on the Kubernetes API answer, which is larger than the mapped list.
+	maxK3sAnswerBody = 8 << 20
 
 	k3sMaxNameLen        = 253 // a DNS-1123 subdomain, also the longest allowed label value
 	k3sMaxTypeLen        = 32
 	k3sMaxPortNameLen    = 63
 	k3sMaxProtocolLen    = 16
-	k3sMaxAppProtocolLen = 253
+	k3sMaxAppProtocolLen = 317 // a qualified name: 253-byte prefix, '/', 63-byte name
 	k3sMaxErrorLen       = 300
 )
 
@@ -188,10 +188,15 @@ func sanitizeK3sList(in api.K3sServiceList, now time.Time) api.K3sServiceList {
 			if len(c.Ports) >= api.MaxK3sServicePorts {
 				break
 			}
-			if p.Port < 1 || p.Port > 65535 || !k3sText(p.Name, k3sMaxPortNameLen) || !k3sText(p.AppProtocol, k3sMaxAppProtocolLen) {
+			if p.Port < 1 || p.Port > 65535 || !k3sText(p.Name, k3sMaxPortNameLen) {
 				continue
 			}
-			cp := api.K3sServicePort{Name: p.Name, Port: p.Port, AppProtocol: p.AppProtocol}
+			cp := api.K3sServicePort{Name: p.Name, Port: p.Port}
+			if k3sText(p.AppProtocol, k3sMaxAppProtocolLen) {
+				// Only a protocol hint for the console: an unusable one is
+				// dropped, the port stays.
+				cp.AppProtocol = p.AppProtocol
+			}
 			if slices.Contains([]string{"TCP", "UDP", "SCTP"}, p.Protocol) {
 				cp.Protocol = p.Protocol
 			}

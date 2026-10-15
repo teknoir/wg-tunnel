@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -335,11 +336,15 @@ func TestSanitizeK3sList(t *testing.T) {
 	for _, s := range got.Services {
 		w := want[s.Name]
 		if s.Name == "fine" {
-			if len(s.Ports) != 3 {
-				t.Errorf("ports kept: %+v", s.Ports)
+			// A port with an unusable appProtocol keeps the port and loses the hint.
+			wantPorts := []api.K3sServicePort{
+				in.Services[0].Ports[0],
+				{Name: "app", Port: 83},
+				{Name: "proto", Port: 84},
+				{Port: 85, Protocol: "UDP"},
 			}
-			if s.Ports[0] != in.Services[0].Ports[0] || s.Ports[1].Protocol != "" || s.Ports[2].Protocol != "UDP" {
-				t.Errorf("ports %+v", s.Ports)
+			if !slices.Equal(s.Ports, wantPorts) {
+				t.Errorf("ports %+v, want %+v", s.Ports, wantPorts)
 			}
 			s.Ports = nil
 		}
