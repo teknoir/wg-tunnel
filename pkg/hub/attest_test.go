@@ -903,7 +903,7 @@ func TestChallengeWhenStoreFullIsRateLimited(t *testing.T) {
 }
 
 func TestIdentityEntryJSONCarriesAttestationFields(t *testing.T) {
-	e := api.IdentityEntry{AttestedHostKey: "SHA256:x", AttestedHostKeyType: "ssh-ed25519", AgentCapabilities: []string{"attest-v1"}, ActivatedBy: api.ActivatedByHostKey}
+	e := api.IdentityEntry{AttestedHostKey: "SHA256:x", AttestedHostKeyType: "ssh-ed25519", AgentCapabilities: []string{"attest-v1"}, ActivatedBy: api.ActivatedByHostKey} //nolint:staticcheck // the pre-rev-3 value must still round-trip
 	b, _ := json.Marshal(e)
 	var back api.IdentityEntry
 	if err := json.Unmarshal(b, &back); err != nil || back.AttestedHostKey != "SHA256:x" || back.ActivatedBy != "host-key" {

@@ -686,7 +686,7 @@ func TestK8sIdentityStoreUpdate(t *testing.T) {
 	_, _, _ = s.Pin(ctx, idEntry(1, "keyA"))
 	at := time.Unix(50, 0).UTC()
 	cur, found, wrote, err := s.Update(ctx, "acme", "cam-1", func(c api.IdentityEntry) *api.IdentityEntry {
-		c.ActivatedBy, c.ActivatedAt, c.AttestedHostKey = api.ActivatedByHostKey, at, "SHA256:hk"
+		c.ActivatedBy, c.ActivatedAt, c.AttestedHostKey = api.ActivatedByHostKey, at, "SHA256:hk" //nolint:staticcheck // an entry from before rev 3
 		return &c
 	})
 	if err != nil || !found || !wrote || cur.ActivatedBy != "host-key" || cur.AttestedHostKey != "SHA256:hk" {

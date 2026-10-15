@@ -1,11 +1,11 @@
 // Package attestor is the host-key attestation sidecar of the device Deployment
 // and the file exchange the agent uses to talk to it.
 //
-// Deprecated: since rev 3 the agent signs the attestation itself with the
-// per-device device key (api.DeviceKeyFile, or an envelope delivered over MQTT,
-// see pkg/devicekey). The agent uses this sidecar only on a device that holds no
-// device key; the package is removed one release after device-controller
-// stopped deploying the sidecar.
+// This package is deprecated: since rev 3 the agent signs the attestation
+// itself with the per-device device key (api.DeviceKeyFile, or an envelope
+// delivered over MQTT, see pkg/devicekey). The agent uses the sidecar only on a
+// device that holds no device key; the package is removed one release after
+// device-controller stopped deploying the sidecar.
 //
 // The attestor runs as root with every Linux capability dropped, so it can
 // read the 0600 root-owned sshd host keys (root owns them, no DAC capability

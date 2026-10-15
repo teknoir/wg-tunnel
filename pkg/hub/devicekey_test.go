@@ -289,13 +289,13 @@ func TestLegacyHostKeyActivationStaysUsable(t *testing.T) {
 		t.Fatalf("%d %s", st, body)
 	}
 	_, _, _, _ = r.ids.Update(t.Context(), testNS, testDevice, func(c api.IdentityEntry) *api.IdentityEntry {
-		c.ActivatedBy = api.ActivatedByHostKey
+		c.ActivatedBy = api.ActivatedByHostKey //nolint:staticcheck // entries from before rev 3
 		return &c
 	})
 	if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
 		t.Fatalf("session: %d %s", st, body)
 	}
-	if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByHostKey {
+	if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByHostKey { //nolint:staticcheck // entries from before rev 3
 		t.Fatalf("stored source rewritten: %+v", got)
 	}
 }
