@@ -24,9 +24,12 @@ type fakeNonce struct{ ns, name, idk string }
 
 // Attested is what the fake hub recorded for a device's last enrollment.
 type Attested struct {
-	// HostKey is the SHA256 fingerprint of the key that signed ("" = none).
+	// HostKey is the SHA256 fingerprint of the trusted key if it signed, else the first key that signed ("" =
+	// none), KeyType its type; Keys lists every key that signed (a device
+	// holding two device keys signs with both).
 	HostKey string
 	KeyType string
+	Keys    []string
 	// Capabilities the agent advertised when it enrolled.
 	Capabilities []string
 	// Challenges counts the nonces issued.
@@ -114,6 +117,7 @@ func (h *Hub) verifyEnrollAttest(d *device, ns, name string, idk ed25519.PublicK
 		return ""
 	}
 	fp := identity.Fingerprint(idk)
+	var got Attested
 	for _, a := range req.HostKeyAttestations {
 		rec, ok := st.nonces[a.Nonce]
 		delete(st.nonces, a.Nonce)
@@ -128,8 +132,16 @@ func (h *Hub) verifyEnrollAttest(d *device, ns, name string, idk ed25519.PublicK
 		if err != nil {
 			continue
 		}
-		st.last = Attested{HostKey: ssh.FingerprintSHA256(pub), KeyType: pub.Type(), Capabilities: slices.Clone(req.Capabilities), Challenges: st.last.Challenges}
-		return ""
+		fp := ssh.FingerprintSHA256(pub)
+		if got.HostKey == "" || fp == d.trusted && got.HostKey != d.trusted {
+			got.HostKey, got.KeyType = fp, pub.Type()
+		}
+		got.Keys = append(got.Keys, fp)
 	}
-	return api.ReasonAttestRequired
+	if got.HostKey == "" {
+		return api.ReasonAttestRequired
+	}
+	got.Capabilities, got.Challenges = slices.Clone(req.Capabilities), st.last.Challenges
+	st.last = got
+	return ""
 }

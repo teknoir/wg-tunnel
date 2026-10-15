@@ -17,6 +17,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
+	"github.com/teknoir/wg-tunnel/internal/wgdev"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
@@ -57,7 +58,7 @@ func startPeerAllowed(t *testing.T, priv wgkey.PrivateKey, addr, hubPubB64, endp
 	if err := dev.Up(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(dev.Close)
+	t.Cleanup(func() { wgdev.Close(dev) })
 	return &wgPeer{dev: dev, net: tnet, addr: a}
 }
 

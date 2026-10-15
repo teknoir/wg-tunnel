@@ -260,8 +260,13 @@ type Rig struct {
 	RSAKeyPath string
 	// HostKeyFingerprint and AttestExchange are set by Options.Attest.
 	HostKeyFingerprint string
+	hostKeysDir        string
 	AttestExchange     string
 	IdentityDir        string
+	// DeviceKeyFile and DeviceKeyEnvelope are where the agent looks for the
+	// bootstrap device key and the sealed envelope (see DeliverDeviceKey).
+	DeviceKeyFile     string
+	DeviceKeyEnvelope string
 
 	HubLogs, AgentLogs, ClientLogs *LogBuf
 
@@ -323,6 +328,8 @@ func New(t testing.TB, opts Options) *Rig {
 	must(t, os.WriteFile(filepath.Join(hostDir, "ssh_host_ed25519_key.pub"), []byte(r.HostKey+" root@e2e\n"), 0o644))
 	r.hostKeysGlob = filepath.Join(hostDir, "ssh_host_*_key.pub")
 	r.IdentityDir = filepath.Join(dir, "identity")
+	r.DeviceKeyFile = filepath.Join(dir, "ztna_device_key")
+	r.DeviceKeyEnvelope = filepath.Join(dir, "device-key-envelope", api.DeviceKeyEnvelopeKey)
 	if opts.Attest {
 		r.setupAttest(dir)
 	}
@@ -575,6 +582,9 @@ func (r *Rig) agentConfig() agent.Config {
 		StaleAfter: r.Opts.StaleAfter, HandshakeTimeout: 20 * time.Second,
 		RenewRetry: 500 * time.Millisecond, RenewTimeout: 3 * time.Second,
 		DeadAfter: r.Opts.DeadAfter, AttestExchange: r.AttestExchange,
+		// Device keys: the rig's own files (never /etc/teknoir), polled fast.
+		DeviceKeyFile: r.DeviceKeyFile, DeviceKeyEnvelope: r.DeviceKeyEnvelope,
+		DeviceKeyPoll: 100 * time.Millisecond, ReattestInterval: 300 * time.Millisecond,
 		// The ssh service reaches the fake sshd (the echo server) instead of port 22.
 		SSHPort:     r.Echo.Port,
 		AllowTarget: r.allowLoopback,
@@ -686,13 +696,16 @@ type Agent struct {
 	// Agent is the running agent (for its test hooks and status).
 	Agent  *agent.Agent
 	cancel context.CancelFunc
-	done   chan error
+	// finished is closed when Run returned; res is its result.
+	finished chan struct{}
+	res      error
 }
 
-// Stop stops the agent and waits for it.
+// Stop stops the agent and waits for it. It can be called more than once.
 func (a *Agent) Stop() error {
 	a.cancel()
-	return <-a.done
+	<-a.finished
+	return a.res
 }
 
 // StartAgent runs the real agent against the hub; it is stopped at test end.
@@ -701,8 +714,8 @@ func (r *Rig) StartAgent() *Agent {
 	a, err := agent.New(r.AgentConfig())
 	must(r.T, err)
 	ctx, cancel := context.WithCancel(context.Background())
-	ag := &Agent{Agent: a, cancel: cancel, done: make(chan error, 1)}
-	go func() { ag.done <- a.Run(ctx) }()
+	ag := &Agent{Agent: a, cancel: cancel, finished: make(chan struct{})}
+	go func() { ag.res = a.Run(ctx); close(ag.finished) }()
 	r.secMu.Lock()
 	r.agentRuns++
 	r.secMu.Unlock()
@@ -714,7 +727,7 @@ func (r *Rig) StartAgent() *Agent {
 		once.Do(func() {
 			cancel()
 			select {
-			case <-ag.done:
+			case <-ag.finished:
 			case <-time.After(15 * time.Second):
 				r.T.Error("e2erig: agent did not stop")
 			}

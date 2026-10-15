@@ -12,6 +12,10 @@ import (
 	"github.com/teknoir/wg-tunnel/pkg/wgclient"
 )
 
+// These tests drive the deprecated attestor sidecar (the SSH host key as the
+// trusted key); devicekey_test.go covers the device key itself. The hub does not
+// care which key signed: the trusted one activates (api.ActivatedByDeviceKey).
+//
 // With the device's SSH host key trusted, an enrollment attested by that key
 // activates by itself: no admin approval, a user reaches the device, and the
 // hub recorded how the identity was activated. Clearing the anchor cuts the
@@ -28,7 +32,7 @@ func TestAutoActivationByTrustedHostKey(t *testing.T) {
 		t.Fatal("test setup: nobody approved the identity")
 	}
 	pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName)
-	if pin.AttestedHostKey != r.HostKeyFingerprint || pin.ActivatedBy != api.ActivatedByHostKey || pin.ActivatedAt.IsZero() ||
+	if pin.AttestedHostKey != r.HostKeyFingerprint || pin.ActivatedBy != api.ActivatedByDeviceKey || pin.ActivatedAt.IsZero() ||
 		pin.Fingerprint != r.AgentFingerprint() {
 		t.Fatalf("pin %+v, host key %s", pin, r.HostKeyFingerprint)
 	}
@@ -110,13 +114,17 @@ func TestClearedFlagForcesManualActivation(t *testing.T) {
 	}
 
 	// Generation 3 with the force cleared (ForceManualGeneration < generation):
-	// the anchor activates the next identity by itself again.
+	// the anchor activates the next identity by itself again, once the key that
+	// was in use when the device was flagged is rotated: until then the hub
+	// refuses it (its pin was voided for the flag).
+	r.RotateHostKey()
+	r.TrustHostKey()
 	r.Policy.Update(e2erig.NS, e2erig.DeviceName, func(e *api.PolicyEntry) {
 		e.EnrollmentGeneration, e.EnrollmentEpoch, e.ApprovedFingerprint = 3, "e2e-epoch-3", ""
 		e.EnrollUntil = time.Now().Add(time.Hour)
 	})
 	r.WaitDeviceUp(3)
-	if pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName); pin.EnrollmentGeneration != 3 || pin.ActivatedBy != api.ActivatedByHostKey {
+	if pin := r.Identity.Entry(e2erig.NS, e2erig.DeviceName); pin.EnrollmentGeneration != 3 || pin.ActivatedBy != api.ActivatedByDeviceKey {
 		t.Fatalf("generation 3 pin %+v", pin)
 	}
 }

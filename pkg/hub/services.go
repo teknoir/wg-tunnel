@@ -29,7 +29,7 @@ const (
 	servicePushTO    = 5 * time.Second
 )
 
-var knownCaps = []string{api.CapServices, api.CapControl, api.CapAttest, api.CapP2P}
+var knownCaps = []string{api.CapServices, api.CapControl, api.CapAttest, api.CapDeviceKey, api.CapP2P}
 
 // sanitizeCaps keeps the capabilities this hub knows, once each. An unknown
 // capability is ignored: it can only ever enable a feature the hub has.

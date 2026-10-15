@@ -39,11 +39,22 @@ type Agent struct {
 
 	mu       sync.Mutex
 	loggedFP string
-	// attested: this process delivered a host-key attestation with an
-	// enrollment of the current identity; lastReattest is when it last tried
-	// to (while waiting for approval).
-	attested     bool
+	// attestedSet identifies the keys (attestSetOf, or legacyAttestSet) this
+	// process delivered attestations for with an enrollment of the current
+	// identity, "" when it delivered none. triedSet and lastReattest are the
+	// set of the last try to attest again and when that was.
+	attestedSet  string
+	triedSet     string
 	lastReattest time.Time
+	// curID is the identity key of the current attempt (the key watcher
+	// attests it again when the device keys change).
+	curID atomic.Pointer[ed25519.PrivateKey]
+	// wake ends the wait between two attempts early.
+	wake chan struct{}
+
+	// dkMu guards the device key files and dkWarned.
+	dkMu     sync.Mutex
+	dkWarned map[string]struct{}
 
 	// pb is the plane B of the current device session (nil: none).
 	pb atomic.Pointer[planeB]
@@ -68,7 +79,7 @@ func New(cfg Config) (*Agent, error) {
 	target.applyDefaults()
 	return &Agent{
 		cfg: cfg, log: cfg.Logger, sub: api.DeviceSubject(cfg.Namespace, cfg.DeviceID),
-		sleep: sleepCtx, rnd: randFloat, target: target,
+		sleep: sleepCtx, rnd: randFloat, target: target, wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -82,6 +93,12 @@ func (a *Agent) posture() api.Posture {
 // fix (an unusable identity directory).
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("wg-agent starting", "device", a.cfg.DeviceID, "namespace", a.cfg.Namespace, "hub", a.cfg.HubURL, "version", version.Version)
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		a.watchDeviceKeys(ctx)
+	}()
+	defer func() { <-watcherDone }()
 	failures := 0
 	for ctx.Err() == nil {
 		up, err := a.attempt(ctx)
@@ -99,7 +116,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		d := a.cfg.Backoff.delay(failures, a.rnd)
 		failures++
 		a.logFailure(err, d)
-		a.sleep(ctx, d)
+		a.sleepUnlessWoken(ctx, d)
 	}
 	a.log.Info("wg-agent stopping")
 	return nil
@@ -121,6 +138,7 @@ var hints = map[string]string{
 	api.ReasonSessionLimit:    "the hub's session limit is reached",
 	api.ReasonPosture:         "the hub rejected this agent's version",
 	api.ReasonPendingApproval: "an admin must approve this device identity (fingerprint above) in the Teknoir UI",
+	api.ReasonAttestRequired:  "a device key is trusted for this device and this agent holds none it can attest with; an admin can rotate the device key in the Teknoir UI to deliver one",
 }
 
 func (a *Agent) logFailure(err error, wait time.Duration) {
@@ -157,6 +175,7 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		return 0, &fatalError{fmt.Errorf("identity key unusable: %w", err)}
 	}
 	a.logFingerprint(priv)
+	a.curID.Store(&priv)
 	if err := a.publishIdentityPub(priv); err != nil {
 		return 0, err
 	}
@@ -190,13 +209,14 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		case api.ReasonNotEnrolled:
 			a.log.Info("device identity is not enrolled; enrolling")
 		case api.ReasonPendingApproval:
-			// The pin exists but is not usable. If it was enrolled without a
-			// host-key attestation (the attestor could not sign yet, or this
-			// is a new process and nothing is known), try again to attest it:
-			// the hub accepts the same identity idempotently, records the
-			// attestation, and activates the pin when the host key is the one
-			// an admin trusted. Slow timer; no-op without an attestor.
-			if enrolled || !a.shouldReattest() {
+			// The pin exists but is not usable. If it was enrolled without an
+			// attestation by the keys held now (a new process, a device key
+			// that came later, an attestor that could not sign yet), try again
+			// to attest it: the hub accepts the same identity idempotently,
+			// records the attestation, and activates the pin when the device
+			// key is the one the policy trusts. Slow timer unless the keys
+			// changed; no-op without a device key or attestor.
+			if enrolled || !a.shouldReattest(true) {
 				return 0, cerr
 			}
 			a.log.Info("the identity is waiting for approval; attesting it again")
@@ -212,13 +232,7 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 				return 0, fmt.Errorf("hub asked to re-enroll right after enrollment: %w", cerr)
 			}
 			a.log.Info("enrollment was reset; generating a new identity")
-			rotated, rerr := identity.Rotate(a.cfg.IdentityDir)
-			if rerr != nil {
-				return 0, &fatalError{fmt.Errorf("rotating identity key: %w", rerr)}
-			}
-			priv = rotated
-			a.logFingerprint(priv)
-			if err := a.publishIdentityPub(priv); err != nil {
+			if priv, err = a.rotateIdentity(); err != nil {
 				return 0, err
 			}
 		default:
@@ -227,27 +241,112 @@ func (a *Agent) attempt(ctx context.Context) (up time.Duration, err error) {
 		if enrolled {
 			return 0, fmt.Errorf("still not enrolled after enrollment: %w", cerr)
 		}
-		if eerr := a.enroll(ctx, priv); eerr != nil {
+		eerr := a.enroll(ctx, priv)
+		if wgclient.ReasonOf(eerr) == api.ReasonReenroll {
+			// The hub voided this identity (a replacement of the device's pin
+			// while it was offline, a flag) and, because the enrollment was
+			// attested by the trusted device key, tells the device itself to
+			// start over with a new identity.
+			a.log.Info("the hub voided this device identity; generating a new one")
+			if priv, err = a.rotateIdentity(); err != nil {
+				return 0, err
+			}
+			eerr = a.enroll(ctx, priv)
+		}
+		if eerr != nil {
 			return 0, eerr
 		}
 		enrolled = true
 	}
 }
 
-// shouldReattest reports whether a pending identity should be attested again
-// now: an attestor is configured, this process has not delivered an
-// attestation, and the last try is older than Config.ReattestInterval.
-func (a *Agent) shouldReattest() bool {
-	if !a.attesting() {
+// rotateIdentity replaces the identity key with a new one and makes it the
+// identity of the current attempt.
+func (a *Agent) rotateIdentity() (ed25519.PrivateKey, error) {
+	priv, err := identity.Rotate(a.cfg.IdentityDir)
+	if err != nil {
+		return nil, &fatalError{fmt.Errorf("rotating identity key: %w", err)}
+	}
+	a.curID.Store(&priv)
+	a.logFingerprint(priv)
+	if err := a.publishIdentityPub(priv); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+// shouldReattest reports whether the identity should be attested again now:
+// there are keys to attest with and this process has not delivered an
+// attestation made with exactly this set of keys. A changed set is attested at
+// once. An unchanged one is attested only while the hub still holds the
+// identity back (pending: the hub records one attestation per pin, and the key
+// it preferred then may not be the one it trusts now), at most every
+// Config.ReattestInterval.
+func (a *Agent) shouldReattest(pending bool) bool {
+	set := a.currentAttestSet()
+	if set == "" {
 		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.attested || time.Since(a.lastReattest) < a.cfg.ReattestInterval {
+	if (a.attestedSet == set && !pending) || (set == a.triedSet && time.Since(a.lastReattest) < a.cfg.ReattestInterval) {
 		return false
 	}
-	a.lastReattest = time.Now()
+	a.triedSet, a.lastReattest = set, time.Now()
 	return true
+}
+
+// watchDeviceKeys notices a device key that appeared or changed (the bootstrap
+// file, or an envelope device-controller delivered) and attests the current
+// identity again, whatever state the session is in: a pending pin activates, an
+// active one records the key. It returns when ctx ends.
+func (a *Agent) watchDeviceKeys(ctx context.Context) {
+	poll := a.cfg.DeviceKeyPoll
+	t := time.NewTicker(poll)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		priv := a.curID.Load()
+		if priv == nil || len(a.deviceKeys()) == 0 || !a.shouldReattest(false) {
+			continue
+		}
+		a.log.Info("the device keys changed; attesting the device identity again")
+		if err := a.enroll(ctx, *priv); err != nil {
+			if ctx.Err() == nil {
+				a.log.Warn("attesting the device identity again failed", "error", err.Error())
+			}
+			if wgclient.ReasonOf(err) == api.ReasonReenroll { // the session loop rotates the identity
+				select {
+				case a.wake <- struct{}{}:
+				default:
+				}
+			}
+			continue
+		}
+		select { // the session attempt may be waiting for exactly this
+		case a.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// sleepUnlessWoken waits d between two attempts, or less when the key watcher
+// attested the identity meanwhile.
+func (a *Agent) sleepUnlessWoken(ctx context.Context, d time.Duration) {
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-a.wake:
+			cancel()
+		case <-wctx.Done():
+		}
+	}()
+	a.sleep(wctx, d)
 }
 
 func (a *Agent) logFingerprint(priv ed25519.PrivateKey) {
@@ -295,18 +394,31 @@ func (a *Agent) create(ctx context.Context, priv ed25519.PrivateKey, hostKeys []
 }
 
 // enroll pins the identity key at the hub, proving possession of the legacy
-// RSA device key (admission) and of the identity key (proof of possession).
+// RSA device key (admission) and of the identity key (proof of possession),
+// and attests it with the device keys. Enrolling the pinned identity again is
+// how a changed set of device keys reaches the hub.
 func (a *Agent) enroll(ctx context.Context, priv ed25519.PrivateKey) error {
 	rsaPEM, err := os.ReadFile(a.cfg.RSAKeyPath)
 	if err != nil {
 		return fmt.Errorf("reading device RSA key for enrollment: %w", err)
 	}
 	pub := identity.EncodePublicKey(priv.Public().(ed25519.PublicKey))
-	var attestations []api.HostKeyAttestation
-	if a.attesting() {
+	var (
+		attestations []api.HostKeyAttestation
+		caps         []string
+		set          string
+	)
+	switch keys := a.deviceKeys(); {
+	case len(keys) > 0:
+		if attestations, err = a.attestDeviceKeys(ctx, rsaPEM, priv, pub, keys); err != nil {
+			return fmt.Errorf("device key attestation: %w", err)
+		}
+		caps, set = []string{api.CapAttest, api.CapDeviceKey}, attestSetOf(keys)
+	case a.legacyAttesting(keys):
 		if attestations, err = a.attest(ctx, rsaPEM, priv, pub); err != nil {
 			return fmt.Errorf("host-key attestation: %w", err)
 		}
+		caps, set = []string{api.CapAttest}, legacyAttestSet
 	}
 	token, jti, err := identity.MintEnrollJWT(rsaPEM, a.sub, pub, identityTokenTTL)
 	if err != nil {
@@ -320,15 +432,17 @@ func (a *Agent) enroll(ctx context.Context, priv ed25519.PrivateKey) error {
 	if len(attestations) > 0 {
 		// Advertised only together with a valid attestation: an agent that
 		// could not obtain one enrolls like a phase-1 agent (admin approval).
-		req.Capabilities, req.HostKeyAttestations = []string{api.CapAttest}, attestations
+		req.Capabilities, req.HostKeyAttestations = caps, attestations
+	} else {
+		set = ""
 	}
-	a.mu.Lock()
-	a.attested = len(attestations) > 0
-	a.mu.Unlock()
 	resp, err := wgclient.Enroll(ctx, a.cfg.HubURL, a.cfg.HTTPClient, token, req)
 	if err != nil {
 		return fmt.Errorf("enrolling: %w", err)
 	}
+	a.mu.Lock()
+	a.attestedSet = set
+	a.mu.Unlock()
 	a.log.Info("device identity enrolled", "fingerprint", resp.Fingerprint, "generation", resp.EnrollmentGeneration)
 	return nil
 }

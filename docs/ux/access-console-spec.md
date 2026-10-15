@@ -4,6 +4,26 @@
 **Prototype:** `access-console.html` in this folder. It is one static file, and the only external resource is JetBrains Mono from Google Fonts. Open it in a browser and use the small "Prototype" switcher at the bottom right (two selects: state, and view as admin or member), or open it with a hash: `#active`, `#waiting`, `#waitingok`, `#waitingwg`, `#forced`, `#unattested`, `#duplicate`, `#unavail`, `#unavailkey`, `#mismatch`, `#revoked`, `#offline`, `#off`, `#stale`, `#loading`, `#dialog`, `#dialogbad`, `#dialogks`. Add `member` to view the page as a non-admin, for example `#active,member`.
 **Implements:** W5 (backstage). It replaces `DeviceWireGuardContent.tsx` on branch `robot`.
 
+## Rev 4: zero-touch device key (supersedes the host-key flow of sections 3.1 to 3.7)
+
+**Requirement (Anders, 2026-10-15):** "The device bootstrap process is a trusted process and should create what is needed for all Teknoir platform services to a device including WireGuard. It should not require any hands-on steps to connect a bootstrapped device with for example WireGuard. If any secrets still have to be exchanged they have to do so through MQTT, the primary channel, managed securely by the device-controller." Design: `plans/ztna-rev3-zero-touch.md`; wire contract: `pkg/api` ("Device key (rev 3)") and `pkg/devicekey`.
+
+The trust anchor is no longer an SSH host key an admin compares and trusts, but a per-device **device key** that the trusted bootstrap installs or that device-controller seals to the device's RSA key and ships over MQTT. The agent signs its enrollment with it and the hub activates the identity. Nobody pastes or compares a fingerprint, so the host-key comparison UI, the paste box and the "Trust this host key" actions are gone. Where sections 3.1 to 3.7 and the prototype say "host key", read "device key", and apply the changes below. The wire names `trustedHostKey`, `attestedHostKey` and `duplicateHostKey` are kept.
+
+| Rev 3 (host key) | Rev 4 (device key) |
+|---|---|
+| Waiting for a first trust (3.3): paste `ssh-keygen -lf`, "Trust host key and activate" | **Waiting for device:** no pin yet and a device key is set; no action. **Delivering device key over MQTT (since t):** the key was sent and the hub has not seen it yet; no action. |
+| Auto-activated (3.1), "Update trusted host key" | **Active, Automatic, device key.** The label names the source: bootstrap, virtual device or MQTT. For MQTT it reads "legacy bootstrap: as strong as the device RSA key during delivery". Admins get **Rotate device key** (reason required) in place of "Update trusted host key". |
+| Host key mismatch (3.4) | **Device key mismatch**, red, shown only after delivery is confirmed (an attestation by another key than the one device-controller set). |
+| Unattested enrollment (3.6.1), Duplicate host key (3.6.3) | Kept. "Duplicate host key" is relabelled **Duplicate device key**. |
+| Forced manual after a compromise (3.6.2) | A cleared compromised or health flag no longer forces manual approval: it bumps the generation, **rotates the device key over MQTT** and re-activates automatically. The state stays only for an admin who ticks "require manual approval next" (`manual-next`) or sets `activation=manual`. |
+| Automatic verification unavailable (3.6.4), "no ed25519 host key", `ssh-keygen -A` | Removed. The kind `unavailable-key` is gone; `unavailable-old` is renamed **Agent update rolling out** (an agent without `device-key-v1`). |
+| Manual approval of one identity (3.7), "Approve identity only" | Kept for `manual`, `forced` and `unattested` states only; no longer offered next to a pending first trust. |
+
+**Facts on the card:** device-key fingerprint, source and set-at, delivered and confirmed times, WireGuard identity fingerprint, activated at and by (`approval`, `device-key`, or `host-key` for entries from before rev 3), enrollment epoch and generation, and replacements. A **replacement** happens when the device is offline, lost its identity and enrolls again with the device key; the card shows "Identity replaced N times, last at t" and the fingerprint that was replaced. While the device is online the same enrollment is a conflict, as before. A voided identity that comes back with the device key is told to start over and is not counted as a conflict. After a flag was cleared the card still shows "waiting for a new device key" until device-controller has rotated the key: the key that attested the flagged identity activates nothing again.
+
+**Actions:** `trust-host-key` returns 410; `approve-identity` is allowed only in the manual, forced and unattested states; `clear-flags` gets "require manual approval next"; new `rotate-device-key` (admin, reason) and `register-device-key` (editor, used by `tnctl bootstrap`). The prototype `access-console.html` still shows the rev 3 states and is not updated.
+
 ---
 
 ## 0. Design plan

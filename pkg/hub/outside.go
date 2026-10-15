@@ -303,20 +303,22 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 	pol = eff.Policy
 	fingerprint := identity.Fingerprint(idPub)
 
-	// Host-key attestation (api.CapAttest). An agent that advertises it must
-	// present a valid one; a phase-1 agent enrolls as before.
-	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol)
+	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
+	if err != nil {
+		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
+		return 0, nil, denyUnavailable("identity store unavailable")
+	}
+
+	// Device-key attestation (api.CapAttest). An agent that advertises it must
+	// present a valid one; a phase-1 agent enrolls as before. An attestation by
+	// a key that signed a pin voided for a flag is refused (distrustedKeys).
+	att, den := h.verifyAttestations(ns, device, fingerprint, req, pol, h.distrustedKeys(ctx, cur, found, pol))
 	if den != nil {
 		h.recordForeignAttemptConflict(ctx, ns, device, pol, req.IdentityPublicKey)
 		return 0, nil, den
 	}
 	caps := sanitizeCaps(req.Capabilities)
 
-	cur, found, err := h.deps.Identity.Get(ctx, ns, device)
-	if err != nil {
-		h.log.Error("reading identity pin failed", "ns", ns, "device", device, "err", err)
-		return 0, nil, denyUnavailable("identity store unavailable")
-	}
 	if found && sameEpoch(cur, pol) {
 		// First wins per enrollment epoch.
 		if cur.Voided {
@@ -328,22 +330,32 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 			h.recordActivation(ctx, cur, activationSource(cur, pol))
 			return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 		}
-		if canDisplace(cur, att, pol) {
-			// A different identity, attested by the host key the admin trusted,
-			// meets a pin that is not: the pin was squatted by someone who
-			// holds the enrollment key but not the device.
+		displaceOrReplace := canDisplace(cur, att, pol)
+		// A trusted pin is replaced only while the device is offline: a live
+		// session of the pin keeps today's conflict.
+		replace := !displaceOrReplace && canReplace(cur, att, pol) && !h.DeviceOnline(ns, device)
+		if displaceOrReplace || replace {
+			// A different identity, attested by the device key that is
+			// trusted, meets a pin that is not (it was squatted by someone who
+			// holds the enrollment key but not the device), or a trusted pin of
+			// a device that is offline (it lost its identity).
 			if IsVoidedFingerprint(cur, fingerprint) {
-				return 0, nil, h.voidedEnrollDenial(ctx, d)
+				return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 			}
 			entry := newPinEntry(ns, device, idPub, fingerprint, pol, h.now(), att, caps)
-			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att)
+			got, replaced, err := h.displace(ctx, entry, cur.Fingerprint, pol, att, replace)
 			if err != nil {
 				h.log.Error("displacing identity pin failed", "ns", ns, "device", device, "err", err)
 				return 0, nil, denyUnavailable("identity store unavailable")
 			}
 			if replaced {
-				h.log.Warn("identity pin displaced by an enrollment attested by the trusted host key",
-					"ns", ns, "device", device, "displaced", cur.Fingerprint, "fingerprint", fingerprint)
+				if replace {
+					h.log.Warn("identity pin replaced by an enrollment attested by the device key",
+						"ns", ns, "device", device, "replaced", cur.Fingerprint, "fingerprint", fingerprint)
+				} else {
+					h.log.Warn("identity pin displaced by an enrollment attested by the trusted device key",
+						"ns", ns, "device", device, "displaced", cur.Fingerprint, "fingerprint", fingerprint)
+				}
 				h.endStaleDeviceSession(devKey{ns, device}, fingerprint)
 				h.recordActivation(ctx, got, activationSource(got, pol))
 				return h.enrollResult(ctx, got, req.IdentityPublicKey, true, d)
@@ -353,18 +365,19 @@ func (h *Hub) handleEnroll(ctx context.Context, r *http.Request, body []byte, d 
 		return h.enrollResult(ctx, cur, req.IdentityPublicKey, false, d)
 	}
 	// No pin, or a pin of another epoch or generation (void): enrollment is
-	// allowed only inside the open window of this policy.
-	if !now.Before(pol.EnrollUntil) {
+	// allowed only inside the open window of this policy, or when the
+	// enrollment is attested by the device key the policy trusts.
+	if !now.Before(pol.EnrollUntil) && !byTrustedKey(att, pol) {
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
 	// A voided identity is never re-admitted, whatever the epoch: a new window
 	// needs a NEW key (sticky void).
 	if found && IsVoidedFingerprint(cur, fingerprint) {
-		return 0, nil, h.voidedEnrollDenial(ctx, d)
+		return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 	}
 	got, created, err := h.deps.Identity.Pin(ctx, newPinEntry(ns, device, idPub, fingerprint, pol, now, att, caps))
 	if errors.Is(err, ErrFingerprintVoided) {
-		return 0, nil, h.voidedEnrollDenial(ctx, d)
+		return 0, nil, h.voidedEnrollDenial(ctx, d, att, pol)
 	}
 	if err != nil {
 		h.log.Error("pinning identity failed", "ns", ns, "device", device, "err", err)
@@ -425,7 +438,7 @@ func (h *Hub) updateAttestation(ctx context.Context, cur api.IdentityEntry, att 
 		return withAttestation(c, att, caps)
 	})
 	if err != nil {
-		h.log.Warn("recording host-key attestation failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
+		h.log.Warn("recording attestation failed", "ns", cur.Namespace, "device", cur.Device, "err", err)
 		return cur
 	}
 	if !found {
@@ -452,8 +465,15 @@ func (h *Hub) endStaleDeviceSession(k devKey, fingerprint string) {
 }
 
 // voidedEnrollDenial answers an enrollment with an identity that was voided
-// before. It is recorded as a conflict, like any other rejected key.
-func (h *Hub) voidedEnrollDenial(ctx context.Context, d *dctx) *denial {
+// before. An agent that proves the device key the policy trusts is told to
+// generate a new identity (ReasonReenroll): it is the device itself, back with
+// an identity a replacement or a flag voided (a pod that moved to another node
+// and back), not a squatter. Anything else is recorded as a conflict, like any
+// other rejected key.
+func (h *Hub) voidedEnrollDenial(ctx context.Context, d *dctx, att *attested, pol api.PolicyEntry) *denial {
+	if att != nil && pol.TrustedHostKey != "" && !pol.DuplicateHostKey && att.hostKey == pol.TrustedHostKey {
+		return deny(api.ReasonReenroll, "this identity was voided; generate a new identity and enroll it")
+	}
 	if err := h.deps.Identity.RecordConflict(ctx, d.ns, d.device, h.now()); err != nil {
 		h.log.Error("recording enrollment conflict failed", "ns", d.ns, "device", d.device, "err", err)
 	}

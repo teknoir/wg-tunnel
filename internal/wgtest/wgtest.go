@@ -10,6 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
+	"github.com/teknoir/wg-tunnel/internal/wgdev"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
 )
 
@@ -41,7 +42,7 @@ func NewNode(t testing.TB, bind conn.Bind, addr netip.Addr) *Node {
 	if err := dev.Up(); err != nil {
 		t.Fatalf("wgtest: Up: %v", err)
 	}
-	t.Cleanup(dev.Close)
+	t.Cleanup(func() { wgdev.Close(dev) })
 	return &Node{Dev: dev, Net: tnet, Priv: priv, Pub: pub, Addr: addr}
 }
 

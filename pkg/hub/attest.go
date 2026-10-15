@@ -16,24 +16,29 @@ import (
 	"github.com/teknoir/wg-tunnel/pkg/sshsig"
 )
 
-// Host-key attestation (api.CapAttest).
+// Device-key attestation (api.CapAttest, api.CapDeviceKey).
 //
-// The agent first asks for a single-use nonce (api.AttestChallengePath), has
-// the attestor sidecar sign api.AttestStatement with the device's SSH host key
-// and sends the signature with its enrollment. The hub verifies it against the
-// CURRENT epoch and generation of the policy and the enrolling identity, and
-// records which host key signed. Automatic activation (identityUsable) then
-// compares that key with the one an admin trusted.
+// The agent first asks for a single-use nonce (api.AttestChallengePath) per
+// key it holds, signs api.AttestStatement with its device key (a pre-rev-3
+// agent had the attestor sidecar sign with the SSH host key) and sends the
+// signatures with its enrollment. The hub verifies them against the CURRENT
+// epoch and generation of the policy and the enrolling identity, and records
+// which key signed. Automatic activation (identityUsable) then compares that
+// key with the trusted one (PolicyEntry.TrustedHostKey, the device key since
+// rev 3).
 
 const (
-	attestNonceTTL     = 5 * time.Minute
-	attestNonceMax     = 4096 // outstanding nonces in total
-	attestNoncePerDev  = 8    // outstanding nonces per (device, identity key); the oldest is dropped
-	attestNonceDevMax  = 64   // outstanding nonces per device over all identity keys
-	maxAttestations    = 4
-	maxAttestationSize = 8 << 10
-	maxAgentCaps       = 8
-	maxAgentCapLen     = 32
+	attestNonceTTL    = 5 * time.Minute
+	attestNonceMax    = 4096 // outstanding nonces in total
+	attestNoncePerDev = 8    // outstanding nonces per (device, identity key); the oldest is dropped
+	attestNonceDevMax = 64   // outstanding nonces per device over all identity keys
+	// attestNonceForeignMax bounds the outstanding nonces of a device's identity
+	// keys other than the pinned one, together.
+	attestNonceForeignMax = 16
+	maxAttestations       = 4
+	maxAttestationSize    = 8 << 10
+	maxAgentCaps          = 8
+	maxAgentCapLen        = 32
 )
 
 type nonceRec struct {
@@ -72,7 +77,14 @@ func (n *nonceStore) sweepLocked(now time.Time) {
 
 // issue stores a new nonce for rec. It fails only when the store is full of
 // unexpired nonces of other devices.
-func (n *nonceStore) issue(rec nonceRec) (string, time.Time, bool) {
+//
+// pinned is the base64 identity key of the device's current pin ("" when there
+// is none). Its nonces are never evicted for the sake of other identity keys,
+// and the other keys of a device together hold at most attestNonceForeignMax
+// nonces (the oldest of them is dropped): whoever holds the (legacy) enrollment
+// key can mint identity keys at will, outside the enrollment window too, and
+// must not starve the device's own identity.
+func (n *nonceStore) issue(rec nonceRec, pinned string) (string, time.Time, bool) {
 	var raw [24]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", time.Time{}, false
@@ -103,6 +115,22 @@ func (n *nonceStore) issue(rec nonceRec) (string, time.Time, bool) {
 			delete(n.m, k)
 		}
 		dev = slices.DeleteFunc(dev, func(k string) bool { _, ok := n.m[k]; return !ok })
+	}
+	// Identity keys other than the pinned one: bounded together, oldest first.
+	if rec.identityKey != pinned {
+		var foreign []string
+		for _, k := range dev {
+			if n.m[k].identityKey != pinned {
+				foreign = append(foreign, k)
+			}
+		}
+		if len(foreign) >= attestNonceForeignMax {
+			byAge(foreign)
+			for _, k := range foreign[:len(foreign)-attestNonceForeignMax+1] {
+				delete(n.m, k)
+			}
+			dev = slices.DeleteFunc(dev, func(k string) bool { _, ok := n.m[k]; return !ok })
+		}
 	}
 	// Device wide: make room by dropping the oldest nonce of the identity key
 	// that holds the most; when every key holds just its newest nonce, refuse.
@@ -204,10 +232,17 @@ func (h *Hub) handleAttestChallenge(ctx context.Context, r *http.Request, _ []by
 		}
 		// A pin of this window exists: attesting is still useful (it can
 		// upgrade the pin or displace an unattested one).
-	} else if !now.Before(pol.EnrollUntil) {
+	} else if !now.Before(pol.EnrollUntil) && (!deviceKeyTrusted(pol) || slices.Contains(h.distrustedKeys(ctx, cur, found, pol), pol.TrustedHostKey)) {
+		// With a device key that activates identities trusted, the window does
+		// not gate attestation: only an enrollment attested by that key is
+		// admitted outside it (handleEnroll).
 		return 0, nil, deny(api.ReasonEnrollClosed, "enrollment window is closed")
 	}
-	nonce, exp, ok := h.nonces.issue(nonceRec{ns: ns, device: device, epoch: pol.EnrollmentEpoch, generation: pol.EnrollmentGeneration, identityKey: claims.IdentityKey})
+	pinned := ""
+	if found && !cur.Voided {
+		pinned = cur.IdentityPublicKey
+	}
+	nonce, exp, ok := h.nonces.issue(nonceRec{ns: ns, device: device, epoch: pol.EnrollmentEpoch, generation: pol.EnrollmentGeneration, identityKey: claims.IdentityKey}, pinned)
 	if !ok {
 		return 0, nil, deny(api.ReasonRateLimited, "too many outstanding attestation challenges")
 	}
@@ -216,30 +251,73 @@ func (h *Hub) handleAttestChallenge(ctx context.Context, r *http.Request, _ []by
 	}, nil
 }
 
-// attested is a verified attestation: the SSH host key that signed.
+// attested is a verified attestation: the key that signed (the device key
+// since rev 3, the SSH host key before).
 type attested struct {
 	hostKey string // "SHA256:<b64>" (ssh.FingerprintSHA256 of the key blob)
 	keyType string
 }
 
+// deviceKeyTrusted reports whether pol names a device key that can activate
+// identities (autoActivation).
+func deviceKeyTrusted(pol api.PolicyEntry) bool { return autoActivation(pol) }
+
+// distrustedKeys are the attestation keys the hub refuses for this device:
+// IdentityEntry.DistrustedKeys of the stored pin cur, which includes the key
+// that attested a pin voided because the device was flagged compromised or
+// failed its health check (whoever caused the flag may hold that key; see
+// VoidEntry). The list is permanent for the device (carried over to every
+// later pin). It is enforced, as an outright refusal of any enrollment that
+// carries an attestation by a listed key, while the policy trusts a listed
+// key. Once device-controller has rotated to a key that is not listed, an
+// attestation by an old key can neither activate nor displace anything, so it
+// is not refused: an agent may still hold its old bootstrap key beside the new
+// one and signs with both.
+//
+// The list matters only where the key would activate an identity
+// (autoActivation): in a generation forced to manual, with manual activation or
+// with a key shared with another device an admin decides anyway, and the hub
+// returns nil.
+func (h *Hub) distrustedKeys(ctx context.Context, cur api.IdentityEntry, found bool, pol api.PolicyEntry) []string {
+	if !found {
+		return nil
+	}
+	list := distrustedAfterVoid(cur)
+	if len(list) == 0 {
+		return nil
+	}
+	if !slices.Contains(list, pol.TrustedHostKey) || !autoActivation(pol) {
+		return nil
+	}
+	return list
+}
+
+// byTrustedKey reports whether att was signed by the device key pol trusts.
+func byTrustedKey(att *attested, pol api.PolicyEntry) bool {
+	return att != nil && deviceKeyTrusted(pol) && att.hostKey == pol.TrustedHostKey
+}
+
 // verifyAttestations checks the attestations of an enrollment. It returns
 // (nil, nil) for an enrollment that neither advertises api.CapAttest nor sends
-// attestations (a phase-1 agent) while the policy trusts no host key, and
+// attestations (a phase-1 agent) while the policy trusts no device key, and
 // ReasonAttestRequired when it does advertise or send them but none is valid,
-// or when the policy has a TrustedHostKey and there is none at all. Every nonce presented is consumed. A valid attestation
+// or when the policy has a TrustedHostKey and there is none at all. Every nonce
+// presented is consumed. An enrollment that carries a valid attestation by a
+// key in distrust (see distrustedKeys) is refused outright, whatever else it
+// carries: the key may be held by whoever flagged the device. A valid attestation
 // is a SSHSIG by an ed25519 or RSA (rsa-sha2-512) key over api.AttestStatement
 // with the policy's CURRENT epoch and generation, a nonce this hub issued to
 // this device for this identity key, and the enrolling identity's fingerprint.
-func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry) (*attested, *denial) {
+func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollRequest, pol api.PolicyEntry, distrust []string) (*attested, *denial) {
 	advertised := slices.Contains(req.Capabilities, api.CapAttest)
 	if !advertised && len(req.HostKeyAttestations) == 0 {
 		if pol.TrustedHostKey != "" {
-			// An admin trusted a host key: identities now activate by attestation
+			// A device key is trusted: identities now activate by attestation
 			// alone. An enrollment that carries none (whatever it claims to
 			// support) could only ever be approved by hand, which is exactly
 			// what a squatter with the legacy key wants; refuse it. Removing the
 			// trusted key re-opens manual approval.
-			return nil, deny(api.ReasonAttestRequired, "a host key is trusted for this device; the enrollment must be attested by it")
+			return nil, deny(api.ReasonAttestRequired, "a device key is trusted for this device; the enrollment must be attested by it")
 		}
 		return nil, nil
 	}
@@ -247,6 +325,7 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		return nil, deny(api.ReasonBadRequest, "too many attestations")
 	}
 	var valid []attested
+	distrusted := false
 	for _, a := range req.HostKeyAttestations {
 		rec, ok := h.nonces.take(a.Nonce)
 		if !ok || rec.ns != ns || rec.device != device ||
@@ -263,10 +342,17 @@ func (h *Hub) verifyAttestations(ns, device, fingerprint string, req api.EnrollR
 		if err != nil {
 			continue
 		}
+		if slices.Contains(distrust, ssh.FingerprintSHA256(pub)) {
+			distrusted = true // refused below, after every nonce is consumed
+			continue
+		}
 		valid = append(valid, attested{hostKey: ssh.FingerprintSHA256(pub), keyType: pub.Type()})
 	}
+	if distrusted {
+		return nil, deny(api.ReasonAttestRequired, "the enrollment carries an attestation by a device key that was in use when this device was flagged; the device key must be rotated before the device can enroll again")
+	}
 	if len(valid) == 0 {
-		return nil, deny(api.ReasonAttestRequired, "this agent supports host-key attestation, but the enrollment carries no valid attestation")
+		return nil, deny(api.ReasonAttestRequired, "this agent supports attestation, but the enrollment carries no valid attestation")
 	}
 	// Prefer the trusted key, then ed25519.
 	best := valid[0]
@@ -300,31 +386,65 @@ func withAttestation(cur api.IdentityEntry, att *attested, caps []string) *api.I
 
 // canDisplace reports whether a new enrollment attested by att may take the
 // place of the pin cur of the same enrollment window: only an attestation by
-// the trusted host key can, and only a pin that is not itself attested by that
-// key and was not explicitly approved by an admin. A trusted key shared with
-// another device (DuplicateHostKey) proves nothing and displaces nothing.
+// the trusted device key can, and only a pin that is not itself attested by
+// that key and was not explicitly approved by an admin. A trusted key shared
+// with another device (DuplicateHostKey) proves nothing and displaces nothing.
+//
+// Unlike the window bypass and canReplace it does not need automatic
+// activation: in activation=manual (or a generation forced to manual) the
+// displaced pin is a squatter's and the new pin waits for an admin, but the
+// real device must not be locked out by the squatter.
 func canDisplace(cur api.IdentityEntry, att *attested, pol api.PolicyEntry) bool {
-	return att != nil && pol.TrustedHostKey != "" && !pol.DuplicateHostKey &&
-		att.hostKey == pol.TrustedHostKey &&
+	return att != nil && pol.TrustedHostKey != "" && !pol.DuplicateHostKey && att.hostKey == pol.TrustedHostKey &&
 		!cur.Voided && sameEpoch(cur, pol) &&
 		cur.AttestedHostKey != pol.TrustedHostKey &&
 		(pol.ApprovedFingerprint == "" || cur.Fingerprint != pol.ApprovedFingerprint)
 }
 
+// canReplace reports whether a new enrollment attested by att may replace the
+// pin cur of the same enrollment window although cur is itself trusted (it
+// was attested by the device key, or an admin approved it): the device lost
+// its identity file or was re-imaged, and the one thing it still holds, the
+// device key, proves it is the same device. Unlike canDisplace it needs the
+// device to be offline (the caller checks): a live session of the trusted pin
+// stays a conflict.
+func canReplace(cur api.IdentityEntry, att *attested, pol api.PolicyEntry) bool {
+	return byTrustedKey(att, pol) &&
+		!cur.Voided && sameEpoch(cur, pol) &&
+		!canDisplace(cur, att, pol) &&
+		(cur.AttestedHostKey == pol.TrustedHostKey ||
+			(pol.ApprovedFingerprint != "" && cur.Fingerprint == pol.ApprovedFingerprint))
+}
+
 // displace replaces the pin whose fingerprint is displaced by entry. The
 // displaced fingerprint joins the voided history (it can never be pinned
-// again) and counts as a conflict. replaced is false when the stored pin
-// changed meanwhile and no longer qualifies.
-func (h *Hub) displace(ctx context.Context, entry api.IdentityEntry, displaced string, pol api.PolicyEntry, att *attested) (cur api.IdentityEntry, replaced bool, err error) {
+// again). A displacement counts as a conflict, a replacement (replace: the
+// pin was trusted, canReplace) as a replacement. replaced is false when the
+// stored pin changed meanwhile and no longer qualifies.
+func (h *Hub) displace(ctx context.Context, entry api.IdentityEntry, displaced string, pol api.PolicyEntry, att *attested, replace bool) (cur api.IdentityEntry, replaced bool, err error) {
 	now := h.now()
 	cur, found, wrote, err := h.deps.Identity.Update(ctx, entry.Namespace, entry.Device, func(c api.IdentityEntry) *api.IdentityEntry {
-		if c.Fingerprint != displaced || !canDisplace(c, att, pol) {
+		if c.Fingerprint != displaced {
+			return nil
+		}
+		if replace && !canReplace(c, att, pol) || !replace && !canDisplace(c, att, pol) {
 			return nil
 		}
 		next := entry
 		next.VoidedFingerprints = appendVoided(c.VoidedFingerprints, c.Fingerprint)
-		next.Conflicts = c.Conflicts + 1
-		next.LastConflictAt = now
+		next.DistrustedKeys = distrustedAfterVoid(c)
+		for _, k := range entry.DistrustedKeys {
+			next.DistrustedKeys = appendBounded(next.DistrustedKeys, k, api.MaxDistrustedKeys)
+		}
+		next.Conflicts, next.LastConflictAt = c.Conflicts, c.LastConflictAt
+		next.Replacements, next.LastReplacedAt, next.LastReplacedFingerprint = c.Replacements, c.LastReplacedAt, c.LastReplacedFingerprint
+		if replace {
+			next.Replacements++
+			next.LastReplacedAt, next.LastReplacedFingerprint = now, c.Fingerprint
+		} else {
+			next.Conflicts++
+			next.LastConflictAt = now
+		}
 		return &next
 	})
 	return cur, found && wrote, err

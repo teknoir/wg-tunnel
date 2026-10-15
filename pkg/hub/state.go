@@ -140,9 +140,10 @@ func (s *session) identityView() identityView {
 // its epoch and generation are the policy's, and either
 //   - an admin approved exactly this identity fingerprint (api.ActivatedByApproval), or
 //   - automatic activation is on (the activation mode is not "manual", the
-//     generation is not forced manual, the trusted host key is not shared with
-//     another device) and the identity was enrolled with an attestation made
-//     by exactly the host key an admin trusted (api.ActivatedByHostKey).
+//     generation is not forced manual, the trusted device key is not shared
+//     with another device) and the identity was enrolled with an attestation
+//     made by exactly the device key the policy trusts (api.ActivatedByDeviceKey;
+//     entries activated before rev 3 keep their stored api.ActivatedByHostKey).
 //
 // by is the activation source when ok.
 func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
@@ -153,14 +154,23 @@ func identityUsable(v identityView, pol api.PolicyEntry) (ok bool, by string) {
 	if pol.ApprovedFingerprint != "" && v.Fingerprint == pol.ApprovedFingerprint {
 		return true, api.ActivatedByApproval
 	}
-	if pol.ActivationMode != "manual" &&
-		pol.ForceManualGeneration < pol.EnrollmentGeneration &&
-		!pol.DuplicateHostKey &&
-		pol.TrustedHostKey != "" &&
-		v.AttestedHostKey == pol.TrustedHostKey {
-		return true, api.ActivatedByHostKey
+	if autoActivation(pol) && v.AttestedHostKey == pol.TrustedHostKey {
+		return true, api.ActivatedByDeviceKey
 	}
 	return false, ""
+}
+
+// autoActivation reports whether pol lets the trusted device key activate an
+// identity without an admin: a key is trusted, the activation mode is not
+// "manual", the generation is not forced manual and the key is not shared with
+// another device. Everything that admits an identity because of the device key
+// (the window bypass, replacing a pin) uses it too, so an identity is admitted
+// that way only when it would itself become usable.
+func autoActivation(pol api.PolicyEntry) bool {
+	return pol.TrustedHostKey != "" &&
+		!pol.DuplicateHostKey &&
+		pol.ActivationMode != "manual" &&
+		pol.ForceManualGeneration < pol.EnrollmentGeneration
 }
 
 func activated(v identityView, pol api.PolicyEntry) bool {

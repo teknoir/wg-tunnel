@@ -15,6 +15,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
+	"github.com/teknoir/wg-tunnel/internal/wgdev"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/turnbind"
 	"github.com/teknoir/wg-tunnel/pkg/wgkey"
@@ -172,11 +173,11 @@ func NewPlane(cfg PlaneConfig) (*Plane, error) {
 		Errorf:   func(f string, a ...any) { log.Warn("wireguard (plane B)", "msg", fmt.Sprintf(f, a...)) },
 	})
 	if err := dev.IpcSet("private_key=" + cfg.PrivateKey.Hex() + "\n"); err != nil {
-		dev.Close()
+		wgdev.Close(dev)
 		return nil, fmt.Errorf("p2p: configuring WireGuard: %w", err)
 	}
 	if err := dev.Up(); err != nil {
-		dev.Close()
+		wgdev.Close(dev)
 		return nil, fmt.Errorf("p2p: bringing WireGuard up: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -211,7 +212,7 @@ func (pl *Plane) Close() {
 	pl.cancel()
 	pl.wg.Wait()
 	pl.sock.Conn().SetProbeHandler(nil)
-	pl.dev.Close()
+	wgdev.Close(pl.dev)
 	_ = pl.sock.Close()
 	pl.priv.Zero()
 }

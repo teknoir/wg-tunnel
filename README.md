@@ -121,8 +121,9 @@ must send that token; until it does, every status call is refused.
   the device is connected and since when, the last WireGuard handshake of its
   peer, transport (`turn`), agent version and capabilities, whether the
   identity waits for an admin, the hub's own record of the identity pin
-  (`identity`: fingerprint, attested host key and type, enrollment epoch and
-  generation, activation source, voided, conflicts; taken from the identity
+  (`identity`: fingerprint, attested key (the device key) and type, enrollment
+  epoch and generation, activation source and time, voided, conflicts,
+  replacements; taken from the identity
   store, never from the Device CR, whose status device editors can write; the
   admin actions of Backstage compare against it), and its client sessions (subject, service,
   software, path, since, bytes). `BytesIn` is client to device, `BytesOut` device
@@ -183,67 +184,151 @@ closes nothing (the next round asks again).
 (`/etc/teknoir/rsa_private.pem`), `IDENTITY_DIR` (`/var/lib/teknoir/wg-agent`),
 `SSH_HOST_KEYS_GLOB` (`/etc/ssh/ssh_host_*_key.pub`), `FORWARD_HOST` (`127.0.0.1`),
 `TURN_SERVER` (host:port override), `CA_FILE` (extra CAs added to the system
-roots; `/etc/teknoir/roots.pem` if present), `ATTEST_EXCHANGE` (see below) and `LOG_LEVEL`.
+roots; `/etc/teknoir/roots.pem` if present), `DEVICE_KEY_FILE`
+(`/etc/teknoir/ztna_device_key`), `DEVICE_KEY_ENVELOPE`
+(`/run/ztna-device-key/envelope.json`), `ATTEST_EXCHANGE` (deprecated, see below) and `LOG_LEVEL`.
 
-### Host-key attestation and automatic activation
+### Device key and automatic activation (rev 3)
 
-`wg-agent attestor --state /var/lib/teknoir/wg-agent --exchange /run/wg-attest --hostkeys /etc/ssh`
-is a sidecar run as root with **all capabilities dropped** (root owns the 0600
-host keys, so no DAC capability is needed), a read-only `/etc/ssh` and no
-socket. `NAMESPACE` and `DEVICE_ID` come from its own environment.
+The bootstrap of a device is a trusted process, so a bootstrapped device needs
+no hands-on step to get WireGuard: it holds a per-device **device key** (Ed25519,
+`pkg/devicekey`) whose fingerprint device-controller writes to the policy as
+`trustedHostKey` (the wire name is kept; the meaning is now the device key). An
+identity that the device key attested activates by itself.
 
-- The agent (with `ATTEST_EXCHANGE=/run/wg-attest`) asks the hub for a
-  single-use nonce (`api.AttestChallengePath`), writes `request.json`
-  `{nonce, epoch, generation}` into the shared exchange directory and waits up to
-  15 s for `response.json`. The attestor polls once a second, accepts only a
-  regular file of at most 4 KiB owned by uid 65532, reads the identity PUBLIC
-  key from `identity.pub` in the state directory, signs `api.AttestStatement`
-  with the ed25519 host key (RSA host key with `rsa-sha2-512` only when there is
-  no ed25519 one; SSHSIG, `pkg/sshsig`) and writes `response.json` (0644,
-  atomically). One signature per 10 s.
-- The agent verifies the signature locally and sends it in the `EnrollRequest`
-  with capability `attest-v1`. Without `ATTEST_EXCHANGE` it enrolls like a
-  phase-1 agent; against a hub without the challenge endpoint it enrolls without
-  attestation. If the attestor says it cannot sign (no host key), the agent
-  enrolls unattested, and if it does not answer at all the enrollment is retried.
-- The hub verifies the attestation against the CURRENT epoch and generation, the
-  enrolling identity and a nonce it issued to that identity key. It records
-  `AttestedHostKey` (`SHA256:<b64>` of the key blob) on the identity. An agent
-  that advertises `attest-v1` without a valid attestation is refused
-  (`attest_required`). While the policy has a **trusted host key**, an enrollment
-  with no attestation at all is refused too, whatever the agent advertised
-  (`attest_required`): a holder of the legacy enrollment key could otherwise pin
-  an unattested identity that an admin might approve by hand. Manual approval of
-  an unattested identity is therefore impossible until the admin removes the
-  trusted key; an identity pinned before the key was trusted can still be
-  approved, or displaced by an attested enrollment.
+- **Where the key comes from.** Either the trusted bootstrap installs it as
+  `/etc/teknoir/ztna_device_key` (OpenSSH Ed25519, 0440, owner 65532:root;
+  `DEVICE_KEY_FILE`; source `bootstrap` or `vdevice`), or device-controller
+  generates one, **seals it to the device's bootstrap RSA key** (RSA-OAEP-SHA256
+  over the 32-byte seed, label `api.DeviceKeyLabel(ns, device, serial)`,
+  `api.DeviceKeyEnvelope`) and ships the envelope in the device's MQTT config as
+  the ConfigMap `wg-agent-device-key`, mounted read-only and optional at
+  `/run/ztna-device-key/envelope.json` (`DEVICE_KEY_ENVELOPE`; source `mqtt`).
+  Nobody types or compares anything, and the private key is stored nowhere in
+  the cloud.
+- **The agent** loads the bootstrap file; if the envelope's fingerprint is not
+  already stored it opens the envelope with `RSA_KEY` (`/etc/teknoir/rsa_private.pem`),
+  checks namespace, device and fingerprint and writes `<IDENTITY_DIR>/device_key`
+  (0600, atomic). It collects every device key it holds (bootstrap and delivered,
+  deduplicated, at most 2), fetches one single-use nonce per key
+  (`api.AttestChallengePath`), signs `api.AttestStatement` **in-process**
+  (SSHSIG, `pkg/sshsig`) with each, and enrolls with capabilities `attest-v1` and
+  `device-key-v1`. No sidecar, no shared directory. It never logs key material,
+  only fingerprints. Against a hub without the challenge endpoint it enrolls
+  without attestation.
+- **Re-attestation.** The agent remembers the set of key fingerprints it
+  attested with. A poller (`DeviceKeyPoll`, 15 s) re-reads the key file and the
+  envelope; when the set changes, the agent enrolls the SAME identity again,
+  also while a session is active (the hub accepts it idempotently and records
+  the attestation). That is how a pending pin activates when the key arrives
+  later, an approved pin records a first key, and a rotation (a new trusted key
+  and a new envelope) activates the identity again. A pending identity is also
+  attested again at start and every `ReattestInterval` (60 s) as long as the
+  hub holds it back, also when the set is unchanged: the hub records ONE
+  attestation per pin (the key trusted at that moment), so a pin that fell back to
+  pending because trust moved to another key the agent holds is attested again
+  until the hub records that key.
+- The hub verifies each attestation against the CURRENT epoch and generation,
+  the enrolling identity and a nonce it issued to that identity key, and records
+  `AttestedHostKey` (`SHA256:<b64>`; the name is kept) on the pin, preferring the
+  trusted key when several signed. An agent that advertises `attest-v1` without a
+  valid attestation is refused (`attest_required`). While the policy trusts a
+  device key, an enrollment with no attestation at all is refused too, whatever
+  the agent advertised: a holder of the legacy enrollment key could otherwise pin
+  an unattested identity that an admin might approve by hand. An identity pinned
+  before the key was trusted can still be approved, activated by re-attesting, or
+  displaced.
+- **Window bypass.** With a device key trusted that activates identities (not
+  shared with another device, `activationMode` not `manual`, the generation not
+  forced manual) the hub issues attestation nonces outside the enrollment window
+  and admits an enrollment attested by that key without one; an unattested or
+  differently attested enrollment is still refused (`enroll_closed`). Pin
+  displacement and replacement below follow the same rule: the device key admits
+  an identity only where the identity would itself become usable.
+- **A flagged device's key is not trusted again.** When a pin is voided because
+  the device was flagged compromised or failed its health check, the key that
+  attested it is stored in the identity (`distrustedKeys`, bounded like
+  `voidedFingerprints`) and carried over whenever the pin is replaced or
+  displaced, and never cleared. While the policy trusts a listed key, the hub
+  refuses every enrollment that carries an attestation by a listed key, beside
+  any other (`attest_required`), and issues no nonce outside the window for it.
+  Once the policy trusts a rotated key that is not listed, an attestation by an
+  old key can neither activate nor displace anything and is not refused, so an
+  agent that still holds the old key beside the new one enrolls; trusting a
+  listed key again later is refused the same way. This applies where the key
+  would activate an identity; in a generation
+  forced to manual or with manual activation an admin decides anyway. device-controller
+  rotates the key when it clears the flag; a hub that did not wait for that would
+  let whoever caused the flag enroll in the gap.
 - **Budgets**: enrollment and challenge rate limits, replay partitions and the
   outstanding-nonce caps (8) are per (device, identity key), with a generous
   per-device bucket (and 64 nonces) behind them, so a squatter holding the
-  enrollment key drains its own budget and cannot starve the real device. An
+  enrollment key drains its own budget and cannot starve the real device. The
+  identity keys of a device other than its pinned one hold at most 16 nonces
+  together (the oldest is dropped), so identity keys minted at will, also outside
+  the window, cannot crowd out the pinned identity. An
   unattested enrollment of another identity than the pinned one is counted as a
   conflict even though it is refused.
-- **Re-attestation**: an agent whose identity is pending approval, and that has
-  not delivered an attestation in this process, attests it again every
-  `ReattestInterval` (60 s). The hub accepts it idempotently for the pinned key,
-  so a host key that appeared later or one the admin trusts afterwards activates
-  the pin without any manual step.
 - **Activation rule** (`identityUsable`, one function for session create, renew
   and enforcement): an identity is usable iff it is not voided, its epoch and
   generation are the policy's, and either its fingerprint is the approved one
   (`activatedBy: approval`) or `activationMode != "manual"`, `forceManualGeneration
   < enrollmentGeneration`, `!duplicateHostKey`, `trustedHostKey != ""` and the
-  attested host key equals `trustedHostKey` (`activatedBy: host-key`). The hub
-  records `activatedBy`/`activatedAt` once.
-- **Pin displacement**: an enrollment attested by the trusted host key replaces an
-  existing pin of the same epoch that is not attested by it and not approved by
-  an admin (the displaced fingerprint is voided for good and counted as a
-  conflict).
+  attested key equals `trustedHostKey` (`activatedBy: device-key`; entries marked
+  `host-key` before rev 3 stay valid). The hub records `activatedBy`/`activatedAt`
+  once, so an approved pin that later also gets a device key stays `approval`.
+- **Pin displacement**: an enrollment attested by the trusted device key replaces
+  an existing pin of the same epoch that is not attested by it and not approved
+  by an admin (the displaced fingerprint is voided for good and counted as a
+  conflict). This also holds with `activationMode: manual` or a generation forced
+  to manual (the new pin then waits for an admin): a squatter must not lock the
+  real device out. A key shared with another device displaces nothing.
+- **Pin replacement**: an enrollment attested by the trusted device key also
+  replaces a pin that IS trusted (attested by the key, or approved) when the
+  device has **no live session**: the device lost its identity (re-image) and the
+  device key proves it is the same device. The old fingerprint is voided,
+  `replacements`, `lastReplacedAt` and `lastReplacedFingerprint` are recorded and
+  the new identity activates. While the device is online the same enrollment is
+  today's `enroll_conflict`. A voided identity that comes back (the pod moved
+  from node A to B and back) and proves the trusted device key is answered
+  `reenroll`, not `enroll_conflict`: the agent generates a new identity and
+  enrolls it (and the console shows no squatting). Without the key it stays a
+  conflict.
+- The live status (`api.LiveIdentity`) reports `activatedBy`, `activatedAt`,
+  `replacements`, `lastReplacedAt`, `current` (the pin is of the policy's current
+  epoch and generation) and `agentCapabilities`.
 
-The state directory is `0711` (the attestor is "other" to it) and `identity.pub`
-is `0644`; `identity.key` stays `0600`. The exchange directory must be writable
-by uid 65532 and by root without capabilities, e.g. a default `emptyDir` (0777).
-`test/smoke-attestor.sh` checks all of this under the device capability set.
+A device key is only as strong as how it got to the device. A bootstrap key is
+written by the trusted bootstrap; an MQTT-delivered key is as strong as the
+device's RSA key and the MQTT channel during delivery (the envelope is sealed to
+the RSA key, but whoever holds that key and can read the config topic can open
+it). Rotating the key (an admin action in the console) delivers a new one.
+
+### Legacy host-key attestor (deprecated)
+
+`wg-agent attestor --state /var/lib/teknoir/wg-agent --exchange /run/wg-attest --hostkeys /etc/ssh`
+is the pre-rev-3 sidecar, run as root with **all capabilities dropped** (root
+owns the 0600 host keys, so no DAC capability is needed), a read-only `/etc/ssh`
+and no socket. It is deprecated and will be removed one release after
+device-controller stops deploying it. The agent uses it (with
+`ATTEST_EXCHANGE=/run/wg-attest`) only while the device holds **no device key**;
+as soon as a device key exists the agent signs with that and ignores the sidecar.
+
+- The agent asks the hub for a nonce, writes `request.json` `{nonce, epoch,
+  generation}` into the shared exchange directory and waits up to 15 s for
+  `response.json`. The attestor polls once a second, accepts only a regular file
+  of at most 4 KiB owned by uid 65532, reads the identity PUBLIC key from
+  `identity.pub` in the state directory, signs `api.AttestStatement` with the
+  ed25519 host key (RSA host key with `rsa-sha2-512` only when there is no
+  ed25519 one) and writes `response.json` (0644, atomically). One signature per
+  10 s. If the attestor says it cannot sign (no host key), the agent enrolls
+  unattested, and if it does not answer at all the enrollment is retried.
+- With an exchange directory the state directory is `0711` (the attestor is
+  "other" to it) and `identity.pub` is `0644`; `identity.key` stays `0600`. The
+  exchange directory must be writable by uid 65532 and by root without
+  capabilities, e.g. a default `emptyDir` (0777). Without `ATTEST_EXCHANGE` the
+  agent sets the state directory back to `0700`.
+  `test/smoke-attestor.sh` checks all of this under the device capability set.
 
 ### Services (phase 2)
 

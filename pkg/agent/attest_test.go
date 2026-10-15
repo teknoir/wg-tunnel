@@ -266,22 +266,22 @@ func TestNoReattestationWithoutAnAttestorOrOnceAttested(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("re-attesting without an attestor")
 	}
 	a.cfg.AttestExchange = "/run/x"
 	time.Sleep(2 * time.Millisecond)
-	if !a.shouldReattest() {
+	if !a.shouldReattest(false) {
 		t.Error("an unattested pending identity must be attested again")
 	}
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("the interval is not honoured")
 	}
 	time.Sleep(2 * time.Millisecond)
 	a.mu.Lock()
-	a.attested = true
+	a.attestedSet = legacyAttestSet
 	a.mu.Unlock()
-	if a.shouldReattest() {
+	if a.shouldReattest(false) {
 		t.Error("re-attesting an identity that was attested")
 	}
 }

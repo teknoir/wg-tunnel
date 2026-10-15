@@ -302,6 +302,9 @@ const (
 // MaxVoidedFingerprints bounds IdentityEntry.VoidedFingerprints.
 const MaxVoidedFingerprints = 32
 
+// MaxDistrustedKeys bounds IdentityEntry.DistrustedKeys.
+const MaxDistrustedKeys = 32
+
 // FlagSet is the single parser for boolean device annotations, used by the
 // hub, the flags watcher and device-controller alike.
 func FlagSet(v string) bool { return strings.EqualFold(strings.TrimSpace(v), "true") }
@@ -363,13 +366,18 @@ type PolicyEntry struct {
 	// health flag was cleared, until an admin re-enables automatic).
 	ActivationMode        string `json:"activationMode,omitempty"`
 	ForceManualGeneration int64  `json:"forceManualGeneration,omitempty"`
-	// TrustedHostKey is the SHA256 fingerprint of the device's ed25519 SSH host
-	// key that an admin trusted (out-of-band comparison). Automatic activation
-	// requires an attestation by exactly this key. DuplicateHostKey is set when
-	// the same key is trusted for more than one device (cloned image): then
-	// automatic activation is refused.
-	TrustedHostKey   string `json:"trustedHostKey,omitempty"`
-	DuplicateHostKey bool   `json:"duplicateHostKey,omitempty"`
+	// TrustedHostKey is the SHA256 fingerprint ("SHA256:<b64>") of the key whose
+	// attestation activates an identity automatically. Since rev 3 it is the
+	// device's WireGuard device key (AnnotationDeviceKey, set by device-controller
+	// from the trusted bootstrap or an MQTT delivery, never by a person); the
+	// wire name is kept for compatibility. DuplicateHostKey is set when the same
+	// key is trusted for more than one device in the teamspace (cloned image):
+	// then automatic activation is refused. TrustedKeySource is a
+	// DeviceKeySource* value, TrustedKeySetAt when device-controller set the key.
+	TrustedHostKey   string    `json:"trustedHostKey,omitempty"`
+	DuplicateHostKey bool      `json:"duplicateHostKey,omitempty"`
+	TrustedKeySource string    `json:"trustedKeySource,omitempty"`
+	TrustedKeySetAt  time.Time `json:"trustedKeySetAt,omitempty"`
 	// RSAPublicCert (PEM) verifies ENROLLMENT JWTs only.
 	RSAPublicCert string `json:"rsaPublicCert"`
 	AllowedPorts  []int  `json:"allowedPorts"`
@@ -413,14 +421,30 @@ type IdentityEntry struct {
 	// is carried over whenever a pin is replaced, and the hub refuses to pin
 	// any listed fingerprint again, in any epoch.
 	VoidedFingerprints []string `json:"voidedFingerprints,omitempty"`
-	// Attestation (CapAttest): the SSH host key that signed this identity's
+	// DistrustedKeys is the bounded list (newest last, max MaxDistrustedKeys)
+	// of attestation keys ("SHA256:<b64>") that signed a pin voided because the
+	// device was flagged compromised or failed its health check. Whoever caused
+	// the flag may hold such a key, so the hub refuses every enrollment that
+	// carries an attestation by one (attest_required) while the policy trusts a
+	// listed key. It is carried over whenever a pin is replaced or displaced and
+	// never cleared: a key on it is not trusted for this device again.
+	DistrustedKeys []string `json:"distrustedKeys,omitempty"`
+	// Attestation (CapAttest): the key that signed this identity's
 	// AttestStatement ("SHA256:<b64>", key type), and the agent's capabilities.
+	// Since rev 3 the signing key is the device key (CapDeviceKey); older agents
+	// signed with the SSH host key. The wire names are kept.
 	AttestedHostKey     string   `json:"attestedHostKey,omitempty"`
 	AttestedHostKeyType string   `json:"attestedHostKeyType,omitempty"`
 	AgentCapabilities   []string `json:"agentCapabilities,omitempty"`
-	// ActivatedBy is ActivatedByApproval or ActivatedByHostKey once usable.
+	// ActivatedBy is an ActivatedBy* value once usable.
 	ActivatedBy string    `json:"activatedBy,omitempty"`
 	ActivatedAt time.Time `json:"activatedAt,omitempty"`
+	// Replacements counts pins replaced without an admin because a new
+	// identity attested by the trusted device key arrived while the device was
+	// offline (re-image, lost state). The replaced fingerprint is voided.
+	Replacements            int       `json:"replacements,omitempty"`
+	LastReplacedAt          time.Time `json:"lastReplacedAt,omitempty"`
+	LastReplacedFingerprint string    `json:"lastReplacedFingerprint,omitempty"`
 	// Conflicts counts rejected enrollments with a DIFFERENT key for this
 	// generation (possible key theft); surfaced in the UI.
 	Conflicts      int       `json:"conflicts,omitempty"`
@@ -480,8 +504,11 @@ const (
 const (
 	CapServices = "services-v1" // connect listener on AgentConnectPort with ConnectRequest preamble
 	CapControl  = "control-v1"  // control listener on AgentControlPort (hub -> agent RPC)
-	CapAttest   = "attest-v1"   // host-key attestation at enrollment
-	CapP2P      = "p2p-v1"      // direct end-to-end WireGuard (plane B)
+	CapAttest   = "attest-v1"   // attestation at enrollment (AttestStatement over SSHSIG)
+	// CapDeviceKey: the agent holds a device key (bootstrap file or MQTT
+	// envelope) and signs AttestStatement with it in-process. Implies CapAttest.
+	CapDeviceKey = "device-key-v1"
+	CapP2P       = "p2p-v1" // direct end-to-end WireGuard (plane B)
 )
 
 // Overlay ports on the agent (plane A, reachable only from the hub: the
@@ -501,11 +528,76 @@ const (
 // writable only by the Backstage backend (after its admin checks) and
 // device-controller (ValidatingAdmissionPolicy on devices.teknoir.org).
 const (
-	AnnotationServices       = "ztna.teknoir.org/services"         // JSON []ServiceSpec (admin)
-	AnnotationP2P            = "ztna.teknoir.org/p2p"              // "disabled" | absent = enabled
-	AnnotationActivation     = "ztna.teknoir.org/activation"       // "manual" | absent = automatic (admin)
-	AnnotationTrustedHostKey = "ztna.teknoir.org/trusted-host-key" // "SHA256:<b64>" of the device ed25519 SSH host key (admin)
+	AnnotationServices   = "ztna.teknoir.org/services"   // JSON []ServiceSpec (admin)
+	AnnotationP2P        = "ztna.teknoir.org/p2p"        // "disabled" | absent = enabled
+	AnnotationActivation = "ztna.teknoir.org/activation" // "manual" | absent = automatic (admin)
+	// Deprecated (rev 3): an admin-trusted SSH host key. device-controller
+	// ignores it; activation is anchored on AnnotationDeviceKey.
+	AnnotationTrustedHostKey = "ztna.teknoir.org/trusted-host-key"
 )
+
+// Device key (rev 3, zero-touch activation). The device key is a per-device
+// Ed25519 key that only the trusted bootstrap or device-controller creates.
+// Its fingerprint is the activation anchor (PolicyEntry.TrustedHostKey): an
+// identity whose AttestStatement is signed by it activates with no admin step.
+//
+// Delivery paths, strongest first:
+//   - bootstrap: the bootstrap script writes DeviceKeyFile (source "bootstrap",
+//     or "vdevice" for virtual-device cloud-init);
+//   - mqtt: device-controller generates a key, seals it to the device's
+//     bootstrap RSA key (DeviceKeyEnvelope) and ships it in the device's MQTT
+//     config as the ConfigMap DeviceKeyConfigMap; the agent opens it with
+//     /etc/teknoir/rsa_private.pem and keeps it as DeliveredDeviceKeyFile. The
+//     ConfigMap is removed from the config once the hub shows an attestation
+//     by that key. The private key is stored nowhere in the cloud.
+//
+// Device annotations (written only by device-controller, except
+// AnnotationRotateDeviceKey, which an admin sets through Backstage).
+const (
+	AnnotationDeviceKey       = "ztna.teknoir.org/device-key"        // "SHA256:<b64>" of the device key
+	AnnotationDeviceKeySource = "ztna.teknoir.org/device-key-source" // DeviceKeySource*
+	AnnotationDeviceKeySetAt  = "ztna.teknoir.org/device-key-set-at" // RFC3339, when device-controller set it
+	AnnotationRotateDeviceKey = "ztna.teknoir.org/rotate-device-key" // RFC3339 request time (admin); newer than set-at => new MQTT key
+
+	DeviceKeySourceBootstrap = "bootstrap"
+	DeviceKeySourceVirtual   = "vdevice"
+	DeviceKeySourceMQTT      = "mqtt"
+
+	// DeviceKeyFile is the bootstrap-installed device key: OpenSSH Ed25519
+	// private key, mode 0440, owner 65532:root (next to rsa_private.pem).
+	DeviceKeyFile = "/etc/teknoir/ztna_device_key"
+	// DeviceKeyConfigMap (namespace default on the device) carries the sealed
+	// envelope under DeviceKeyEnvelopeKey; the agent mounts it (optional) at
+	// DeviceKeyMountDir.
+	DeviceKeyConfigMap   = "wg-agent-device-key"
+	DeviceKeyEnvelopeKey = "envelope.json"
+	DeviceKeyMountDir    = "/run/ztna-device-key"
+	// DeliveredDeviceKeyFile is where the agent keeps an opened envelope key,
+	// inside its identity state directory, mode 0600, OpenSSH format.
+	DeliveredDeviceKeyFile = "device_key"
+
+	DeviceKeyEnvelopeVersion = 1
+	DeviceKeyLabelTag        = "teknoir-ztna-device-key-v1"
+)
+
+// DeviceKeyEnvelope is a device key sealed to the device's bootstrap RSA key.
+// Ciphertext is base64 RSA-OAEP-SHA256 over the 32-byte Ed25519 seed with the
+// label DeviceKeyLabel(Namespace, Device, Serial). Fingerprint is the device
+// key's "SHA256:<b64>"; the opener must check it against the opened key.
+type DeviceKeyEnvelope struct {
+	V           int    `json:"v"`
+	Namespace   string `json:"namespace"`
+	Device      string `json:"device"`
+	Serial      string `json:"serial"`
+	Fingerprint string `json:"fingerprint"`
+	Ciphertext  string `json:"ciphertext"`
+}
+
+// DeviceKeyLabel is the OAEP label that binds an envelope to one device and
+// one delivery.
+func DeviceKeyLabel(namespace, device, serial string) []byte {
+	return []byte(fmt.Sprintf("%s\n%s/%s\n%s", DeviceKeyLabelTag, namespace, device, serial))
+}
 
 // Service kinds.
 const (
@@ -615,9 +707,10 @@ type P2PGrant struct {
 	TTLSeconds        int      `json:"ttlSeconds"`
 }
 
-// Host-key attestation (CapAttest). The agent fetches a single-use nonce, the
-// attestor sidecar signs the statement with the device's SSH host key (SSHSIG,
-// namespace AttestNamespace), filling namespace/device from its own config.
+// Attestation (CapAttest). The agent fetches a single-use nonce and signs the
+// statement (SSHSIG, namespace AttestNamespace) with its device key
+// (CapDeviceKey, in-process). Pre-rev-3 agents had an attestor sidecar sign
+// with the SSH host key; the hub verifies both the same way.
 const (
 	AttestChallengePath = "/v1/device/attest-challenge" // POST, Bearer enroll JWT -> AttestChallenge
 	AttestNamespace     = "teknoir-ztna-attest-v1@teknoir.ai"
@@ -646,8 +739,10 @@ type HostKeyAttestation struct {
 
 // Activation sources recorded on the identity entry.
 const (
-	ActivatedByApproval = "approval" // admin approved the identity fingerprint
-	ActivatedByHostKey  = "host-key" // attested SSH host key equals the trusted host key
+	ActivatedByApproval  = "approval"   // admin approved the identity fingerprint
+	ActivatedByDeviceKey = "device-key" // attested by the trusted device key (zero-touch)
+	// Deprecated: entries activated before rev 3 by an admin-trusted SSH host key.
+	ActivatedByHostKey = "host-key"
 )
 
 // Live status (HubStatusPort, Backstage backend only).
@@ -685,8 +780,19 @@ type LiveIdentity struct {
 	EnrollmentEpoch      string    `json:"enrollmentEpoch"`
 	EnrolledAt           time.Time `json:"enrolledAt"`
 	ActivatedBy          string    `json:"activatedBy,omitempty"`
+	ActivatedAt          time.Time `json:"activatedAt,omitempty"`
 	Voided               bool      `json:"voided,omitempty"`
 	Conflicts            int       `json:"conflicts,omitempty"`
+	Replacements         int       `json:"replacements,omitempty"`
+	LastReplacedAt       time.Time `json:"lastReplacedAt,omitempty"`
+	// Current is true when the pin is of the policy's current enrollment epoch
+	// AND generation, i.e. the pin the activation rule evaluates (it can still
+	// be voided or pending). A pin that is not current belongs to an older
+	// enrollment and must be replaced by a new enrollment.
+	Current bool `json:"current"`
+	// AgentCapabilities are the capabilities the enrolling agent advertised
+	// (IdentityEntry.AgentCapabilities).
+	AgentCapabilities []string `json:"agentCapabilities,omitempty"`
 }
 
 // StatusTokenAudience is the audience of the projected ServiceAccount token

@@ -17,6 +17,7 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
+	"github.com/teknoir/wg-tunnel/internal/wgdev"
 	"github.com/teknoir/wg-tunnel/pkg/api"
 	"github.com/teknoir/wg-tunnel/pkg/relay"
 	"github.com/teknoir/wg-tunnel/pkg/turnbind"
@@ -635,7 +636,7 @@ func (s *Session) end(err error) {
 			_ = c.Close()
 		}
 		if s.dev != nil {
-			s.dev.Close()
+			wgdev.Close(s.dev)
 		}
 		if s.sup != nil {
 			_ = s.sup.Close()

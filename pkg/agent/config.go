@@ -73,15 +73,25 @@ type Config struct {
 	ForwardHost     string
 	// TURNServer ("host:port") overrides the TURN server in the hub's credentials.
 	TURNServer string
-	// AttestExchange is the directory shared with the attestor sidecar
-	// (ATTEST_EXCHANGE). Empty: no host-key attestation (phase-1 behaviour).
+	// DeviceKeyFile is the device key the trusted bootstrap installed
+	// (DEVICE_KEY_FILE, default api.DeviceKeyFile); DeviceKeyEnvelope the
+	// sealed key device-controller delivers (DEVICE_KEY_ENVELOPE, default
+	// api.DeviceKeyMountDir/api.DeviceKeyEnvelopeKey). Either may be absent.
+	DeviceKeyFile     string
+	DeviceKeyEnvelope string
+	// DeviceKeyPoll is how often the agent looks for a new device key (default 15 s).
+	DeviceKeyPoll time.Duration
+	// AttestExchange is the directory shared with the DEPRECATED attestor
+	// sidecar (ATTEST_EXCHANGE). It is used only while the device holds no
+	// device key. Empty: no host-key attestation (phase-1 behaviour).
 	AttestExchange string
 	// AttestTimeout is how long to wait for the attestor (default 15 s).
 	AttestTimeout time.Duration
 	// ReattestInterval is how often an agent whose identity is waiting for
-	// approval, and that has not yet delivered an attestation, tries again to
-	// attest it (default 60 s). The attestor may only be able to sign later
-	// (sshd host keys generated), and an admin may trust the host key later.
+	// approval, and that has not yet delivered an attestation made with the
+	// keys it holds now, tries again to attest it (default 60 s). A change of
+	// the keys is attested at once. The attestor may only be able to sign later
+	// (sshd host keys generated).
 	ReattestInterval time.Duration
 
 	HTTPClient *http.Client
@@ -161,8 +171,11 @@ type Config struct {
 //	P2P                        on (default) or off: direct WireGuard to clients
 //	P2P_PORT                   UDP port of the direct socket, default 0 (any)
 //	P2P_STUN                   host:port of a STUN server (default: the TURN host)
-//	ATTEST_EXCHANGE            directory shared with the attestor sidecar
-//	                           (e.g. /run/wg-attest); empty: no attestation
+//	DEVICE_KEY_FILE            default /etc/teknoir/ztna_device_key
+//	DEVICE_KEY_ENVELOPE        default /run/ztna-device-key/envelope.json
+//	ATTEST_EXCHANGE            DEPRECATED: directory shared with the attestor
+//	                           sidecar (e.g. /run/wg-attest); used only while
+//	                           the device holds no device key
 //	CA_FILE                    extra CA bundle added to the system roots
 //	                           (default: /etc/teknoir/roots.pem if present)
 //	LOG_LEVEL                  debug, info (default), warn, error
@@ -178,7 +191,10 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		ForwardHost:     getenv("FORWARD_HOST"),
 		TURNServer:      getenv("TURN_SERVER"),
 		AttestExchange:  getenv("ATTEST_EXCHANGE"),
-		ClusterDomain:   getenv("CLUSTER_DOMAIN"),
+
+		DeviceKeyFile:     getenv("DEVICE_KEY_FILE"),
+		DeviceKeyEnvelope: getenv("DEVICE_KEY_ENVELOPE"),
+		ClusterDomain:     getenv("CLUSTER_DOMAIN"),
 	}
 	if v := getenv("SERVICE_CIDR"); v != "" {
 		cidrs, err := ParseServiceCIDRs(v)
@@ -268,6 +284,11 @@ func (c *Config) applyDefaults() error {
 	c.IdentityDir = orDefault(c.IdentityDir, DefaultIdentityDir)
 	c.SSHHostKeysGlob = orDefault(c.SSHHostKeysGlob, DefaultHostKeysGlob)
 	c.ForwardHost = orDefault(c.ForwardHost, DefaultForwardHost)
+	c.DeviceKeyFile = orDefault(c.DeviceKeyFile, api.DeviceKeyFile)
+	c.DeviceKeyEnvelope = orDefault(c.DeviceKeyEnvelope, api.DeviceKeyMountDir+"/"+api.DeviceKeyEnvelopeKey)
+	if c.DeviceKeyPoll <= 0 {
+		c.DeviceKeyPoll = DefaultDeviceKeyPoll
+	}
 	if c.TURNServer != "" {
 		if _, _, err := net.SplitHostPort(c.TURNServer); err != nil {
 			return fmt.Errorf("agent: TURN_SERVER must be host:port: %w", err)
