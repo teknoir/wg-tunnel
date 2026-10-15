@@ -25,7 +25,9 @@ const (
 
 // capabilities are what this agent advertises in DeviceSessionRequest.
 // baseCapabilities are always advertised by this agent version.
-func baseCapabilities() []string { return []string{api.CapServices, api.CapControl} }
+func baseCapabilities() []string {
+	return []string{api.CapServices, api.CapControl, api.CapK3sDiscovery}
+}
 
 // implicitSSH is the always-present ssh service.
 var implicitSSH = api.ServiceSpec{ID: api.ServiceSSHID, Kind: api.ServiceKindSSH, Protocol: api.ProtocolTCP, Description: "SSH"}
