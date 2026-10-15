@@ -34,7 +34,16 @@ type controlServer struct {
 	// revoke ends the current device session on the hub's notice (nil: the
 	// control server has no session to end and answers every notice 409).
 	revoke *revokeTarget
+	// revokeGrace bounds how long a revoke notice's handler waits for the hub
+	// to take the answer before the session is torn down regardless.
+	revokeGrace time.Duration
 }
+
+// defaultRevokeGrace is how long the answer to a revoke notice may take to
+// reach the hub before the session is ended anyway. The hub waits for the
+// answer for one second at most; a client that has the answer closes the
+// connection at once, which ends the wait.
+const defaultRevokeGrace = 500 * time.Millisecond
 
 // revokeTarget is the device session a RevokeNotice may end.
 type revokeTarget struct {
@@ -43,7 +52,7 @@ type revokeTarget struct {
 }
 
 func newControlServer(log *slog.Logger, connect *connectServer, grants *GrantStore, pb *planeB) *controlServer {
-	c := &controlServer{log: log, connect: connect, grants: grants, planeB: pb, hubAddr: netip.MustParseAddr(api.HubAddress)}
+	c := &controlServer{log: log, connect: connect, grants: grants, planeB: pb, hubAddr: netip.MustParseAddr(api.HubAddress), revokeGrace: defaultRevokeGrace}
 	mux := http.NewServeMux()
 	mux.HandleFunc(api.ControlServicesPath, c.handle(c.services))
 	mux.HandleFunc(api.ControlGrantsPath, c.handle(c.applyGrants))
@@ -174,7 +183,11 @@ var revokeReasons = map[string]bool{
 // handleRevoke takes the hub's notice that it is ending the device session
 // (api.RevokeNotice): the session is ended at once with the notice's reason
 // instead of when a renewal fails. The answer goes out first, then the session
-// is torn down (which closes this very connection).
+// is torn down (which closes this very connection). Flushing only hands the
+// answer to the tunnel's TCP stack; tearing the tunnel down right after would
+// drop it before it reached the hub, which would then wait for it in vain. So
+// the handler stays until the hub closes the connection (the request context
+// ends: it has the answer) or revokeGrace has passed.
 func (c *controlServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	body, ok := c.readRequest(w, r)
 	if !ok {
@@ -192,6 +205,10 @@ func (c *controlServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 	_ = http.NewResponseController(w).Flush()
 	c.log.Warn("the hub is ending this session", "session", n.SessionID, "reason", n.Reason, "detail", n.Detail)
+	select {
+	case <-r.Context().Done():
+	case <-time.After(c.revokeGrace):
+	}
 	end := c.revoke.end
 	go end(&noticeError{err: wgclient.Revoked(n.Reason, n.Detail)})
 }

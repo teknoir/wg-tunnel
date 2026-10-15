@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +22,7 @@ import (
 func revokeRig(t *testing.T) (*controlServer, chan error) {
 	t.Helper()
 	c, _, _ := controlRig(t)
+	c.revokeGrace = time.Millisecond // httptest requests never see a client close
 	ended := make(chan error, 4)
 	c.revoke = &revokeTarget{sessionID: "s7", end: func(err error) { ended <- err }}
 	return c, ended
@@ -115,6 +119,54 @@ func TestSkipBackoffOnlyOnceForAReenrollNotice(t *testing.T) {
 	a.mu.Unlock()
 	if !a.skipBackoff(ctx, notice(api.ReasonReenroll)) {
 		t.Fatal("a notice after the cooldown was ignored")
+	}
+}
+
+// The session must not be torn down before the hub has the answer to the
+// notice: the answer travels through the very tunnel being closed, and a hub
+// that never gets it reports the notice as failed after its timeout.
+func TestRevokeNoticeEndsSessionOnlyAfterTheHubTookTheAnswer(t *testing.T) {
+	c, ended := revokeRig(t)
+	c.revokeGrace = 10 * time.Second // the client closing must be what ends the wait
+	c.hubAddr = netip.MustParseAddr("127.0.0.1")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	c.Serve(ctx, ln, &wg)
+	defer func() { cancel(); wg.Wait() }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	body := `{"reason":"reenroll","sessionId":"s7"}`
+	_, _ = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", api.ControlRevokePath, len(body), body)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status %d, want 204", resp.StatusCode)
+	}
+	select {
+	case err := <-ended:
+		t.Fatalf("the session was ended while the hub still held the connection open: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	_ = conn.Close() // the hub has the answer
+	select {
+	case err := <-ended:
+		if wgclient.ReasonOf(err) != api.ReasonReenroll {
+			t.Fatalf("ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session was not ended after the hub closed the connection")
 	}
 }
 

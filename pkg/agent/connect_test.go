@@ -342,6 +342,28 @@ func TestConnectCaps(t *testing.T) {
 	})
 }
 
+// A refused connection must have given back its slots by the time the client
+// reads the refusal: the next request (here for another service, right at the
+// global cap) must not be refused because of the connection just refused.
+func TestConnectRefusalReleasesItsSlotsBeforeItIsAnswered(t *testing.T) {
+	echo := startEchoServer(t)
+	for i := range 200 {
+		r := newConnectRig(t, 2, 3, allowPorts(echo.port()))
+		r.srv.SetServices([]api.ServiceSpec{externalSpec("one", echo.port()), externalSpec("two", echo.port())})
+		for range 2 {
+			if _, resp := r.connect(api.ConnectRequest{Service: "one"}); !resp.OK {
+				t.Fatalf("round %d: %+v", i, resp)
+			}
+		}
+		if _, resp := r.connect(api.ConnectRequest{Service: "one"}); resp.OK || resp.Reason != api.ReasonSessionLimit {
+			t.Fatalf("round %d: per-service cap: %+v", i, resp)
+		}
+		if _, resp := r.connect(api.ConnectRequest{Service: "two"}); !resp.OK {
+			t.Fatalf("round %d: the refused connection still held its slot: %+v", i, resp)
+		}
+	}
+}
+
 func TestServicesUpdateClosesRelaysOfRemovedOrChangedServices(t *testing.T) {
 	a, b := startEchoServer(t), startEchoServer(t)
 	r := newConnectRig(t, 4, 8, allowPorts(a.port(), b.port()))

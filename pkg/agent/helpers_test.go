@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -194,8 +195,26 @@ func (r *rig) waitTunnelUp(t *testing.T, n int) {
 	})
 }
 
+// waitServing waits until the agent has bound the listener of the rig's
+// forwarded port ("exposing port" is logged right after the bind). The hub
+// lists a device session as soon as it answers the create request, which is
+// BEFORE the agent has a tunnel and BEFORE it listens on the allowed ports: a
+// client that dials in that window is refused at the device ("connection was
+// refused" in the hub's splice) and sees EOF or a reset. Waiting for the
+// session to be listed is therefore not enough to dial through it.
+func (r *rig) waitServing(t *testing.T) {
+	t.Helper()
+	want := fmt.Sprintf(`"msg":"exposing port","port":%d,`, r.port)
+	eventually(t, 15*time.Second, "the agent to listen on the forwarded port", func() bool {
+		return strings.Contains(r.logs.String(), want)
+	})
+}
+
+// clientSession creates a client session for the rig's device. The device's
+// agent must have been started; it waits until the agent serves the port.
 func (r *rig) clientSession(t *testing.T) *wgclient.Session {
 	t.Helper()
+	r.waitServing(t)
 	var n atomic.Int64
 	s, err := wgclient.Create(ctxT(t), wgclient.Options{
 		HubURL: r.hub.URL, Kind: api.KindClient,

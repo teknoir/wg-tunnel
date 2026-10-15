@@ -305,19 +305,36 @@ func (s *connectServer) readPreamble(c net.Conn) (*bufio.Reader, api.ConnectRequ
 func (s *connectServer) relay(ctx context.Context, c net.Conn, br *bufio.Reader, req api.ConnectRequest, pair string, stillAllowed func() bool) {
 	select {
 	case s.global <- struct{}{}:
-		defer func() { <-s.global }()
 	default:
 		s.log.Warn("too many concurrent connections; refusing one", "service", req.Service)
 		s.answer(c, api.ConnectResponse{Reason: api.ReasonSessionLimit})
 		return
 	}
+	// What this connection holds is given back in reverse order, and BEFORE a
+	// refusal is answered: the client may retry, or connect to another
+	// service, the moment it reads the answer, and must not find the slots of
+	// the connection it was just refused still taken.
+	var held []func()
+	finish := func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i]()
+		}
+		held = nil
+	}
+	defer finish()
+	refuse := func(reason string) {
+		finish()
+		s.answer(c, api.ConnectResponse{Reason: reason})
+	}
+	held = append(held, func() { <-s.global })
+
 	spec, reason := s.reserve(req.Service, pair)
 	if reason != "" {
 		s.log.Warn("connect refused", "service", req.Service, "reason", reason, "as", req.As)
-		s.answer(c, api.ConnectResponse{Reason: reason})
+		refuse(reason)
 		return
 	}
-	defer s.release(spec.ID, pair)
+	held = append(held, func() { s.release(spec.ID, pair) })
 
 	dctx, cancel := context.WithTimeout(ctx, s.dialTO)
 	local, err := s.policy.DialService(dctx, spec, s.dialTO)
@@ -329,25 +346,25 @@ func (s *connectServer) relay(ctx context.Context, c net.Conn, br *bufio.Reader,
 			reason = api.ReasonServiceDenied
 		}
 		s.log.Warn("service target refused or unreachable", "service", spec.ID, "reason", reason, "error", err.Error())
-		s.answer(c, api.ConnectResponse{Reason: reason})
+		refuse(reason)
 		return
 	}
-	defer func() { _ = local.Close() }()
+	held = append(held, func() { _ = local.Close() })
 
 	ac := &activeConn{spec: spec, pair: pair, close: func() { _ = c.Close(); _ = local.Close() }}
 	if !s.register(ac) {
 		s.log.Warn("service changed while connecting; refusing", "service", spec.ID)
-		s.answer(c, api.ConnectResponse{Reason: api.ReasonServiceUnknown})
+		refuse(api.ReasonServiceUnknown)
 		return
 	}
-	defer s.unregister(ac)
+	held = append(held, func() { s.unregister(ac) })
 	if stillAllowed != nil && !stillAllowed() {
 		s.log.Warn("grant removed while connecting; refusing", "service", spec.ID, "pair", pair)
-		s.answer(c, api.ConnectResponse{Reason: api.ReasonServiceDenied})
+		refuse(api.ReasonServiceDenied)
 		return
 	}
 	stop := context.AfterFunc(ctx, ac.close) // session over: unblock both copies
-	defer stop()
+	held = append(held, func() { stop() })
 
 	s.answer(c, api.ConnectResponse{OK: true})
 	s.log.Debug("relaying connection", "service", spec.ID, "as", req.As, "pair", pair)
