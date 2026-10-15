@@ -3,7 +3,10 @@
 //	wg-agent init --dir D --uid U   prepare the identity directory (init container, root)
 //	wg-agent run                    run the agent (configured by environment)
 //	wg-agent attestor --state D --exchange D --hostkeys D
-//	                                host-key attestation sidecar (root, no capabilities)
+//	                                DEPRECATED host-key attestation sidecar (root, no
+//	                                capabilities); the agent signs with the device key
+//	                                itself. Removed one release after device-controller
+//	                                stopped deploying it.
 //	wg-agent version
 package main
 
@@ -96,6 +99,10 @@ func runAgent(ctx context.Context, getenv func(string) string, stderr io.Writer)
 
 // runAttestor runs the host-key attestation sidecar. NAMESPACE and DEVICE_ID
 // come from the environment; the directories from flags.
+//
+// Deprecated: since rev 3 the agent signs its attestation in-process with the
+// device key (api.DeviceKeyFile or an MQTT-delivered envelope). The sidecar is
+// still used for a device that holds no device key.
 func runAttestor(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("attestor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
