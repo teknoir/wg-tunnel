@@ -157,6 +157,8 @@ type svcAgent struct {
 	// grants, when set, serves ControlGrantsPath.
 	grants  func(w http.ResponseWriter, body []byte)
 	rawEcho int // also echo on this overlay port (legacy listener)
+	// k3s, when set, serves ControlK3sServicesPath.
+	k3s http.HandlerFunc
 }
 
 func (a *svcAgent) connects() []api.ConnectRequest {
@@ -256,6 +258,10 @@ func (a *svcAgent) handleConnect(c net.Conn) {
 }
 
 func (a *svcAgent) handleControl(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == api.ControlK3sServicesPath && a.k3s != nil {
+		a.k3s(w, r)
+		return
+	}
 	var upd api.ServicesUpdate
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if r.URL.Path == api.ControlGrantsPath && a.grants != nil {

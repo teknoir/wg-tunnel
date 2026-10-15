@@ -115,7 +115,7 @@ func TestBootstrapDeviceKeySignsInProcess(t *testing.T) {
 		!slices.Equal(got.Capabilities, []string{api.CapAttest, api.CapDeviceKey}) {
 		t.Fatalf("hub recorded %+v, want device key %s", got, fp)
 	}
-	if caps := d.hub.SessionCapabilities(testNS, testDevice); !slices.Equal(caps, []string{api.CapServices, api.CapControl, api.CapAttest, api.CapDeviceKey}) {
+	if caps := d.hub.SessionCapabilities(testNS, testDevice); !slices.Equal(caps, []string{api.CapServices, api.CapControl, api.CapK3sDiscovery, api.CapAttest, api.CapDeviceKey}) {
 		t.Fatalf("session capabilities %v", caps)
 	}
 	// No sidecar: nothing is published for it and the state directory is private.

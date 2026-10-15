@@ -82,7 +82,7 @@ func TestEnrollsWithHostKeyAttestation(t *testing.T) {
 	if got.HostKey != ar.hostFP || got.KeyType != ssh.KeyAlgoED25519 || !slices.Contains(got.Capabilities, api.CapAttest) || got.Challenges != 1 {
 		t.Fatalf("hub recorded %+v, want host key %s", got, ar.hostFP)
 	}
-	if caps := ar.hub.SessionCapabilities(testNS, testDevice); !slices.Equal(caps, []string{api.CapServices, api.CapControl, api.CapAttest}) {
+	if caps := ar.hub.SessionCapabilities(testNS, testDevice); !slices.Equal(caps, []string{api.CapServices, api.CapControl, api.CapK3sDiscovery, api.CapAttest}) {
 		t.Fatalf("session capabilities %v", caps)
 	}
 	// identity.pub is next to the identity key and readable by the attestor.

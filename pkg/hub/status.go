@@ -134,10 +134,12 @@ func parseLastHandshake(dump, hexKey string) (t time.Time, ok bool) {
 // Config.BackstageSA or Deps.Status every request is refused.
 //
 //	GET  api.StatusDevicePath + "<ns>/<device>"       -> api.DeviceLiveStatus
+//	GET  api.StatusDevicePath + "<ns>/<device>" + api.StatusK3sServicesSuffix -> api.K3sServiceList
 //	POST api.AdminEndSessionPath + "<session id>/end" -> 204
 func (h *Hub) StatusHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+api.StatusDevicePath+"{ns}/{device}", h.statusAuth("status", h.handleDeviceStatus))
+	mux.HandleFunc("GET "+api.StatusDevicePath+"{ns}/{device}"+api.StatusK3sServicesSuffix, h.statusAuth("k3s_services", h.handleK3sServices))
 	mux.HandleFunc("POST "+api.AdminEndSessionPath+"{id}/end", h.statusAuth("admin_end", h.handleAdminEnd))
 	mux.HandleFunc(api.HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
