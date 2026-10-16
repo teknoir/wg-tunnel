@@ -1,5 +1,7 @@
 # Access console: interaction spec
 
+> **Update:** WireGuard is now the platform's Tunneling and is on by default. The tab described here is shown as **Tunneling** in the console; "WireGuard" below is the technology name. The legacy SSH tunnel is being removed (production and airgapped installs still use it until migrated).
+
 **Status:** D-UX deliverable for ZTNA phase 2 (`plans/ztna-phase2.md`, sections 1 to 6, updated for "Rev 2 decisions"), 2026-10-14. Draft for Anders's review. **Rev 3 (this version):** the trusted SSH host key comes only from the admin action "Trust this host key", never from the SSH tunnel; the bold comparison now compares SSH host-key fingerprints; four new states were added (section 3.6).
 **Prototype:** `access-console.html` in this folder. It is one static file, and the only external resource is JetBrains Mono from Google Fonts. Open it in a browser and use the small "Prototype" switcher at the bottom right (two selects: state, and view as admin or member), or open it with a hash: `#active`, `#waiting`, `#waitingok`, `#waitingwg`, `#forced`, `#unattested`, `#duplicate`, `#unavail`, `#unavailkey`, `#mismatch`, `#revoked`, `#offline`, `#off`, `#stale`, `#loading`, `#dialog`, `#dialogbad`, `#dialogks`. Add `member` to view the page as a non-admin, for example `#active,member`.
 **Implements:** W5 (backstage). It replaces `DeviceWireGuardContent.tsx` on branch `robot`.

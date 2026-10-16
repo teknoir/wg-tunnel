@@ -1,8 +1,22 @@
 # wg-tunnel
 
-Zero-trust WireGuard tunnels for Teknoir devices, relayed through
-[STUNner](https://github.com/l7mp/stunner) (TURN). This runs as an
-alternative to the SSH reverse tunnels and stays separate from them.
+WireGuard is the Teknoir platform's **Tunneling**: zero-trust, device-initiated
+WireGuard tunnels to Teknoir devices, relayed through
+[STUNner](https://github.com/l7mp/stunner) (TURN). It is on by default and
+activates itself during device bootstrap, with no manual step. Users reach
+devices with `tnctl ssh <device>`, `tnctl port-forward <device> [local:]<service-id>`
+and `tnctl ansible`; `tnctl` picks WireGuard by itself and falls back to the
+legacy SSH tunnel (deadend, reverse-tunnel-app) only where WireGuard is not yet
+deployed. As of this writing that is production (teknoir.online) and airgapped
+installs; staging (teknoir.cloud) uses WireGuard. There is no SOCKS proxy and no
+arbitrary `host:port` forwarding over WireGuard, only the services a device
+publishes.
+
+Network needs on the device: outbound HTTPS to `wg.<domain>` and UDP 3478 to the
+TURN relay.
+
+Technical names keep the internal project name: namespace `teknoir-ztna`,
+annotations `ztna.teknoir.org/*`, and the `ztna-*` ConfigMaps and images.
 
 - `cmd/wg-hub`: session broker and WireGuard gateway. It runs wireguard-go on a
   gVisor netstack, unprivileged. It authenticates every session, applies policy
@@ -14,10 +28,10 @@ alternative to the SSH reverse tunnels and stays separate from them.
   `wgt-` pod): an HTTP reverse proxy that publishes the device's web services to
   browsers through the ingress, over the tunnel.
 - `cmd/wg-connect`: stdio proxy for `ssh -o ProxyCommand=...` (WG web terminal).
-- `pkg/wgclient`: client library used by `tnctl ssh --wireguard`.
+- `pkg/wgclient`: client library used by `tnctl ssh`, `tnctl port-forward` and `tnctl ansible`.
 - `pkg/api`: the wire contract (standard library only).
 
-Design: `plans/wireguard-ztna-tunnel.md` in the Teknoir workspace.
+Design: `plans/wireguard-ztna-tunnel.md` in the Teknoir workspace (historical name).
 
 ## wg-hub
 
