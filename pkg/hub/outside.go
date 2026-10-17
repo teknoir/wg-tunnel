@@ -873,6 +873,15 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 		h.endSession(s, again.Reason)
 		return 0, nil, deny(again.Reason, again.Detail)
 	}
+	// The org gate too: a placement or document change in the window is not
+	// seen by orgEnforce (the session was not registered yet).
+	if !perConn && h.cfg.OrgGateMode == OrgGateEnforce {
+		if ok, reason := h.orgEval(email, ns, device); !ok {
+			h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
+			h.endSession(s, reason)
+			return 0, nil, orgDenial(reason)
+		}
+	}
 	// The service may have been removed or redefined since it was resolved
 	// (the enforcer did not see this session yet): plane B bypasses the hub's
 	// per-connection checks, so it is checked again before anything is granted.

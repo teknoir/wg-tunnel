@@ -63,12 +63,11 @@ members with their units, plus the exempt users: superadmins and teamspace
 owners) for every teamspace that has flags entries. The hub reads those and
 fails closed: no document, an unknown placement or a malformed document denies
 members (reason `forbidden`, message "organisation data is not available yet");
-users who are not members, and exempt users, are unaffected. A change of a
+a teamspace without a usable document denies everyone (members and not), otherwise users who are not members, and exempt users, are unaffected. A change of a
 document or of a device's placement ends the affected open sessions at once,
 without a new SubjectAccessReview. Needs `ORG_GATE_MODE` (below) and RBAC: the
 watcher lists/watches `users.teknoir.org` and the hub reads ConfigMaps labelled
-`ztna.teknoir.org/org=true` (the watcher's ConfigMap write rule covers
-`ztna-org-*`). Metrics: `wghub_org_gate_total{mode,decision,reason}`,
+`ztna.teknoir.org/org=true` (the watcher's ConfigMap write rule and the `users` RBAC come with the ztna chart: release the chart before or together with this image, or start with `ORG_GATE_MODE=audit`, because the default `enforce` denies every tunnel user while no org documents exist). Metrics: `wghub_org_gate_total{mode,decision,reason}`,
 `wgflags_org_writes_total{action}`.
 
 A device is reachable only while the policy entry is `active`, the flags entry

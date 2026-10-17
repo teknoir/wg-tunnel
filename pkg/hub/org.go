@@ -178,6 +178,19 @@ func ParseOrgConfigMap(cm *corev1.ConfigMap) (api.OrgDoc, string) {
 	if err := dec.Decode(&d); err != nil || dec.More() {
 		return api.OrgDoc{}, "malformed org JSON"
 	}
+	if d.Members == nil || d.Exempt == nil {
+		return api.OrgDoc{}, "malformed org JSON"
+	}
+	for e := range d.Members {
+		if !ValidEmail(e) {
+			return api.OrgDoc{}, "invalid member email"
+		}
+	}
+	for _, e := range d.Exempt {
+		if !ValidEmail(e) {
+			return api.OrgDoc{}, "invalid exempt email"
+		}
+	}
 	if d.V != api.OrgDocVersion {
 		return api.OrgDoc{}, "unsupported version"
 	}

@@ -624,6 +624,12 @@ func (h *Hub) recheckUsers(s *session) {
 		ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
 		den, err := h.canOpen(ctx, user, s.ns, s.device)
 		cancel()
+		if err != nil && h.cfg.OrgGateMode == OrgGateEnforce {
+			// An authorizer outage must not keep an out-of-scope user connected.
+			if ok, reason := h.orgEval(user, s.ns, s.device); !ok {
+				den, err = orgDenial(reason), nil
+			}
+		}
 		if err != nil {
 			h.log.Error("re-authorizing a gateway user failed", "ns", s.ns, "err", err)
 			continue

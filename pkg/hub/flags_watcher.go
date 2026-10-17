@@ -266,7 +266,9 @@ func desiredEntry(m *metav1.PartialObjectMetadata, now time.Time) api.FlagsEntry
 }
 
 // Ready reports whether both informers are synced.
-func (w *FlagsWatcher) Ready() bool { return w.ready.Load() }
+func (w *FlagsWatcher) Ready() bool {
+	return w.ready.Load() && w.userInf.HasSynced() && w.orgInf.HasSynced()
+}
 
 // Handler serves /healthz, /readyz and /metrics.
 func (w *FlagsWatcher) Handler() http.Handler {
@@ -290,8 +292,9 @@ func (w *FlagsWatcher) Run(ctx context.Context) error {
 	go w.cmInf.Run(ctx.Done())
 	go w.userInf.Run(ctx.Done())
 	go w.orgInf.Run(ctx.Done())
-	// No org document is written before the Users have been listed.
-	if !cache.WaitForCacheSync(ctx.Done(), w.devInf.HasSynced, w.cmInf.HasSynced, w.userInf.HasSynced, w.orgInf.HasSynced) {
+	// Device flags (security flags included) must not wait for the Users: only
+	// the org documents do (see reconcile), and /readyz needs both.
+	if !cache.WaitForCacheSync(ctx.Done(), w.devInf.HasSynced, w.cmInf.HasSynced) {
 		return errors.New("flags watcher: informers did not sync")
 	}
 	w.resync() // also covers flags ConfigMaps whose Device vanished while we were down
@@ -347,6 +350,12 @@ func (w *FlagsWatcher) resync() {
 // reconcile brings the flags ConfigMap of one device in line with the Device.
 func (w *FlagsWatcher) reconcile(ctx context.Context, k devKey) error {
 	if k.device == "" { // org documents: one teamspace, or (empty ns) all of them
+		if !w.userInf.HasSynced() || !w.orgInf.HasSynced() {
+			// No org document is written or deleted before the Users and the
+			// existing documents have been listed.
+			w.queue.AddRateLimited(k)
+			return nil
+		}
 		if k.ns == "" {
 			w.enqueueAllOrg()
 			return nil
@@ -492,10 +501,10 @@ func (w *FlagsWatcher) enqueueAllOrg() {
 	all := w.teamspacesWithFlags()
 	for _, o := range w.orgInf.GetStore().List() {
 		if cm, ok := o.(*corev1.ConfigMap); ok {
-			if ns := cm.Labels[api.PolicyTeamspaceLabel]; validLabel(ns) {
+			if ns := cm.Labels[api.PolicyTeamspaceLabel]; validLabel(ns) && cm.Name == api.OrgConfigMapName(ns) {
 				all[ns] = true
 			} else if err := w.cs.CoreV1().ConfigMaps(w.cfg.Namespace).Delete(context.Background(), cm.Name, metav1.DeleteOptions{}); err == nil {
-				w.met.orgW.WithLabelValues("delete").Inc() // mislabelled: nothing could ever own it
+				w.met.orgW.WithLabelValues("delete").Inc() // mislabelled or misnamed: nothing could ever own it
 			}
 		}
 	}

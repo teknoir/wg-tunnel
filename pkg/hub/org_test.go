@@ -223,6 +223,10 @@ func TestParseOrgConfigMapIsStrict(t *testing.T) {
 		"ns mismatch":   orgCM("ztna-org-acme", lbl, map[string]string{api.OrgDataKey: strings.Replace(good, `"acme"`, `"evil"`, 1)}),
 		"name mismatch": orgCM("ztna-org-evil", lbl, map[string]string{api.OrgDataKey: good}),
 		"no org label":  orgCM("ztna-org-acme", map[string]string{api.PolicyTeamspaceLabel: "acme"}, map[string]string{api.OrgDataKey: good}),
+		"null members":  orgCM("ztna-org-acme", lbl, map[string]string{api.OrgDataKey: `{"v":1,"namespace":"acme","members":null,"exempt":[]}`}),
+		"null exempt":   orgCM("ztna-org-acme", lbl, map[string]string{api.OrgDataKey: `{"v":1,"namespace":"acme","members":{},"exempt":null}`}),
+		"bad member":    orgCM("ztna-org-acme", lbl, map[string]string{api.OrgDataKey: `{"v":1,"namespace":"acme","members":{"NOT AN EMAIL":{"units":[]}},"exempt":[]}`}),
+		"bad exempt":    orgCM("ztna-org-acme", lbl, map[string]string{api.OrgDataKey: `{"v":1,"namespace":"acme","members":{},"exempt":["x y"]}`}),
 		"no ns label":   orgCM("ztna-org-acme", map[string]string{api.OrgLabel: "true"}, map[string]string{api.OrgDataKey: good}),
 	}
 	for name, cm := range bad {
@@ -679,13 +683,46 @@ func TestFlagsWatcherWaitsForTheUserInformer(t *testing.T) {
 	if w.Ready() {
 		t.Fatal("ready before the User informer synced")
 	}
-	if cms, _ := cs.CoreV1().ConfigMaps(api.HubNamespace).List(ctx, metav1.ListOptions{}); len(cms.Items) != 0 {
-		t.Fatalf("%d ConfigMaps written before the Users synced", len(cms.Items))
+	// Device flags are mirrored without waiting for the Users ...
+	waitFor(t, "flags before the Users synced", func() bool {
+		_, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Get(ctx, api.FlagsConfigMapName("acme", "cam-1"), metav1.GetOptions{})
+		return err == nil
+	})
+	// ... but no org document is written (or deleted) before then.
+	if _, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Get(ctx, "ztna-org-acme", metav1.GetOptions{}); err == nil {
+		t.Fatal("org document written before the Users synced")
 	}
 	close(release)
 	waitFor(t, "ready", w.Ready)
 	waitFor(t, "org doc", func() bool {
 		_, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Get(ctx, "ztna-org-acme", metav1.GetOptions{})
 		return err == nil
+	})
+}
+
+// A placement change between the first check and the registration of the
+// session must not leave it up (the enforcer did not see it yet).
+func TestOrgGateRechecksAfterAdmission(t *testing.T) {
+	r := newRig(t)
+	r.deviceSessionOK()
+	r.org.set(orgDocOf(testNS, aliceEmail, "u1"))
+	r.setOrgDevice("a/u1")
+	r.h.testHookAfterAdmit = func() { r.setOrgDevice("a/elsewhere") }
+	req, _ := r.clientReq(22)
+	st, body := r.clientSession(aliceToken, req)
+	r.h.testHookAfterAdmit = nil
+	wantReason(t, st, body, http.StatusForbidden, api.ReasonForbidden)
+	if _, n := r.h.sessionCounts(); n != 0 {
+		t.Fatal("session left open")
+	}
+}
+
+// A document with the org label but a non-canonical name is deleted.
+func TestFlagsWatcherDeletesMisnamedOrgDocument(t *testing.T) {
+	cm := orgCM("ztna-org-wrong", map[string]string{api.OrgLabel: "true", api.PolicyTeamspaceLabel: "acme"}, map[string]string{api.OrgDataKey: "{}"})
+	r := newWatcherRigCMs(t, []runtime.Object{cm}, deviceMeta("acme", "cam-1", map[string]string{api.AnnotationWireGuard: "enabled"}))
+	waitFor(t, "misnamed document deleted", func() bool {
+		_, err := r.cs.CoreV1().ConfigMaps(api.HubNamespace).Get(context.Background(), "ztna-org-wrong", metav1.GetOptions{})
+		return err != nil
 	})
 }

@@ -114,8 +114,8 @@ func (h *Hub) orgEnforce(k devKey) {
 			}
 			continue
 		}
-		if ok, reason := h.orgEval(s.subject, s.ns, s.device); !ok && h.endSession(s, orgReasonScope) {
-			h.met.revocations.WithLabelValues(orgReasonScope).Inc()
+		if ok, reason := h.orgEval(s.subject, s.ns, s.device); !ok && h.endSession(s, reason) {
+			h.met.revocations.WithLabelValues(reason).Inc()
 			h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
 			h.logRevoke(s.key(), api.ReasonForbidden, orgDenial(reason).msg, s.id, slog.String("org_reason", reason))
 		}
