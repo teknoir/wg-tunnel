@@ -149,7 +149,10 @@ type Deps struct {
 	Users    UserAuthenticator
 	SA       SADelegation
 	Authz    Authorizer
-	TURN     TURNMinter
+	// Org serves the per-teamspace org documents of the org gate. Required
+	// unless Config.OrgGateMode is "off".
+	Org  OrgSource
+	TURN TURNMinter
 	// Status verifies the Backstage service account token of the status
 	// listener (optional: without it StatusHandler refuses everything).
 	Status StatusAuthenticator

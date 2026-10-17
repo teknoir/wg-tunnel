@@ -107,6 +107,7 @@ func (f *Flags) Set(ns, device string, ann map[string]string) {
 		WireGuard:         ann[api.AnnotationWireGuard] == "enabled",
 		Compromised:       api.FlagSet(ann[api.AnnotationCompromised]),
 		HealthCheckFailed: api.FlagSet(ann[api.AnnotationHealthCheckFailed]),
+		OrgKnown:          true, OrgPath: ann[api.AnnotationOrgPath], OrgNodeID: ann[api.AnnotationOrgNodeID],
 	}
 	f.mu.Unlock()
 	f.notify(ns, device)
@@ -118,6 +119,39 @@ func (f *Flags) Delete(ns, device string) {
 	delete(f.m, key{ns, device})
 	f.mu.Unlock()
 	f.notify(ns, device)
+}
+
+// Org is a hub.OrgSource. A teamspace without a document gets an empty one (no
+// members), so tests that ignore the org gate see no restriction; Set installs
+// a real document and Delete makes the teamspace's document missing (fail
+// closed for members is then not testable here, use the hub package fakes).
+type Org struct {
+	subscribers
+	mu   sync.Mutex
+	docs map[string]api.OrgDoc
+}
+
+var _ hub.OrgSource = (*Org)(nil)
+
+func NewOrg() *Org { return &Org{docs: map[string]api.OrgDoc{}} }
+
+func (o *Org) Doc(ns string) (api.OrgDoc, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if d, ok := o.docs[ns]; ok {
+		return d, true
+	}
+	return api.OrgDoc{V: api.OrgDocVersion, Namespace: ns, Members: map[string]api.OrgMember{}, Exempt: []string{}}, true
+}
+func (o *Org) Subscribe(fn func(ns, device string)) { o.add(fn) }
+func (o *Org) HasSynced() bool                      { return true }
+
+// Set installs the document of a teamspace and notifies the hub.
+func (o *Org) Set(doc api.OrgDoc) {
+	o.mu.Lock()
+	o.docs[doc.Namespace] = doc
+	o.mu.Unlock()
+	o.notify(doc.Namespace, "")
 }
 
 // Identity is a hub.IdentityStore.

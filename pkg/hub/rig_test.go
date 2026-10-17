@@ -33,6 +33,7 @@ type rig struct {
 	h      *Hub
 	pol    *fakePolicy
 	flags  *fakeFlags
+	org    *fakeOrg
 	ids    *memIdentity
 	users  *fakeUsers
 	sa     *fakeSA
@@ -86,7 +87,7 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 	t.Helper()
 	logger, logs := captureLogger()
 	r := &rig{
-		t: t, pol: newFakePolicy(), flags: newFakeFlags(), ids: newMemIdentity(), users: newFakeUsers(),
+		t: t, pol: newFakePolicy(), flags: newFakeFlags(), org: newFakeOrg(), ids: newMemIdentity(), users: newFakeUsers(),
 		sa: newFakeSA(), authz: newFakeAuthz(), tun: newFakeTunnel(), clock: newFakeClock(), logs: logs,
 		dev: newDeviceCreds(t),
 	}
@@ -101,7 +102,7 @@ func buildRig(t *testing.T, realWG bool, opts ...rigOpt) *rig {
 		o(&cfg)
 	}
 	deps := Deps{
-		Policy: r.pol, Flags: r.flags, Identity: r.ids, Users: r.users, SA: r.sa, Authz: r.authz,
+		Policy: r.pol, Flags: r.flags, Org: r.org, Identity: r.ids, Users: r.users, SA: r.sa, Authz: r.authz,
 		TURN: NewTURNMinter(func() (string, error) { return turnSecret, nil }, []string{"turn:turn.example.com:3478?transport=udp"}, 30*time.Minute, r.clock.Now),
 	}
 	if !realWG {

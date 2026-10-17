@@ -17,6 +17,7 @@ type metrics struct {
 	conns       prometheus.Gauge
 	connsTotal  prometheus.Counter
 	bytes       *prometheus.CounterVec
+	orgGate     *prometheus.CounterVec
 }
 
 func newMetrics() *metrics {
@@ -43,8 +44,11 @@ func newMetrics() *metrics {
 		bytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wghub_spliced_bytes_total", Help: "Bytes spliced, by direction.",
 		}, []string{"direction"}),
+		orgGate: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wghub_org_gate_total", Help: "Org gate decisions by mode, decision (allow, deny, would_deny) and reason.",
+		}, []string{"mode", "decision", "reason"}),
 	}
-	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes)
+	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes, m.orgGate)
 	// Make zero series visible.
 	m.sessions.WithLabelValues("device").Set(0)
 	m.sessions.WithLabelValues("client").Set(0)

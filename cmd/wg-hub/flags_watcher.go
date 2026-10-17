@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
@@ -38,7 +39,11 @@ func runFlagsWatcher() error {
 	if err != nil {
 		return err
 	}
-	w, err := hub.NewFlagsWatcher(cs, mc, hub.FlagsWatcherConfig{Namespace: hubNS, Logger: log})
+	dc, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		return err
+	}
+	w, err := hub.NewFlagsWatcher(cs, mc, dc, hub.FlagsWatcherConfig{Namespace: hubNS, Logger: log})
 	if err != nil {
 		return err
 	}

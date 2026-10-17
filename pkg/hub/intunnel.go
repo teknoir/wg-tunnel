@@ -198,13 +198,13 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 			default:
 			}
 		} else {
-			allowed, err := h.deps.Authz.CanExec(ctx, s.subject, s.ns)
+			den, err := h.canOpen(ctx, s.subject, s.ns, s.device)
 			if err != nil {
 				h.log.Error("authorization check failed", "ns", s.ns, "err", err)
 				return 0, nil, denyUnavailable("authorization backend unavailable")
 			}
-			if !allowed {
-				return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+			if den != nil {
+				return 0, nil, den
 			}
 		}
 		if den := h.serviceDenialLive(s, eff.Policy); den != nil {

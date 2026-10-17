@@ -806,13 +806,13 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	// Authorize before revealing anything about the device. A perConn session
 	// has no user yet: each connection is authorized for its own.
 	if !perConn {
-		allowed, err := h.deps.Authz.CanExec(ctx, email, ns)
+		den, err := h.canOpen(ctx, email, ns, device)
 		if err != nil {
 			h.log.Error("authorization check failed", "ns", ns, "err", err)
 			return 0, nil, denyUnavailable("authorization backend unavailable")
 		}
-		if !allowed {
-			return 0, nil, deny(api.ReasonForbidden, "no access to this teamspace")
+		if den != nil {
+			return 0, nil, den
 		}
 	}
 	eff := computeEffective(h.deps.Policy, h.deps.Flags, ns, device)

@@ -1,0 +1,403 @@
+{
+  "description": "Org-tree gate vectors shared by the next-gen fleet API (orgGateVectors.test.ts) and the WireGuard hub's CanOpen. Rule: plans/nextgen/org-gate-rule.md. A user is { email? (the hub lowercases it, then the User CR name is email with @ replaced by -at-), superadmin?, claimSets?: [{name, namespace}], annotations: User CR annotations, unreadable?: true }. expect is allow or deny.",
+  "namespace": "teknoir-demo",
+  "vectors": [
+    {
+      "id": 1,
+      "user": {
+        "superadmin": true,
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"karlstad-lab\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "allow",
+      "why": "exempt: superadmin"
+    },
+    {
+      "id": 2,
+      "user": {
+        "claimSets": [
+          {
+            "name": "owner",
+            "namespace": "teknoir-demo"
+          }
+        ],
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"karlstad-lab\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "allow",
+      "why": "exempt: owner of the teamspace"
+    },
+    {
+      "id": 3,
+      "user": {
+        "claimSets": [
+          {
+            "name": "owner",
+            "namespace": "other-ns"
+          }
+        ],
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"karlstad-lab\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "deny",
+      "why": "owner elsewhere does not exempt here"
+    },
+    {
+      "id": 4,
+      "user": {
+        "annotations": {}
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "allow",
+      "why": "not a member"
+    },
+    {
+      "id": 5,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "false",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"karlstad-lab\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "allow",
+      "why": "(dev 3) \"false\" is not a member"
+    },
+    {
+      "id": 6,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad/karlstad-lab"
+        }
+      },
+      "expect": "allow",
+      "why": "own unit is on the path"
+    },
+    {
+      "id": 7,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad"
+        }
+      },
+      "expect": "allow",
+      "why": "own unit itself"
+    },
+    {
+      "id": 8,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland"
+        }
+      },
+      "expect": "deny",
+      "why": "an ancestor of the own unit is not enough"
+    },
+    {
+      "id": 9,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "deny",
+      "why": "sibling branch"
+    },
+    {
+      "id": 10,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {}
+      },
+      "expect": "allow",
+      "why": "unplaced is visible to every member"
+    },
+    {
+      "id": 11,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-node-id": "stockholm-office"
+        }
+      },
+      "expect": "deny",
+      "why": "(dev 1) a node id alone is a placement"
+    },
+    {
+      "id": 12,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-node-id": "se-karlstad"
+        }
+      },
+      "expect": "allow",
+      "why": "(dev 1)"
+    },
+    {
+      "id": 13,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "/se//se-stockholm/"
+        }
+      },
+      "expect": "deny",
+      "why": "empty parts are dropped"
+    },
+    {
+      "id": 14,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad/karlstad-lab"
+        }
+      },
+      "expect": "deny",
+      "why": "member without units sees only unplaced"
+    },
+    {
+      "id": 15,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "not json"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad/karlstad-lab"
+        }
+      },
+      "expect": "deny",
+      "why": "unparsable units -> none"
+    },
+    {
+      "id": 16,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "\"se-karlstad\""
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad/karlstad-lab"
+        }
+      },
+      "expect": "deny",
+      "why": "units not an array -> none"
+    },
+    {
+      "id": 17,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"Se-Karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad"
+        }
+      },
+      "expect": "deny",
+      "why": "ids are case-sensitive"
+    },
+    {
+      "id": 18,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"bad id!\", \"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad"
+        }
+      },
+      "expect": "allow",
+      "why": "invalid ids are ignored, valid ones count"
+    },
+    {
+      "id": 19,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {}
+      },
+      "expect": "allow",
+      "why": "unplaced"
+    },
+    {
+      "id": 20,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "other-ns",
+        "annotations": {
+          "teknoir.org/org-tree-path": "x/y"
+        }
+      },
+      "expect": "allow",
+      "why": "membership is per teamspace"
+    },
+    {
+      "id": 21,
+      "user": {
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"l9\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "l0/l1/l2/l3/l4/l5/l6/l7/l8/l9"
+        }
+      },
+      "expect": "allow",
+      "why": "(dev 2) no depth limit"
+    },
+    {
+      "id": 22,
+      "user": {
+        "unreadable": true,
+        "annotations": {}
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-varmland/se-karlstad"
+        }
+      },
+      "expect": "deny",
+      "why": "User CR unreadable: fail closed in the hub (next-gen falls back to token groups instead; not tested here)",
+      "hubOnly": true
+    },
+    {
+      "id": 23,
+      "user": {
+        "email": "Claude-Agent@Teknoir.CLOUD",
+        "annotations": {
+          "teknoir.org/org-tree-member-teknoir-demo": "true",
+          "teknoir.org/org-tree-units-teknoir-demo": "[\"se-karlstad\"]"
+        }
+      },
+      "device": {
+        "namespace": "teknoir-demo",
+        "annotations": {
+          "teknoir.org/org-tree-path": "se/se-stockholm/stockholm-office"
+        }
+      },
+      "expect": "deny",
+      "why": "emails are lowercased before the User CR lookup (claude-agent-at-teknoir.cloud), so the mixed-case identity is still the Karlstad member",
+      "hubOnly": true
+    }
+  ]
+}
