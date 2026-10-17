@@ -40,7 +40,9 @@ import (
 	"golang.org/x/crypto/ssh"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	metafake "k8s.io/client-go/metadata/fake"
 
@@ -246,6 +248,7 @@ type Rig struct {
 	StatusAuth  *hubtest.StatusAuth
 	Policy      *hubtest.Policy
 	Flags       *hubtest.Flags
+	Org         *hubtest.Org
 	Identity    *hubtest.Identity
 	Authz       *hubtest.Authz
 	Echo        *Echo
@@ -297,7 +300,7 @@ func New(t testing.TB, opts Options) *Rig {
 	}
 	r := &Rig{
 		T: t, Opts: opts,
-		Policy: hubtest.NewPolicy(), Flags: hubtest.NewFlags(), Identity: hubtest.NewIdentity(), Authz: hubtest.NewAuthz(),
+		Policy: hubtest.NewPolicy(), Flags: hubtest.NewFlags(), Org: hubtest.NewOrg(), Identity: hubtest.NewIdentity(), Authz: hubtest.NewAuthz(),
 		SA: hubtest.NewSA(), StatusAuth: hubtest.NewStatusAuth(),
 		HubLogs: &LogBuf{}, AgentLogs: &LogBuf{}, ClientLogs: &LogBuf{},
 		secrets: map[string]struct{}{},
@@ -373,7 +376,7 @@ func New(t testing.TB, opts Options) *Rig {
 		flags = r.startFlagsWatcher()
 	}
 	h, err := hub.New(cfg, hub.Deps{
-		Policy: r.Policy, Flags: flags, Identity: r.Identity, Users: users, Authz: r.Authz, SA: r.SA, Status: r.StatusAuth,
+		Policy: r.Policy, Flags: flags, Org: r.Org, Identity: r.Identity, Users: users, Authz: r.Authz, SA: r.SA, Status: r.StatusAuth,
 		TURN: hub.NewTURNMinter(func() (string, error) { return TURNSecret, nil },
 			[]string{"turn:" + r.TURN.Addr + "?transport=udp"}, 30*time.Minute, nil),
 	})
@@ -417,7 +420,8 @@ func (r *Rig) startFlagsWatcher() hub.DeviceFlags {
 	}
 	r.metaClient = metafake.NewSimpleMetadataClient(scheme, dev)
 	cs := fake.NewSimpleClientset()
-	w, err := hub.NewFlagsWatcher(cs, r.metaClient, hub.FlagsWatcherConfig{Namespace: api.HubNamespace, Logger: logger(&LogBuf{})})
+	dc := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{hub.UserGVR: "UserList"})
+	w, err := hub.NewFlagsWatcher(cs, r.metaClient, dc, hub.FlagsWatcherConfig{Namespace: api.HubNamespace, Logger: logger(&LogBuf{})})
 	must(t, err)
 	src, err := hub.NewK8sFlagsSource(cs, api.HubNamespace, logger(&LogBuf{}))
 	must(t, err)

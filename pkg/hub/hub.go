@@ -86,6 +86,10 @@ type Config struct {
 	GlobalRate  float64
 	GlobalBurst int
 
+	// OrgGateMode is "enforce" (default), "audit" (log and count what the org
+	// gate would deny, allow) or "off" (ORG_GATE_MODE).
+	OrgGateMode string
+
 	Logger *slog.Logger
 	Now    func() time.Time
 }
@@ -189,10 +193,17 @@ type Hub struct {
 	wake    chan struct{}
 	// recheck wakes the user re-authorization worker (gateway renewals).
 	recheck chan struct{}
+	// orgPending/orgWake feed the org enforcer: org documents or flags entries
+	// changed for (ns, device) or, with an empty device, a whole teamspace.
+	orgPending map[devKey]struct{}
+	orgWake    chan struct{}
 
 	// testHookAfterAdmit, when set (tests), runs in handleClientSession right
 	// after the session was registered.
 	testHookAfterAdmit func()
+	// testHookAfterCommit, when set (tests), runs in the splice right after a
+	// connection was committed to its sessions.
+	testHookAfterCommit func()
 
 	tunnelServing atomic.Bool
 	ctx           context.Context
@@ -206,6 +217,14 @@ type Hub struct {
 // ServeTunnel to open the in-tunnel listeners and Handler for the HTTP API.
 func New(cfg Config, deps Deps) (*Hub, error) {
 	cfg.applyDefaults()
+	mode, err := ParseOrgGateMode(cfg.OrgGateMode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.OrgGateMode = mode
+	if deps.Org == nil && mode != OrgGateOff {
+		return nil, errors.New("hub: Org is required unless the org gate is off")
+	}
 	switch {
 	case deps.Policy == nil, deps.Flags == nil, deps.Identity == nil, deps.Users == nil, deps.Authz == nil, deps.TURN == nil:
 		return nil, errors.New("hub: Policy, Flags, Identity, Users, Authz and TURN are required")
@@ -254,11 +273,18 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		voiding:     map[devKey]struct{}{},
 		wake:        make(chan struct{}, 1),
 		recheck:     make(chan struct{}, 1),
+		orgPending:  map[devKey]struct{}{},
+		orgWake:     make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel,
 	}
 	deps.Policy.Subscribe(h.notify)
 	deps.Flags.Subscribe(h.notify)
-	h.wg.Add(3)
+	if mode != OrgGateOff {
+		deps.Flags.Subscribe(h.orgNotify)
+		deps.Org.Subscribe(h.orgNotify)
+	}
+	h.wg.Add(4)
+	go h.orgEnforcer()
 	go h.enforcer()
 	go h.reaper()
 	go h.userRechecker()
@@ -278,7 +304,7 @@ func (h *Hub) Endpoint() string {
 
 // Ready reports whether the informers are synced and the data plane is up.
 func (h *Hub) Ready() bool {
-	return h.deps.Policy.HasSynced() && h.deps.Flags.HasSynced() && h.tunnel.Up() && h.tunnelServing.Load()
+	return h.deps.Policy.HasSynced() && h.deps.Flags.HasSynced() && (h.deps.Org == nil || h.deps.Org.HasSynced()) && h.tunnel.Up() && h.tunnelServing.Load()
 }
 
 // Close ends all sessions and stops the hub.
@@ -598,19 +624,31 @@ func (h *Hub) recheckUsers(s *session) {
 		if h.ctx.Err() != nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
-		allowed, err := h.deps.Authz.CanExec(ctx, user, s.ns)
-		cancel()
+		var den *denial
+		var err error
+		if h.cfg.OrgGateMode == OrgGateEnforce {
+			// No Kubernetes call, and an authorizer outage must not keep an
+			// out-of-scope user connected.
+			if ok, reason := h.orgEval(user, s.ns, s.device); !ok {
+				h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
+				den = orgDenial(reason)
+			}
+		}
+		if den == nil {
+			ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
+			den, err = h.canOpen(ctx, user, s.ns, s.device)
+			cancel()
+		}
 		if err != nil {
 			h.log.Error("re-authorizing a gateway user failed", "ns", s.ns, "err", err)
 			continue
 		}
-		if allowed {
+		if den == nil {
 			continue
 		}
 		if n := s.closeConnsOf(user); n > 0 {
 			h.met.revocations.WithLabelValues(api.ReasonForbidden).Inc()
-			h.logRevoke(s.key(), api.ReasonForbidden, "user lost access to the teamspace", s.id,
+			h.logRevoke(s.key(), api.ReasonForbidden, "user lost access: "+den.msg, s.id,
 				slog.String("user", user), slog.Int("connections_closed", n))
 		}
 	}

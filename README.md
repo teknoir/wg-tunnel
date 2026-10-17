@@ -48,6 +48,28 @@ that reads them, metadata only, and mirrors the three switches into
 `ztna-flags-<teamspace>.<device>` ConfigMaps (written only on change; deleted
 when the Device is gone). A missing flags entry means "not enabled".
 
+### Org gate
+
+On top of the per-teamspace SubjectAccessReview (`create pods/exec`), a user who
+is a member of the teamspace's organisation tree may open only devices that are
+unplaced or whose placement path contains one of the user's units. The rule is
+`plans/nextgen/org-gate-rule.md`; `pkg/hub/testdata/org-gate-vectors.json` holds
+the shared vectors (also run by the fleet API). The flags watcher mirrors the
+Device annotations `teknoir.org/org-tree-path` and `teknoir.org/org-tree-node-id`
+into the flags entry (`orgKnown`, `orgPath`, `orgNodeId`) and, from the User
+CRs (a transformed informer that keeps only the email, role, claim sets and
+org-tree annotations), writes one `ztna-org-<teamspace>` ConfigMap (`org.json`:
+members with their units, plus the exempt users: superadmins and teamspace
+owners) for every teamspace that has flags entries. The hub reads those and
+fails closed: no document, an unknown placement or a malformed document denies
+members (reason `forbidden`, message "organisation data is not available yet");
+a teamspace without a usable document (a missing one included) denies everyone (members and not), otherwise users who are not members, and exempt users, are unaffected. A change of a
+document or of a device's placement ends the affected open sessions at once,
+without a new SubjectAccessReview. Needs `ORG_GATE_MODE` (below) and RBAC: the
+watcher lists/watches `users.teknoir.org` and the hub reads ConfigMaps labelled
+`ztna.teknoir.org/org=true` (the watcher's ConfigMap write rule and the `users` RBAC come with the ztna chart: release the chart before or together with this image, or start with `ORG_GATE_MODE=audit`, because the default `enforce` denies every tunnel user while no org documents exist). Metrics: `wghub_org_gate_total{mode,decision,reason}`,
+`wgflags_org_writes_total{action}`.
+
 A device is reachable only while the policy entry is `active`, the flags entry
 says the Device exists, `ztna.teknoir.org/wireguard=enabled` and neither
 `compromised` nor `health-check-failed` is `true` (`api.FlagSet` parses the
@@ -97,6 +119,7 @@ delegated sessions, the budget is per (service account, email).
 | `STATUS_ADDR` | listener for the Backstage live status and admin API (the chart sets `:8082`); off when empty | off |
 | `BACKSTAGE_SA` | full username of the Backstage service account (`system:serviceaccount:<ns>:<name>`), required with `STATUS_ADDR` | |
 | `STATUS_AUDIENCE` | audience of the projected token the Backstage backend presents on the status listener | `teknoir-ztna-status` (`api.StatusTokenAudience`) |
+| `ORG_GATE_MODE` | org gate: `enforce`, `audit` (log and count `would_deny`, allow) or `off`; any other value stops the hub | `enforce` |
 | `FLUSH_GRACE` | how long a revoked session's WireGuard peer stays after its streams were closed, so the FIN/RST reaches the client and the device | `300ms` |
 | `LOG_LEVEL` | slog level | `info` |
 
@@ -113,8 +136,15 @@ plus its retry) since the last packet or the last successful renewal.
 
 `wg-hub flags-watcher` takes `HUB_NAMESPACE`, `LOG_LEVEL` and `METRICS_ADDR`
 (`/healthz`, `/readyz`, `/metrics`); it needs get/list/watch on Devices
-(cluster-wide, metadata only) and create/update/delete on ConfigMaps in the hub
-namespace.
+(cluster-wide, metadata only) and on Users (cluster-scoped; only the fields the
+org gate reads are kept in memory) and create/update/delete on ConfigMaps in the
+hub namespace.
+
+Org gate failure behaviour: while the Users cannot be listed, the watcher
+writes and deletes no org document, so existing documents stay in force (stale,
+but not fail-open beyond that staleness); a teamspace whose document is missing
+denies everyone in it. The watcher's ServiceAccount can read User objects
+(including status) cluster-wide, an accepted risk like its existing Device read.
 
 ### Status and admin listener (`STATUS_ADDR`)
 

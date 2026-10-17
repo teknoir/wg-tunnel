@@ -115,14 +115,14 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 	}()
 	cctx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
 	defer cancel()
-	allowed, err := h.deps.Authz.CanExec(cctx, subject, s.ns)
+	den, err := h.canOpen(cctx, subject, s.ns, s.device)
 	if err != nil {
 		h.log.Error("authorization check failed", "ns", s.ns, "err", err)
 		closeDenied(api.ReasonInternal, "authorization backend unavailable")
 		return
 	}
-	if !allowed {
-		closeDenied(api.ReasonForbidden, "no access to this teamspace")
+	if den != nil {
+		closeDenied(den.reason, den.msg)
 		return
 	}
 	dev := h.deviceSession(s.ns, s.device)
@@ -167,6 +167,21 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		dev.removeConn(sc)
 		h.logDecision(d, "deny", again.Reason, again.Detail)
 		return
+	}
+	if h.testHookAfterCommit != nil {
+		h.testHookAfterCommit()
+	}
+	// The org placement may have changed while the agent was being dialled.
+	if s.perConn && h.cfg.OrgGateMode == OrgGateEnforce {
+		if ok, reason := h.orgEval(subject, s.ns, s.device); !ok {
+			h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
+			den := orgDenial(reason)
+			s.removeConn(sc)
+			dev.removeConn(sc)
+			_ = dc.Close()
+			closeDenied(den.reason, den.msg) // replies to the gateway, logs, closes the client
+			return
+		}
 	}
 	if s.perConn {
 		if err := writeReplyErr(client, api.ConnectResponse{OK: true}); err != nil {

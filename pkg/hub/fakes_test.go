@@ -122,12 +122,7 @@ func (f *fakeFlags) HasSynced() bool                      { return true }
 // Set replaces the flags of a device (creating it) from Device annotations,
 // the way the flags watcher mirrors them.
 func (f *fakeFlags) Set(ns, device string, ann map[string]string) {
-	f.SetEntry(api.FlagsEntry{
-		Device: device, Namespace: ns, Exists: true,
-		WireGuard:         ann[api.AnnotationWireGuard] == "enabled",
-		Compromised:       api.FlagSet(ann[api.AnnotationCompromised]),
-		HealthCheckFailed: api.FlagSet(ann[api.AnnotationHealthCheckFailed]),
-	})
+	f.SetEntry(desiredEntry(deviceMeta(ns, device, ann), time.Time{}))
 }
 
 // SetEntry stores an entry as is.
@@ -495,4 +490,49 @@ func (c *deviceCreds) renewToken(t testing.TB, now time.Time, wgKeyB64 string) s
 		t.Fatal(err)
 	}
 	return tok
+}
+
+// ---- org documents ----
+
+// fakeOrg is an OrgSource. A teamspace without a document gets an empty one
+// (no members) so tests that ignore the org gate see no restriction; missing
+// makes the document unavailable (fail closed).
+type fakeOrg struct {
+	subscribers
+	mu      sync.Mutex
+	docs    map[string]api.OrgDoc
+	missing map[string]bool
+}
+
+func newFakeOrg() *fakeOrg {
+	return &fakeOrg{docs: map[string]api.OrgDoc{}, missing: map[string]bool{}}
+}
+
+func (o *fakeOrg) Doc(ns string) (api.OrgDoc, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.missing[ns] {
+		return api.OrgDoc{}, false
+	}
+	if d, ok := o.docs[ns]; ok {
+		return d, true
+	}
+	return api.OrgDoc{V: api.OrgDocVersion, Namespace: ns, Members: map[string]api.OrgMember{}, Exempt: []string{}}, true
+}
+func (o *fakeOrg) Subscribe(fn func(ns, device string)) { o.add(fn) }
+func (o *fakeOrg) HasSynced() bool                      { return true }
+
+func (o *fakeOrg) set(d api.OrgDoc) {
+	o.mu.Lock()
+	o.docs[d.Namespace] = d
+	delete(o.missing, d.Namespace)
+	o.mu.Unlock()
+	o.notify(d.Namespace, "")
+}
+
+func (o *fakeOrg) setMissing(ns string, missing bool) {
+	o.mu.Lock()
+	o.missing[ns] = missing
+	o.mu.Unlock()
+	o.notify(ns, "")
 }

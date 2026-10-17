@@ -9,12 +9,19 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	metafake "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
 )
+
+func newUserClient(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{UserGVR: "UserList"}, objs...)
+}
 
 func deviceMeta(ns, name string, ann map[string]string) *metav1.PartialObjectMetadata {
 	return &metav1.PartialObjectMetadata{
@@ -27,17 +34,24 @@ type watcherRig struct {
 	t      *testing.T
 	cs     *fake.Clientset
 	mc     *metafake.FakeMetadataClient
+	dc     *dynamicfake.FakeDynamicClient
 	w      *FlagsWatcher
 	writes atomic.Int32 // create + update + delete of flags ConfigMaps
 }
 
 func newWatcherRig(t *testing.T, devices ...runtime.Object) *watcherRig {
 	t.Helper()
+	return newWatcherRigCMs(t, nil, devices...)
+}
+
+// newWatcherRigCMs starts with the given ConfigMaps already in the cluster.
+func newWatcherRigCMs(t *testing.T, cms []runtime.Object, devices ...runtime.Object) *watcherRig {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := metav1.AddMetaToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	r := &watcherRig{t: t, cs: fake.NewSimpleClientset(), mc: metafake.NewSimpleMetadataClient(scheme, devices...)}
+	r := &watcherRig{t: t, cs: fake.NewSimpleClientset(cms...), mc: metafake.NewSimpleMetadataClient(scheme, devices...), dc: newUserClient()}
 	r.cs.PrependReactor("*", "configmaps", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		switch a.GetVerb() {
 		case "create", "update", "delete":
@@ -46,7 +60,7 @@ func newWatcherRig(t *testing.T, devices ...runtime.Object) *watcherRig {
 		return false, nil, nil
 	})
 	logger, _ := captureLogger()
-	w, err := NewFlagsWatcher(r.cs, r.mc, FlagsWatcherConfig{Namespace: api.HubNamespace, Resync: time.Hour, Logger: logger})
+	w, err := NewFlagsWatcher(r.cs, r.mc, r.dc, FlagsWatcherConfig{Namespace: api.HubNamespace, Resync: time.Hour, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +181,7 @@ func TestFlagsWatcherCleansUpOrphansAtStartup(t *testing.T) {
 	cs := fake.NewSimpleClientset(orphan)
 	mc := metafake.NewSimpleMetadataClient(scheme)
 	logger, _ := captureLogger()
-	w, err := NewFlagsWatcher(cs, mc, FlagsWatcherConfig{Resync: time.Hour, Logger: logger})
+	w, err := NewFlagsWatcher(cs, mc, newUserClient(), FlagsWatcherConfig{Resync: time.Hour, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}

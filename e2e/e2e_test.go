@@ -261,6 +261,27 @@ func TestUserLosingAccessIsRefused(t *testing.T) {
 	}
 }
 
+// A teamspace whose org document is missing denies everyone in it, members
+// and non-members alike, at session creation.
+func TestMissingOrgDocumentDeniesEveryone(t *testing.T) {
+	t.Parallel()
+	r := e2erig.New(t, e2erig.Options{})
+	r.StartAgent()
+	r.WaitDeviceUp(1)
+	r.Org.SetMissing(e2erig.NS, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, u := range []string{e2erig.AliceEmail, e2erig.BobEmail} { // neither is a member
+		if _, err := r.NewClient(ctx, u); wgclient.ReasonOf(err) != api.ReasonForbidden {
+			t.Fatalf("%s with a missing org document: %v", u, err)
+		}
+	}
+	r.Org.SetMissing(e2erig.NS, false)
+	if err := e2erig.EchoVia(r.MustClient(e2erig.AliceEmail), "back", 20*time.Second); err != nil {
+		t.Fatalf("access did not return with the document: %v", err)
+	}
+}
+
 // (e) The TURN server restarts and loses every allocation; the relay
 // supervisors of agent and client recover and a new connection works.
 func TestTURNRestartRecovers(t *testing.T) {

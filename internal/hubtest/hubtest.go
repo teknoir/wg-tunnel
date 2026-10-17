@@ -107,6 +107,7 @@ func (f *Flags) Set(ns, device string, ann map[string]string) {
 		WireGuard:         ann[api.AnnotationWireGuard] == "enabled",
 		Compromised:       api.FlagSet(ann[api.AnnotationCompromised]),
 		HealthCheckFailed: api.FlagSet(ann[api.AnnotationHealthCheckFailed]),
+		OrgKnown:          true, OrgPath: ann[api.AnnotationOrgPath], OrgNodeID: ann[api.AnnotationOrgNodeID],
 	}
 	f.mu.Unlock()
 	f.notify(ns, device)
@@ -118,6 +119,53 @@ func (f *Flags) Delete(ns, device string) {
 	delete(f.m, key{ns, device})
 	f.mu.Unlock()
 	f.notify(ns, device)
+}
+
+// Org is a hub.OrgSource. A teamspace without a document gets an empty one (no
+// members), so tests that ignore the org gate see no restriction; Set installs
+// a real document and SetMissing makes the teamspace's document unavailable,
+// which denies everyone in it (members and non-members).
+type Org struct {
+	subscribers
+	mu      sync.Mutex
+	docs    map[string]api.OrgDoc
+	missing map[string]bool
+}
+
+var _ hub.OrgSource = (*Org)(nil)
+
+func NewOrg() *Org { return &Org{docs: map[string]api.OrgDoc{}, missing: map[string]bool{}} }
+
+func (o *Org) Doc(ns string) (api.OrgDoc, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.missing[ns] {
+		return api.OrgDoc{}, false
+	}
+	if d, ok := o.docs[ns]; ok {
+		return d, true
+	}
+	return api.OrgDoc{V: api.OrgDocVersion, Namespace: ns, Members: map[string]api.OrgMember{}, Exempt: []string{}}, true
+}
+func (o *Org) Subscribe(fn func(ns, device string)) { o.add(fn) }
+func (o *Org) HasSynced() bool                      { return true }
+
+// Set installs the document of a teamspace and notifies the hub.
+func (o *Org) Set(doc api.OrgDoc) {
+	o.mu.Lock()
+	o.docs[doc.Namespace] = doc
+	delete(o.missing, doc.Namespace)
+	o.mu.Unlock()
+	o.notify(doc.Namespace, "")
+}
+
+// SetMissing makes (or stops making) the document of a teamspace unavailable
+// and notifies the hub.
+func (o *Org) SetMissing(ns string, missing bool) {
+	o.mu.Lock()
+	o.missing[ns] = missing
+	o.mu.Unlock()
+	o.notify(ns, "")
 }
 
 // Identity is a hub.IdentityStore.

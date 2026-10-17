@@ -100,6 +100,11 @@ func run() error {
 	}
 	azp := hub.SplitList(env("ALLOWED_AZP", api.KeycloakAllowedAZP))
 
+	orgMode, err := hub.ParseOrgGateMode(env("ORG_GATE_MODE", ""))
+	if err != nil {
+		return err
+	}
+
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
@@ -120,8 +125,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	org, err := hub.NewK8sOrgSource(cs, hubNS, log)
+	if err != nil {
+		return err
+	}
 	policy.Start(ctx)
 	flags.Start(ctx)
+	org.Start(ctx)
 
 	users, err := hub.NewKeycloakVerifier(hub.KeycloakConfig{Issuer: issuer, JWKSURL: jwks, AllowedAZP: azp})
 	if err != nil {
@@ -144,6 +154,7 @@ func run() error {
 		return fmt.Errorf("FLUSH_GRACE must be a non-negative duration such as 300ms: %v", err)
 	}
 	h, err := hub.New(hub.Config{
+		OrgGateMode:    orgMode,
 		FlushGrace:     flushGrace,
 		Namespace:      hubNS,
 		PodIP:          podIP,
@@ -157,6 +168,7 @@ func run() error {
 		Identity: hub.NewK8sIdentityStore(cs, hubNS),
 		Users:    users,
 		SA:       hub.NewK8sSADelegation(cs, hubNS),
+		Org:      org,
 		Authz:    hub.NewCachedAuthorizer(hub.NewK8sAuthorizer(cs), 5*time.Second, 1024),
 		TURN:     hub.NewTURNMinter(secrets.Secret, turnURLs, 30*time.Minute, nil),
 		Status:   hub.NewK8sStatusAuth(cs, env("STATUS_AUDIENCE", api.StatusTokenAudience)),
@@ -165,7 +177,7 @@ func run() error {
 		return err
 	}
 	defer func() { _ = h.Close() }()
-	log.Info("wg-hub starting", "version", version.Version, "namespace", hubNS, "wgPort", h.WGPort(), "endpoint", h.Endpoint())
+	log.Info("wg-hub starting", "version", version.Version, "namespace", hubNS, "orgGate", orgMode, "wgPort", h.WGPort(), "endpoint", h.Endpoint())
 
 	// The outside API (users and devices through the ingress gateways) and the
 	// internal API (service-account delegation and direct sessions from pods

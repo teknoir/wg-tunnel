@@ -328,7 +328,49 @@ type FlagsEntry struct {
 	Compromised       bool      `json:"compromised"`
 	HealthCheckFailed bool      `json:"healthCheckFailed"`
 	ObservedAt        time.Time `json:"observedAt"`
+	// OrgKnown is true when the watcher wrote the org placement below (even if
+	// the Device has none). An entry without it (an older watcher) is unknown
+	// and the org gate fails closed for organisation members.
+	OrgKnown bool `json:"orgKnown,omitempty"`
+	// OrgPath and OrgNodeID are the raw Device annotations
+	// teknoir.org/org-tree-path and teknoir.org/org-tree-node-id.
+	OrgPath   string `json:"orgPath,omitempty"`
+	OrgNodeID string `json:"orgNodeId,omitempty"`
 }
+
+// Org-tree annotations of Devices and Users, read by the flags watcher.
+const (
+	AnnotationOrgPath       = "teknoir.org/org-tree-path"
+	AnnotationOrgNodeID     = "teknoir.org/org-tree-node-id"
+	AnnotationOrgMemberPref = "teknoir.org/org-tree-member-" // + <teamspace>
+	AnnotationOrgUnitsPref  = "teknoir.org/org-tree-units-"  // + <teamspace>
+)
+
+// Org documents: one ConfigMap per teamspace, written by the flags watcher
+// from the User CRs and read by the hub's org gate.
+const (
+	OrgConfigMapPrefix = "ztna-org-"            // + <teamspace>
+	OrgLabel           = "ztna.teknoir.org/org" // = "true"
+	OrgDataKey         = "org.json"
+	OrgDocVersion      = 1
+)
+
+// OrgDoc is the content of an org ConfigMap (canonical JSON: sorted keys and
+// lists, [] never null).
+type OrgDoc struct {
+	V         int                  `json:"v"`
+	Namespace string               `json:"namespace"`
+	Members   map[string]OrgMember `json:"members"`
+	Exempt    []string             `json:"exempt"`
+}
+
+// OrgMember is a member of the teamspace's organisation tree.
+type OrgMember struct {
+	Units []string `json:"units"`
+}
+
+// OrgConfigMapName returns the org ConfigMap name of a teamspace.
+func OrgConfigMapName(teamspace string) string { return OrgConfigMapPrefix + teamspace }
 
 // FlagsConfigMapName returns the flags ConfigMap name for a device.
 func FlagsConfigMapName(teamspace, device string) string {
