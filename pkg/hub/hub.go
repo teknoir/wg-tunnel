@@ -630,6 +630,7 @@ func (h *Hub) recheckUsers(s *session) {
 			// No Kubernetes call, and an authorizer outage must not keep an
 			// out-of-scope user connected.
 			if ok, reason := h.orgEval(user, s.ns, s.device); !ok {
+				h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
 				den = orgDenial(reason)
 			}
 		}

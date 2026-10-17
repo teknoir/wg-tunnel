@@ -174,6 +174,7 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 	// The org placement may have changed while the agent was being dialled.
 	if s.perConn && h.cfg.OrgGateMode == OrgGateEnforce {
 		if ok, reason := h.orgEval(subject, s.ns, s.device); !ok {
+			h.met.orgGate.WithLabelValues(OrgGateEnforce, "deny", reason).Inc()
 			den := orgDenial(reason)
 			s.removeConn(sc)
 			dev.removeConn(sc)
