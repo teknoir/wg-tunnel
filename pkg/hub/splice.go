@@ -168,6 +168,20 @@ func (h *Hub) handleSplice(ctx context.Context, c net.Conn) {
 		h.logDecision(d, "deny", again.Reason, again.Detail)
 		return
 	}
+	if h.testHookAfterCommit != nil {
+		h.testHookAfterCommit()
+	}
+	// The org placement may have changed while the agent was being dialled.
+	if s.perConn && h.cfg.OrgGateMode == OrgGateEnforce {
+		if ok, reason := h.orgEval(subject, s.ns, s.device); !ok {
+			den := orgDenial(reason)
+			s.removeConn(sc)
+			dev.removeConn(sc)
+			_ = dc.Close()
+			closeDenied(den.reason, den.msg) // replies to the gateway, logs, closes the client
+			return
+		}
+	}
 	if s.perConn {
 		if err := writeReplyErr(client, api.ConnectResponse{OK: true}); err != nil {
 			sc.close()

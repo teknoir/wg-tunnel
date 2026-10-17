@@ -201,6 +201,9 @@ type Hub struct {
 	// testHookAfterAdmit, when set (tests), runs in handleClientSession right
 	// after the session was registered.
 	testHookAfterAdmit func()
+	// testHookAfterCommit, when set (tests), runs in the splice right after a
+	// connection was committed to its sessions.
+	testHookAfterCommit func()
 
 	tunnelServing atomic.Bool
 	ctx           context.Context
@@ -621,14 +624,19 @@ func (h *Hub) recheckUsers(s *session) {
 		if h.ctx.Err() != nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
-		den, err := h.canOpen(ctx, user, s.ns, s.device)
-		cancel()
-		if err != nil && h.cfg.OrgGateMode == OrgGateEnforce {
-			// An authorizer outage must not keep an out-of-scope user connected.
+		var den *denial
+		var err error
+		if h.cfg.OrgGateMode == OrgGateEnforce {
+			// No Kubernetes call, and an authorizer outage must not keep an
+			// out-of-scope user connected.
 			if ok, reason := h.orgEval(user, s.ns, s.device); !ok {
-				den, err = orgDenial(reason), nil
+				den = orgDenial(reason)
 			}
+		}
+		if den == nil {
+			ctx, cancel := context.WithTimeout(h.ctx, h.cfg.DialTimeout)
+			den, err = h.canOpen(ctx, user, s.ns, s.device)
+			cancel()
 		}
 		if err != nil {
 			h.log.Error("re-authorizing a gateway user failed", "ns", s.ns, "err", err)

@@ -63,7 +63,7 @@ members with their units, plus the exempt users: superadmins and teamspace
 owners) for every teamspace that has flags entries. The hub reads those and
 fails closed: no document, an unknown placement or a malformed document denies
 members (reason `forbidden`, message "organisation data is not available yet");
-a teamspace without a usable document denies everyone (members and not), otherwise users who are not members, and exempt users, are unaffected. A change of a
+a teamspace without a usable document (a missing one included) denies everyone (members and not), otherwise users who are not members, and exempt users, are unaffected. A change of a
 document or of a device's placement ends the affected open sessions at once,
 without a new SubjectAccessReview. Needs `ORG_GATE_MODE` (below) and RBAC: the
 watcher lists/watches `users.teknoir.org` and the hub reads ConfigMaps labelled
@@ -139,6 +139,12 @@ plus its retry) since the last packet or the last successful renewal.
 (cluster-wide, metadata only) and on Users (cluster-scoped; only the fields the
 org gate reads are kept in memory) and create/update/delete on ConfigMaps in the
 hub namespace.
+
+Org gate failure behaviour: while the Users cannot be listed, the watcher
+writes and deletes no org document, so existing documents stay in force (stale,
+but not fail-open beyond that staleness); a teamspace whose document is missing
+denies everyone in it. The watcher's ServiceAccount can read User objects
+(including status) cluster-wide, an accepted risk like its existing Device read.
 
 ### Status and admin listener (`STATUS_ADDR`)
 

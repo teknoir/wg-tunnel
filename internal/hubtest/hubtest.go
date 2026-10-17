@@ -123,21 +123,25 @@ func (f *Flags) Delete(ns, device string) {
 
 // Org is a hub.OrgSource. A teamspace without a document gets an empty one (no
 // members), so tests that ignore the org gate see no restriction; Set installs
-// a real document and Delete makes the teamspace's document missing (fail
-// closed for members is then not testable here, use the hub package fakes).
+// a real document and SetMissing makes the teamspace's document unavailable,
+// which denies everyone in it (members and non-members).
 type Org struct {
 	subscribers
-	mu   sync.Mutex
-	docs map[string]api.OrgDoc
+	mu      sync.Mutex
+	docs    map[string]api.OrgDoc
+	missing map[string]bool
 }
 
 var _ hub.OrgSource = (*Org)(nil)
 
-func NewOrg() *Org { return &Org{docs: map[string]api.OrgDoc{}} }
+func NewOrg() *Org { return &Org{docs: map[string]api.OrgDoc{}, missing: map[string]bool{}} }
 
 func (o *Org) Doc(ns string) (api.OrgDoc, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.missing[ns] {
+		return api.OrgDoc{}, false
+	}
 	if d, ok := o.docs[ns]; ok {
 		return d, true
 	}
@@ -150,8 +154,18 @@ func (o *Org) HasSynced() bool                      { return true }
 func (o *Org) Set(doc api.OrgDoc) {
 	o.mu.Lock()
 	o.docs[doc.Namespace] = doc
+	delete(o.missing, doc.Namespace)
 	o.mu.Unlock()
 	o.notify(doc.Namespace, "")
+}
+
+// SetMissing makes (or stops making) the document of a teamspace unavailable
+// and notifies the hub.
+func (o *Org) SetMissing(ns string, missing bool) {
+	o.mu.Lock()
+	o.missing[ns] = missing
+	o.mu.Unlock()
+	o.notify(ns, "")
 }
 
 // Identity is a hub.IdentityStore.

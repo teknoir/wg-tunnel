@@ -70,6 +70,8 @@ type FlagsWatcher struct {
 	userInf cache.SharedIndexInformer // transformed: see stripUser
 	orgInf  cache.SharedIndexInformer
 	queue   workqueue.TypedRateLimitingInterface[devKey]
+	// orgDropped counts org keys dropped while the Users were unsynced (tests).
+	orgDropped atomic.Int64
 
 	ready atomic.Bool
 	met   *watcherMetrics
@@ -302,6 +304,11 @@ func (w *FlagsWatcher) Run(ctx context.Context) error {
 	w.log.Info("flags watcher ready", "namespace", w.cfg.Namespace)
 
 	go func() {
+		if cache.WaitForCacheSync(ctx.Done(), w.userInf.HasSynced, w.orgInf.HasSynced) {
+			w.queue.Add(devKey{}) // the org keys dropped while unsynced
+		}
+	}()
+	go func() {
 		t := time.NewTicker(w.cfg.Resync)
 		defer t.Stop()
 		for {
@@ -352,8 +359,9 @@ func (w *FlagsWatcher) reconcile(ctx context.Context, k devKey) error {
 	if k.device == "" { // org documents: one teamspace, or (empty ns) all of them
 		if !w.userInf.HasSynced() || !w.orgInf.HasSynced() {
 			// No org document is written or deleted before the Users and the
-			// existing documents have been listed.
-			w.queue.AddRateLimited(k)
+			// existing documents have been listed. The key is dropped, not
+			// retried: Run enqueues every teamspace once both have synced.
+			w.orgDropped.Add(1)
 			return nil
 		}
 		if k.ns == "" {

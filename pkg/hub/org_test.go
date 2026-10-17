@@ -688,6 +688,10 @@ func TestFlagsWatcherWaitsForTheUserInformer(t *testing.T) {
 		_, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Get(ctx, api.FlagsConfigMapName("acme", "cam-1"), metav1.GetOptions{})
 		return err == nil
 	})
+	// ... and org keys are dropped, not requeued in a loop.
+	if n := w.orgDropped.Load(); n > 5 {
+		t.Fatalf("org keys spun %d times while the Users were unsynced", n)
+	}
 	// ... but no org document is written (or deleted) before then.
 	if _, err := cs.CoreV1().ConfigMaps(api.HubNamespace).Get(ctx, "ztna-org-acme", metav1.GetOptions{}); err == nil {
 		t.Fatal("org document written before the Users synced")
@@ -725,4 +729,24 @@ func TestFlagsWatcherDeletesMisnamedOrgDocument(t *testing.T) {
 		_, err := r.cs.CoreV1().ConfigMaps(api.HubNamespace).Get(context.Background(), "ztna-org-wrong", metav1.GetOptions{})
 		return err != nil
 	})
+}
+
+// A placement change while the agent is being dialled for a gateway
+// connection must end that connection (the enforcer may not have seen it).
+func TestOrgGateRechecksGatewayConnectionAfterCommit(t *testing.T) {
+	agent := &svcAgent{}
+	w := newSvcRig(t, capsFull, []api.ServiceSpec{webSvc}, agent)
+	w.sa.add(gwToken, "wgt-cam-1", testNS, testDevice)
+	w.org.set(orgDocOf(testNS, aliceEmail, "u1"))
+	w.setOrgDevice("a/u1")
+	cli, _ := gwSession(w, "web")
+	w.h.testHookAfterCommit = func() { w.setOrgDevice("a/elsewhere") }
+	c, ans, err := dialAs(cli, "web", aliceEmail)
+	w.h.testHookAfterCommit = nil
+	if c != nil {
+		_ = c.Close()
+	}
+	if err != nil || ans.OK || ans.Reason != api.ReasonForbidden {
+		t.Fatalf("got %v %+v, want forbidden", err, ans)
+	}
 }
