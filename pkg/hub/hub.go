@@ -205,6 +205,14 @@ type Hub struct {
 	// connection was committed to its sessions.
 	testHookAfterCommit func()
 
+	// leading is false on a hot standby replica: the API answers 503 (see
+	// SetLeading). It is true from the start, so a hub without leader
+	// election always serves.
+	leading atomic.Bool
+	// readyGate, when set (by NewLeader), must also hold for Ready: a replica
+	// is not Ready before its pod label shows its role (see Leader.roleReady).
+	readyGate atomic.Pointer[func() bool]
+
 	tunnelServing atomic.Bool
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -277,6 +285,8 @@ func New(cfg Config, deps Deps) (*Hub, error) {
 		orgWake:     make(chan struct{}, 1),
 		ctx:         ctx, cancel: cancel,
 	}
+	h.leading.Store(true)
+	h.met.leader.Set(1)
 	deps.Policy.Subscribe(h.notify)
 	deps.Flags.Subscribe(h.notify)
 	if mode != OrgGateOff {
@@ -302,9 +312,115 @@ func (h *Hub) Endpoint() string {
 	return net.JoinHostPort(h.cfg.PodIP, strconv.Itoa(h.tunnel.ListenPort()))
 }
 
-// Ready reports whether the informers are synced and the data plane is up.
+// Ready reports whether the informers are synced and the data plane is up and,
+// with leader election, the pod label was set once (bounded wait, see
+// LeaderConfig.RoleWait).
 func (h *Hub) Ready() bool {
+	if g := h.readyGate.Load(); g != nil && !(*g)() {
+		return false
+	}
 	return h.deps.Policy.HasSynced() && h.deps.Flags.HasSynced() && (h.deps.Org == nil || h.deps.Org.HasSynced()) && h.tunnel.Up() && h.tunnelServing.Load()
+}
+
+// SetLeading switches the hub between serving and hot standby. A standby
+// answers every outside, internal and status API request with 503 (reason
+// internal, "hub standby"), so a session is never created on a replica that
+// does not hold the lease, not even in a split brain. Sessions that exist stay
+// up; /healthz and /readyz and the in-tunnel API are not affected (a standby
+// has no peers).
+func (h *Hub) SetLeading(leading bool) {
+	h.leading.Store(leading)
+	v := 0.0
+	if leading {
+		v = 1
+	}
+	h.met.leader.Set(v)
+}
+
+// Leading reports whether the hub serves (true unless it is a standby).
+func (h *Hub) Leading() bool { return h.leading.Load() }
+
+// standbyDenial is the answer of a standby replica.
+func standbyDenial() *denial { return denyUnavailable("hub standby") }
+
+// handoverFallbackReason is the reason of the second notice to an agent that
+// refused hub_handover with 400 because it was built before that reason
+// existed (its set of reasons is reenroll, device_revoked, device_disabled,
+// device_unknown and pending_approval). It must end the session without
+// side effects: reenroll would rotate the identity and the others would log a
+// misleading hint. The agent takes its normal back-off after it (1-2 s after
+// a stable session) and then connects to the new leader.
+const handoverFallbackReason = api.ReasonDeviceUnknown
+
+// handoverConcurrency bounds the revoke notices of Handover that are in flight.
+const handoverConcurrency = 32
+
+// Handover is the planned end of a serving hub: it tells every device session
+// whose agent advertised CapControl that the hub is going away
+// (api.ReasonHubHandover), so the agent connects again at once instead of when
+// a renewal fails 80 seconds later, and then closes the hub (streams first,
+// peers after the flush grace). Notices go out at most 32 at a time, one second
+// each, best effort; when ctx ends the remaining sessions get none. An agent
+// that refuses hub_handover with 400 (built before it existed) gets a second
+// notice with handoverFallbackReason, which every agent with a control
+// listener accepts. Call it after SetLeading(false) and after the new leader is
+// reachable.
+func (h *Hub) Handover(ctx context.Context) error {
+	h.mu.Lock()
+	var devs []*session
+	for _, s := range h.devices {
+		if s.kind == api.KindDevice && s.hasCap(api.CapControl) {
+			devs = append(devs, s)
+		}
+	}
+	h.mu.Unlock()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, handoverConcurrency)
+	skipped := 0
+loop:
+	for i, s := range devs {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			skipped = len(devs) - i
+			break loop
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			nctx, cancel := context.WithTimeout(ctx, revokeNoticeTimeout)
+			defer cancel()
+			n := api.RevokeNotice{Reason: api.ReasonHubHandover, SessionID: s.id, Detail: "the hub hands over to another replica"}
+			err := h.postRevoke(nctx, s, n)
+			var refused *agentStatusError
+			if errors.As(err, &refused) && refused.status == http.StatusBadRequest {
+				// An agent that does not know hub_handover: end its session
+				// with a reason it does know.
+				fctx, fcancel := context.WithTimeout(ctx, revokeNoticeTimeout)
+				defer fcancel()
+				n.Reason = handoverFallbackReason
+				if err = h.postRevoke(fctx, s, n); err == nil {
+					h.met.handoverNotices.WithLabelValues("delivered_legacy").Inc()
+					return
+				}
+			}
+			if err != nil {
+				h.met.handoverNotices.WithLabelValues("failed").Inc()
+				h.log.Debug("handover notice not delivered", "ns", s.ns, "device", s.device, "session", s.id, "err", err)
+				return
+			}
+			h.met.handoverNotices.WithLabelValues("delivered").Inc()
+		}()
+	}
+	wg.Wait()
+	if skipped > 0 {
+		h.met.handoverNotices.WithLabelValues("skipped").Add(float64(skipped))
+		h.log.Warn("handover: out of time; the remaining agents get no notice", "skipped", skipped)
+	}
+	h.log.Info("handover: devices notified", "devices", len(devs), "skipped", skipped)
+	return h.Close()
 }
 
 // Close ends all sessions and stops the hub.

@@ -37,6 +37,9 @@ type controlServer struct {
 	// revokeGrace bounds how long a revoke notice's handler waits for the hub
 	// to take the answer before the session is torn down regardless.
 	revokeGrace time.Duration
+	// refuseHandover answers a hub_handover notice with 400, as an agent
+	// built before that reason existed does (Config.RefuseHandoverNotice).
+	refuseHandover bool
 }
 
 // defaultRevokeGrace is how long the answer to a revoke notice may take to
@@ -176,13 +179,17 @@ func (c *controlServer) applyGrants(ctx context.Context, body []byte) (int, any,
 }
 
 // revokeReasons are the reasons the hub may end a device session with that the
-// agent acts on; any other value in a notice is refused.
+// agent acts on; any other value in a notice is refused with 400. An agent
+// built before hub_handover was added refuses that notice too; the hub then
+// sends a second notice with a reason such an agent accepts (see
+// Hub.Handover), so the agent still ends the session at once.
 var revokeReasons = map[string]bool{
 	api.ReasonReenroll:        true,
 	api.ReasonDeviceRevoked:   true,
 	api.ReasonDeviceDisabled:  true,
 	api.ReasonDeviceUnknown:   true,
 	api.ReasonPendingApproval: true,
+	api.ReasonHubHandover:     true,
 }
 
 // handleRevoke takes the hub's notice that it is ending the device session
@@ -199,7 +206,7 @@ func (c *controlServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var n api.RevokeNotice
-	if err := json.Unmarshal(body, &n); err != nil || !revokeReasons[n.Reason] {
+	if err := json.Unmarshal(body, &n); err != nil || !revokeReasons[n.Reason] || (n.Reason == api.ReasonHubHandover && c.refuseHandover) {
 		writeControlJSON(w, http.StatusBadRequest, &api.Error{Reason: api.ReasonBadRequest, Message: "malformed or unknown revoke notice"})
 		return
 	}

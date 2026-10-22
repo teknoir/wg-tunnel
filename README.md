@@ -120,6 +120,11 @@ delegated sessions, the budget is per (service account, email).
 | `BACKSTAGE_SA` | full username of the Backstage service account (`system:serviceaccount:<ns>:<name>`), required with `STATUS_ADDR` | |
 | `STATUS_AUDIENCE` | audience of the projected token the Backstage backend presents on the status listener | `teknoir-ztna-status` (`api.StatusTokenAudience`) |
 | `ORG_GATE_MODE` | org gate: `enforce`, `audit` (log and count `would_deny`, allow) or `off`; any other value stops the hub | `enforce` |
+| `LEADER_ELECTION` | name of the Lease in `HUB_NAMESPACE` to elect a serving replica on (the chart sets `wg-hub`); empty: no election, the hub always serves | off |
+| `POD_NAME` | identity in the election and the pod whose label is set (downward API); required with `LEADER_ELECTION` | |
+| `LEASE_DURATION` / `RENEW_DEADLINE` / `RETRY_PERIOD` | election timings (lease > renew deadline > 1.2 * retry period, or the hub stops) | `60s` / `45s` / `2s` |
+| `HANDOVER_WAIT` | how long a stepping-down leader waits for another replica to take the lease (`0s` with one replica) | `10s` |
+| `HANDOVER_SETTLE` | pause after the successor appeared, so routing follows, before the devices are told | `2s` |
 | `FLUSH_GRACE` | how long a revoked session's WireGuard peer stays after its streams were closed, so the FIN/RST reaches the client and the device | `300ms` |
 | `LOG_LEVEL` | slog level | `info` |
 
@@ -133,6 +138,60 @@ gone, relay lost), `pkg/wgclient` ends the session with `ErrTunnelDead` when a
 renewal fails at the transport level and nothing arrived through WireGuard for
 more than `DeadAfter` (twice the persistent keepalive, at least one renewal cycle
 plus its retry) since the last packet or the last successful renewal.
+
+### Leader election and handover
+
+The hub keeps every session in memory and ends client TCP streams itself, so
+two replicas cannot both serve: replicas are **active-passive**. With
+`LEADER_ELECTION` set, the replicas campaign for a Lease (client-go
+`leaderelection`, `ReleaseOnCancel`, identity `POD_NAME`). Every replica is
+Ready (informers synced, tunnel up) whether it leads or not, so rollouts and a
+PodDisruptionBudget are not blocked by the standby.
+
+- **Standby gate.** While not leading the hub answers every outside, internal and
+  status API request with `503` `reason: internal` ("hub standby"), before it
+  looks at credentials; wgclient and the agent retry on that. `/healthz`,
+  `/readyz` and the in-tunnel API are not gated by leadership (a standby has no
+  peers). A session is therefore never created on a replica without the lease,
+  not even in a split brain.
+- **Ready waits for the label.** A restarted pod still carries the label of its
+  previous life, possibly `leader`. After a start `/readyz` therefore answers
+  `503` until the first role patch (the standby label) succeeded, but at most
+  `RoleWait` (10 s) after the election started, so an unreachable API server does
+  not hold every replica unready.
+- **Role on the pod.** Each replica patches its own pod, and only these two keys:
+  label `ztna.teknoir.org/hub-role` (`leader` or `standby`) and annotation
+  `controller.kubernetes.io/pod-deletion-cost` (`100` or `0`). Service `wg-hub`
+  selects the leader label; the cost makes a rolling update delete the standby
+  first. At start a replica labels itself `standby`. A failed patch is retried
+  every 2 s, logged and counted; it never changes readiness or serving.
+- **Planned handover** (SIGTERM; also a lost lease, which then exits 1 so the
+  container restarts as a standby): stop serving new sessions, label `standby`,
+  release the lease, wait up to `HANDOVER_WAIT` for another replica to take it
+  and `HANDOVER_SETTLE` for routing, then send a `RevokeNotice` with reason
+  `hub_handover` to every device session that advertised `control-v1` (32 at a
+  time, 1 s each; best effort), close the hub (streams, then peers after
+  `FLUSH_GRACE`), shut the HTTP servers down. A notified agent reconnects after
+  its back-off, which reaches the new leader a few seconds after the kill
+  instead of when its renewal fails (80 to 140 s). Open TCP streams end at the
+  close; clients reconnect. A replica that never led skips the waits.
+- **Not covered.** A crash or SIGKILL of the leader sends no notice: agents find
+  out through the dead-tunnel limit as before (the same pod takes its lease
+  back at once; a lost pod or node costs the 60 s lease first). An API server
+  outage longer than `RENEW_DEADLINE` makes the leader step down.
+- **Agents.** `hub_handover` is accepted by agents built from this change on. An
+  older agent (the one pinned on staging before the re-pin) refuses it with 400;
+  the hub then sends a second notice with reason `device_unknown`, which that
+  agent accepts and which only ends the session (counted as `delivered_legacy`).
+  The agent takes its normal back-off, 1 to 2 s after a stable session, so the
+  devices are back within seconds either way. If the second notice fails too the
+  notice counts as `failed` and the agent finds out through the dead-tunnel limit.
+
+Metrics: `wghub_leader` (1 on the serving replica, also 1 without election),
+`wghub_handover_total{result}` (`successor`, `no_successor`, `not_leader`),
+`wghub_handover_notices_total{result}` (`delivered`, `delivered_legacy`, `failed`, `skipped`) and
+`wghub_role_patch_errors_total`. RBAC: `pods` patch, and `leases` create plus
+get/update on the named Lease, in `HUB_NAMESPACE`.
 
 `wg-hub flags-watcher` takes `HUB_NAMESPACE`, `LOG_LEVEL` and `METRICS_ADDR`
 (`/healthz`, `/readyz`, `/metrics`); it needs get/list/watch on Devices

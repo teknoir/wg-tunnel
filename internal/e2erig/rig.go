@@ -237,7 +237,7 @@ type Rig struct {
 	Opts Options
 
 	TURN   *turntest.Server
-	Hub    *hub.Hub
+	Hub    *hub.Hub // the serving hub (see ReplaceHub)
 	HubURL string
 	// InternalURL is the hub's internal API (service-account delegation and
 	// direct sessions; the web gateway uses it) and StatusURL the status and
@@ -282,6 +282,10 @@ type Rig struct {
 	secMu        sync.Mutex
 	secrets      map[string]struct{}
 	agentRuns    int
+
+	users                             hub.UserAuthenticator
+	flags                             hub.DeviceFlags
+	hubSwap, internalSwap, statusSwap *swapHandler
 }
 
 // New builds and starts the TURN server, the hub (data plane and HTTP API)
@@ -363,25 +367,68 @@ func New(t testing.TB, opts Options) *Rig {
 	r.SA.Add(GatewayToken, GatewaySAName, NS, DeviceName)
 	r.AddSecret(BackstageToken)
 	r.AddSecret(GatewayToken)
+	r.users = users
+	if opts.FlagsViaWatcher {
+		r.flags = r.startFlagsWatcher()
+	} else {
+		r.flags = r.Flags
+	}
+	h := r.startHub(nil)
+	r.Hub = h
+	r.hubSwap, r.internalSwap, r.statusSwap = &swapHandler{}, &swapHandler{}, &swapHandler{}
+	r.setHandlers(h)
+	srv := httptest.NewServer(r.recording(r.hubSwap))
+	t.Cleanup(srv.Close)
+	r.HubURL = srv.URL
+	isrv := httptest.NewServer(r.recording(r.internalSwap))
+	t.Cleanup(isrv.Close)
+	r.InternalURL = isrv.URL
+	ssrv := httptest.NewServer(r.statusSwap)
+	t.Cleanup(ssrv.Close)
+	r.StatusURL = ssrv.URL
+	Eventually(t, 10*time.Second, "hub ready", h.Ready)
+	return r
+}
+
+// swapHandler serves whatever handler was set last, so the rig's URLs stay the
+// same when ReplaceHub puts another hub behind them (the Service wg-hub and
+// its VirtualServices in production).
+type swapHandler struct{ h atomic.Pointer[http.Handler] }
+
+func (s *swapHandler) set(h http.Handler) { s.h.Store(&h) }
+
+func (s *swapHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	(*s.h.Load()).ServeHTTP(w, req)
+}
+
+func (r *Rig) setHandlers(h *hub.Hub) {
+	r.hubSwap.set(h.Handler())
+	r.internalSwap.set(h.InternalHandler())
+	r.statusSwap.set(h.StatusHandler())
+}
+
+// startHub creates a hub on the rig's fakes (sharing policy, flags, identity
+// pins and the TURN server with every other hub of the rig), brings up its
+// data plane and registers its cleanup. adjust may change the configuration.
+func (r *Rig) startHub(adjust func(*hub.Config)) *hub.Hub {
+	t := r.T
 	cfg := hub.Config{
-		PodIP: "127.0.0.1", Logger: logger(r.HubLogs), RenewAfter: opts.RenewAfter, BackstageSA: BackstageSA,
+		PodIP: "127.0.0.1", Logger: logger(r.HubLogs), RenewAfter: r.Opts.RenewAfter, BackstageSA: BackstageSA,
 		IPRate: 1000, IPBurst: 1000, SubjectRate: 1000, SubjectBurst: 1000,
 		GlobalRate: 100000, GlobalBurst: 100000,
 	}
-	if opts.Hub != nil {
-		opts.Hub(&cfg)
+	if r.Opts.Hub != nil {
+		r.Opts.Hub(&cfg)
 	}
-	var flags hub.DeviceFlags = r.Flags
-	if opts.FlagsViaWatcher {
-		flags = r.startFlagsWatcher()
+	if adjust != nil {
+		adjust(&cfg)
 	}
 	h, err := hub.New(cfg, hub.Deps{
-		Policy: r.Policy, Flags: flags, Org: r.Org, Identity: r.Identity, Users: users, Authz: r.Authz, SA: r.SA, Status: r.StatusAuth,
+		Policy: r.Policy, Flags: r.flags, Org: r.Org, Identity: r.Identity, Users: r.users, Authz: r.Authz, SA: r.SA, Status: r.StatusAuth,
 		TURN: hub.NewTURNMinter(func() (string, error) { return TURNSecret, nil },
 			[]string{"turn:" + r.TURN.Addr + "?transport=udp"}, 30*time.Minute, nil),
 	})
 	must(t, err)
-	r.Hub = h
 	t.Cleanup(func() { _ = h.Close() })
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -395,17 +442,23 @@ func New(t testing.TB, opts Options) *Rig {
 			t.Error("e2erig: ServeTunnel did not stop")
 		}
 	})
-	srv := httptest.NewServer(r.recording(h.Handler()))
-	t.Cleanup(srv.Close)
-	r.HubURL = srv.URL
-	isrv := httptest.NewServer(r.recording(h.InternalHandler()))
-	t.Cleanup(isrv.Close)
-	r.InternalURL = isrv.URL
-	ssrv := httptest.NewServer(h.StatusHandler())
-	t.Cleanup(ssrv.Close)
-	r.StatusURL = ssrv.URL
 	Eventually(t, 10*time.Second, "hub ready", h.Ready)
-	return r
+	return h
+}
+
+// ReplaceHub starts a second hub replica (its own WireGuard device, session
+// registry and pod endpoint, the same fakes) and puts it behind the rig's
+// URLs: the way Service wg-hub follows the leader. The old hub (returned) is
+// switched to standby and keeps running with its sessions, so the test can
+// run its Handover. Rig.Hub is the new hub from here on.
+func (r *Rig) ReplaceHub(adjust func(*hub.Config)) (old *hub.Hub) {
+	r.T.Helper()
+	old = r.Hub
+	old.SetLeading(false)
+	h := r.startHub(adjust)
+	r.Hub = h
+	r.setHandlers(h)
+	return old
 }
 
 // startFlagsWatcher runs the flags watcher against a fake Device and returns

@@ -265,6 +265,23 @@ const (
 	ReasonRateLimited     = "rate_limited"
 	ReasonBadRequest      = "bad_request"
 	ReasonInternal        = "internal"
+	// ReasonHubHandover is the reason of the RevokeNotice a hub sends to every
+	// device session before it hands over to another replica (a planned
+	// restart or a lost lease). The agent ends the session and connects again,
+	// which reaches the new leader. It is not a denial.
+	ReasonHubHandover = "hub_handover"
+)
+
+// Hub replicas. Exactly one replica serves (leader election on the Lease
+// LeaderLease in HubNamespace); each replica labels its own pod so that the
+// Service wg-hub selects only the leader, and lowers the deletion cost of a
+// standby so that a rolling update deletes the standby first.
+const (
+	LeaderLease               = "wg-hub"
+	HubRoleLabel              = "ztna.teknoir.org/hub-role" // HubRoleLeader | HubRoleStandby
+	HubRoleLeader             = "leader"
+	HubRoleStandby            = "standby"
+	PodDeletionCostAnnotation = "controller.kubernetes.io/pod-deletion-cost" // "100" leader, "0" standby
 )
 
 // Policy store, written only by device-controller into the hub's namespace
@@ -746,7 +763,8 @@ type K3sServiceList struct {
 // of finding out when a renewal fails and the tunnel is declared dead. The
 // agent ends the named session with Reason (an api.Reason* code: reenroll
 // rotates the identity and enrolls again without a back-off, the others take
-// the agent's normal denial path). Only for agents that advertised CapControl.
+// the agent's normal denial path; hub_handover ends the session and connects
+// again, which reaches the new leader). Only for agents that advertised CapControl.
 // A notice for any other session is answered 409 and ignored. The hub's ending
 // of the session does not depend on the notice being delivered.
 type RevokeNotice struct {

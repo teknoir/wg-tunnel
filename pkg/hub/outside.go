@@ -92,6 +92,11 @@ func (h *Hub) wrap(op string, internal bool, fn handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip, trusted := h.clientIP(r)
 		d := &dctx{op: op, remote: ip, internal: internal}
+		// A standby replica creates no session, whatever the routing did.
+		if !h.Leading() {
+			h.writeDenial(w, d, standbyDenial())
+			return
+		}
 		if r.Method != http.MethodPost {
 			den := deny(api.ReasonBadRequest, "POST required")
 			den.status = http.StatusMethodNotAllowed

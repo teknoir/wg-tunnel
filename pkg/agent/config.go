@@ -61,6 +61,12 @@ var DefaultBackoff = Backoff{Min: 2 * time.Second, Max: 5 * time.Minute, Stable:
 
 // Config configures the agent.
 type Config struct {
+	// RefuseHandoverNotice makes the agent behave like one built before
+	// api.ReasonHubHandover existed: its control listener answers a
+	// hub_handover notice with 400. It exists so that the hub's fallback for
+	// such agents is tested end to end; never set it in production.
+	RefuseHandoverNotice bool
+
 	DeviceID  string
 	Namespace string
 	// Domain is only used to derive HubURL when that is empty.

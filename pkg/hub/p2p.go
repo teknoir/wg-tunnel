@@ -520,7 +520,12 @@ func (h *Hub) postRevoke(ctx context.Context, dev *session, n api.RevokeNotice) 
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("agent answered %d", resp.StatusCode)
+		return &agentStatusError{status: resp.StatusCode}
 	}
 	return nil
 }
+
+// agentStatusError is an agent's refusal of a notice (any status but 200/204).
+type agentStatusError struct{ status int }
+
+func (e *agentStatusError) Error() string { return fmt.Sprintf("agent answered %d", e.status) }

@@ -182,6 +182,7 @@ var hints = map[string]string{
 	api.ReasonSessionLimit:    "the hub's session limit is reached",
 	api.ReasonPosture:         "the hub rejected this agent's version",
 	api.ReasonPendingApproval: "an admin must approve this device identity (fingerprint above) in the Teknoir UI",
+	api.ReasonHubHandover:     "the hub hands over to another replica; connecting to it",
 	api.ReasonAttestRequired:  "a device key is trusted for this device and this agent holds none it can attest with; an admin can rotate the device key in the Teknoir UI to deliver one",
 }
 

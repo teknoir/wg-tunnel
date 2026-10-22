@@ -266,3 +266,25 @@ func TestRevokeNoticeForAnotherSessionIsIgnored(t *testing.T) {
 		t.Fatal("the agent enrolled again")
 	}
 }
+
+// A hub_handover notice (the hub hands over to another replica) ends the
+// session like any other, and the agent connects again through the normal
+// back-off; a notice with a made-up reason is still refused.
+func TestControlRevokeAcceptsHubHandover(t *testing.T) {
+	hub := api.HubAddress + ":51000"
+	c, ended := revokeRig(t)
+	if rec := post(t, c, api.ControlRevokePath, hub, api.RevokeNotice{Reason: "hub_handover_x", SessionID: "s7"}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a made-up reason: %d, want 400", rec.Code)
+	}
+	if rec := post(t, c, api.ControlRevokePath, hub, api.RevokeNotice{Reason: api.ReasonHubHandover, SessionID: "s7", Detail: "handover"}); rec.Code != http.StatusNoContent {
+		t.Fatalf("hub_handover: %d %s", rec.Code, rec.Body)
+	}
+	select {
+	case err := <-ended:
+		if wgclient.ReasonOf(err) != api.ReasonHubHandover {
+			t.Fatalf("session ended with %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hub_handover did not end the session")
+	}
+}
