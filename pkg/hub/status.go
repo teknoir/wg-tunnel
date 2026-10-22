@@ -160,6 +160,12 @@ func (h *Hub) statusAuth(op string, fn statusFunc) http.HandlerFunc {
 			h.logDecision(d, "deny", den.reason, den.msg)
 			writeJSON(w, den.status, &api.Error{Reason: den.reason, Message: den.msg})
 		}
+		// A standby replica knows no sessions: Backstage must not read it as
+		// "device offline" (the Service selects the leader; this is the split-brain backstop).
+		if !h.Leading() {
+			fail(standbyDenial())
+			return
+		}
 		tok := bearer(r.Header.Get("Authorization"))
 		if tok == "" {
 			fail(deny(api.ReasonUnauthenticated, "bearer token required"))

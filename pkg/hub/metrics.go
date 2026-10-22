@@ -18,6 +18,11 @@ type metrics struct {
 	connsTotal  prometheus.Counter
 	bytes       *prometheus.CounterVec
 	orgGate     *prometheus.CounterVec
+
+	leader          prometheus.Gauge
+	handovers       *prometheus.CounterVec
+	handoverNotices *prometheus.CounterVec
+	rolePatchErrors prometheus.Counter
 }
 
 func newMetrics() *metrics {
@@ -47,11 +52,30 @@ func newMetrics() *metrics {
 		orgGate: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wghub_org_gate_total", Help: "Org gate decisions by mode, decision (allow, deny, would_deny) and reason.",
 		}, []string{"mode", "decision", "reason"}),
+		leader: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wghub_leader", Help: "1 while this replica serves (it holds the lease, or leader election is off), 0 on a hot standby.",
+		}),
+		handovers: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wghub_handover_total", Help: "Planned handovers by result (successor: another replica took the lease, no_successor, not_leader).",
+		}, []string{"result"}),
+		handoverNotices: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wghub_handover_notices_total", Help: "Hub-handover notices to device agents by result (delivered, failed, skipped).",
+		}, []string{"result"}),
+		rolePatchErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wghub_role_patch_errors_total", Help: "Failed updates of this pod's hub-role label and deletion-cost annotation.",
+		}),
 	}
-	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes, m.orgGate)
+	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes, m.orgGate,
+		m.leader, m.handovers, m.handoverNotices, m.rolePatchErrors)
 	// Make zero series visible.
 	m.sessions.WithLabelValues("device").Set(0)
 	m.sessions.WithLabelValues("client").Set(0)
+	for _, r := range []string{"delivered", "failed", "skipped"} {
+		m.handoverNotices.WithLabelValues(r)
+	}
+	for _, r := range []string{"successor", "no_successor", "not_leader"} {
+		m.handovers.WithLabelValues(r)
+	}
 	return m
 }
 

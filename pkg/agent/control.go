@@ -176,13 +176,16 @@ func (c *controlServer) applyGrants(ctx context.Context, body []byte) (int, any,
 }
 
 // revokeReasons are the reasons the hub may end a device session with that the
-// agent acts on; any other value in a notice is refused.
+// agent acts on; any other value in a notice is refused with 400. An agent
+// built before hub_handover was added refuses that notice too: the hub counts
+// it as failed and the agent finds out by itself, as it did before.
 var revokeReasons = map[string]bool{
 	api.ReasonReenroll:        true,
 	api.ReasonDeviceRevoked:   true,
 	api.ReasonDeviceDisabled:  true,
 	api.ReasonDeviceUnknown:   true,
 	api.ReasonPendingApproval: true,
+	api.ReasonHubHandover:     true,
 }
 
 // handleRevoke takes the hub's notice that it is ending the device session
