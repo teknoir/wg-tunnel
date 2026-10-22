@@ -151,9 +151,14 @@ PodDisruptionBudget are not blocked by the standby.
 - **Standby gate.** While not leading the hub answers every outside, internal and
   status API request with `503` `reason: internal` ("hub standby"), before it
   looks at credentials; wgclient and the agent retry on that. `/healthz`,
-  `/readyz` and the in-tunnel API are not gated (a standby has no peers). A
-  session is therefore never created on a replica without the lease, not even
-  in a split brain.
+  `/readyz` and the in-tunnel API are not gated by leadership (a standby has no
+  peers). A session is therefore never created on a replica without the lease,
+  not even in a split brain.
+- **Ready waits for the label.** A restarted pod still carries the label of its
+  previous life, possibly `leader`. After a start `/readyz` therefore answers
+  `503` until the first role patch (the standby label) succeeded, but at most
+  `RoleWait` (10 s) after the election started, so an unreachable API server does
+  not hold every replica unready.
 - **Role on the pod.** Each replica patches its own pod, and only these two keys:
   label `ztna.teknoir.org/hub-role` (`leader` or `standby`) and annotation
   `controller.kubernetes.io/pod-deletion-cost` (`100` or `0`). Service `wg-hub`

@@ -209,6 +209,9 @@ type Hub struct {
 	// SetLeading). It is true from the start, so a hub without leader
 	// election always serves.
 	leading atomic.Bool
+	// readyGate, when set (by NewLeader), must also hold for Ready: a replica
+	// is not Ready before its pod label shows its role (see Leader.roleReady).
+	readyGate atomic.Pointer[func() bool]
 
 	tunnelServing atomic.Bool
 	ctx           context.Context
@@ -309,8 +312,13 @@ func (h *Hub) Endpoint() string {
 	return net.JoinHostPort(h.cfg.PodIP, strconv.Itoa(h.tunnel.ListenPort()))
 }
 
-// Ready reports whether the informers are synced and the data plane is up.
+// Ready reports whether the informers are synced and the data plane is up and,
+// with leader election, the pod label was set once (bounded wait, see
+// LeaderConfig.RoleWait).
 func (h *Hub) Ready() bool {
+	if g := h.readyGate.Load(); g != nil && !(*g)() {
+		return false
+	}
 	return h.deps.Policy.HasSynced() && h.deps.Flags.HasSynced() && (h.deps.Org == nil || h.deps.Org.HasSynced()) && h.tunnel.Up() && h.tunnelServing.Load()
 }
 

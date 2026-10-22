@@ -282,8 +282,9 @@ func TestLeaderServesOnlyWhileElected(t *testing.T) {
 }
 
 // TestLeaderRolePatchRetriesAndNeverAffectsReadiness: a patch that keeps
-// failing is retried, counted and logged, and neither readiness nor serving
-// depends on it.
+// failing is retried, counted and logged, and serving does not depend on it
+// (readiness only waits a bounded time for the first patch, see
+// TestReadyzWaitIsBounded).
 func TestLeaderRolePatchRetriesAndNeverAffectsReadiness(t *testing.T) {
 	w := newWGDeviceRig(t)
 	ev := &eventLog{}
@@ -307,6 +308,91 @@ func TestLeaderRolePatchRetriesAndNeverAffectsReadiness(t *testing.T) {
 	}
 	if !strings.Contains(w.logs.String(), "role patch failed") {
 		t.Error("failed patches are not logged")
+	}
+}
+
+// gatedPatcher fails every SetRole until open is closed.
+type gatedPatcher struct {
+	open  chan struct{}
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *gatedPatcher) SetRole(_ context.Context, _ bool) error {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	select {
+	case <-p.open:
+		return nil
+	default:
+		return errors.New("api server unavailable")
+	}
+}
+
+func readyzStatus(t *testing.T, url string) int {
+	t.Helper()
+	resp, err := http.Get(url + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+// TestReadyzWaitsForTheFirstRolePatch: a restarted pod still carries the label
+// of its previous life, so /readyz stays 503 (from Start until the first
+// successful role patch) and turns 200 once the standby label landed, long
+// before RoleWait. The standby gate stays on throughout.
+func TestReadyzWaitsForTheFirstRolePatch(t *testing.T) {
+	w := newWGDeviceRig(t)
+	if !w.h.Ready() {
+		t.Fatal("rig must be ready without a leader")
+	}
+	ev := &eventLog{}
+	p := &gatedPatcher{open: make(chan struct{})}
+	l := NewLeader(w.h, LeaderConfig{Elector: newFakeElector(ev), Patcher: p, PatchRetry: 10 * time.Millisecond, RoleWait: time.Minute})
+
+	if got := readyzStatus(t, w.srv.URL); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz before Start: %d, want 503", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	l.Start(ctx)
+	waitFor(t, "patch attempts", func() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.calls >= 3 })
+	if got := readyzStatus(t, w.srv.URL); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while the role patch fails: %d, want 503", got)
+	}
+	if got := readyzStatus(t, w.isrv.URL); got != http.StatusServiceUnavailable {
+		t.Fatalf("internal /readyz while the role patch fails: %d, want 503", got)
+	}
+	if w.h.Leading() {
+		t.Fatal("serving before the election was won")
+	}
+
+	close(p.open)
+	waitFor(t, "/readyz after the first successful patch", func() bool { return readyzStatus(t, w.srv.URL) == http.StatusOK })
+	if got := readyzStatus(t, w.isrv.URL); got != http.StatusOK {
+		t.Fatalf("internal /readyz after the patch: %d, want 200", got)
+	}
+}
+
+// TestReadyzWaitIsBounded: with an API server that never answers the patch,
+// /readyz turns 200 after RoleWait, so replicas are not unready forever.
+func TestReadyzWaitIsBounded(t *testing.T) {
+	w := newWGDeviceRig(t)
+	p := &gatedPatcher{open: make(chan struct{})} // never opens
+	l := NewLeader(w.h, LeaderConfig{Elector: newFakeElector(&eventLog{}), Patcher: p, PatchRetry: 10 * time.Millisecond, RoleWait: 300 * time.Millisecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	start := time.Now()
+	l.Start(ctx)
+	if got := readyzStatus(t, w.srv.URL); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz right after Start: %d, want 503", got)
+	}
+	waitFor(t, "/readyz after RoleWait", func() bool { return readyzStatus(t, w.srv.URL) == http.StatusOK })
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Fatalf("ready after %v, before RoleWait", d)
 	}
 }
 

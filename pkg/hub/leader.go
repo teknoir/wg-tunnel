@@ -55,7 +55,15 @@ type LeaderConfig struct {
 	// PatchRetry is the delay before a failed role patch is tried again
 	// (default 2 s).
 	PatchRetry time.Duration
-	Logger     *slog.Logger
+	// RoleWait bounds how long after Start the hub is held not Ready while the
+	// first role patch has not succeeded (default 10 s). A restarted pod still
+	// carries the label of its previous life (possibly "leader"); Ready before
+	// the standby patch lands would let the Service select a standby, and a
+	// rolling update would then move on while the old leader label is stale.
+	// The bound keeps an unreachable API server from holding every replica
+	// unready.
+	RoleWait time.Duration
+	Logger   *slog.Logger
 }
 
 // Leader ties a Hub to a leader election: the hub serves only while the lease
@@ -77,6 +85,10 @@ type Leader struct {
 	electDone  chan struct{}
 	roleDone   chan struct{}
 	startedRun bool
+
+	started     time.Time     // when Start ran (zero before)
+	roleSettled chan struct{} // closed by the first successful role patch
+	settleOnce  sync.Once
 }
 
 // NewLeader makes h a hot standby (SetLeading(false)) until the election is won.
@@ -88,12 +100,32 @@ func NewLeader(h *Hub, cfg LeaderConfig) *Leader {
 	if cfg.Logger == nil {
 		cfg.Logger = h.log
 	}
+	if cfg.RoleWait <= 0 {
+		cfg.RoleWait = 10 * time.Second
+	}
 	h.SetLeading(false)
-	return &Leader{
+	l := &Leader{
 		h: h, cfg: cfg, log: cfg.Logger, want: api.HubRoleStandby,
 		kick: make(chan struct{}, 1), lost: make(chan struct{}),
 		electDone: make(chan struct{}), roleDone: make(chan struct{}),
+		roleSettled: make(chan struct{}),
 	}
+	gate := l.roleReady
+	h.readyGate.Store(&gate)
+	return l
+}
+
+// roleReady is the Ready gate: false until Start, then until the first role
+// patch succeeded or RoleWait passed.
+func (l *Leader) roleReady() bool {
+	select {
+	case <-l.roleSettled:
+		return true
+	default:
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return !l.started.IsZero() && time.Since(l.started) >= l.cfg.RoleWait
 }
 
 // Lost is closed when the lease was lost while the process was running. The
@@ -110,6 +142,7 @@ func (l *Leader) Start(ctx context.Context) {
 		return
 	}
 	l.startedRun = true
+	l.started = time.Now()
 	l.mu.Unlock()
 
 	rctx, stopRole := context.WithCancel(ctx)
@@ -187,6 +220,7 @@ func (l *Leader) roleLoop(ctx context.Context) {
 				continue
 			}
 			applied = want
+			l.settleOnce.Do(func() { close(l.roleSettled) })
 			l.log.Info("pod role set", "role", want)
 			continue
 		}
