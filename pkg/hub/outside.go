@@ -789,8 +789,15 @@ func (h *Hub) handleClientSession(ctx context.Context, r *http.Request, body []b
 	default:
 		u, err := h.deps.Users.Authenticate(ctx, tok)
 		if err != nil {
+			if errors.Is(err, ErrMissingAudience) {
+				h.noteUserToken(d, "create", true)
+				if tnctlBelow(req.Posture, api.MinTnctlAudienceVersion) {
+					return 0, nil, deny(api.ReasonPosture, "update tnctl, then run 'tnctl login'")
+				}
+			}
 			return 0, nil, asDenial(err)
 		}
+		h.noteUserToken(d, "create", u.LegacyAudience)
 		email, tokenExp, tokenID, tokenIAT = u.Email, u.ExpiresAt, u.TokenID, u.IssuedAt
 	}
 	d.subject = email

@@ -23,6 +23,7 @@ type metrics struct {
 	handovers       *prometheus.CounterVec
 	handoverNotices *prometheus.CounterVec
 	rolePatchErrors prometheus.Counter
+	userTokens      *prometheus.CounterVec
 }
 
 func newMetrics() *metrics {
@@ -64,9 +65,12 @@ func newMetrics() *metrics {
 		rolePatchErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "wghub_role_patch_errors_total", Help: "Failed updates of this pod's hub-role label and deletion-cost annotation.",
 		}),
+		userTokens: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wghub_user_tokens_total", Help: "Keycloak tokens presented on create and renew, by whether they carry the hub audience (ztna) or not (legacy).",
+		}, []string{"op", "audience"}),
 	}
 	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes, m.orgGate,
-		m.leader, m.handovers, m.handoverNotices, m.rolePatchErrors)
+		m.leader, m.handovers, m.handoverNotices, m.rolePatchErrors, m.userTokens)
 	// Make zero series visible.
 	m.sessions.WithLabelValues("device").Set(0)
 	m.sessions.WithLabelValues("client").Set(0)
@@ -75,6 +79,11 @@ func newMetrics() *metrics {
 	}
 	for _, r := range []string{"successor", "no_successor", "not_leader"} {
 		m.handovers.WithLabelValues(r)
+	}
+	for _, op := range []string{"create", "renew"} {
+		for _, aud := range []string{audienceZTNA, audienceLegacy} {
+			m.userTokens.WithLabelValues(op, aud)
+		}
 	}
 	return m
 }

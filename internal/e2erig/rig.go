@@ -559,11 +559,11 @@ func (b *bodyRecorder) Write(p []byte) (int, error) {
 	return b.ResponseWriter.Write(p)
 }
 
-// UserToken mints a Keycloak-style access token for email (azp teknoir-cli).
+// UserToken mints a Keycloak-style hub token for email (azp teknoir-cli, aud teknoir-ztna).
 func (r *Rig) UserToken(email string) string {
 	now := time.Now()
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"iss": kcIssuer, "azp": "teknoir-cli", "email": email, "email_verified": true,
+		"iss": kcIssuer, "azp": "teknoir-cli", "aud": []string{"teknoir-cli", "teknoir-ztna", "account"}, "email": email, "email_verified": true,
 		"sub": "user-" + email, "iat": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
 		"jti": fmt.Sprintf("%d", now.UnixNano()),
 	})

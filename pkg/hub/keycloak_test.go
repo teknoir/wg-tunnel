@@ -81,6 +81,7 @@ func kcToken(t *testing.T, k kcKey, mutate func(jwt.MapClaims), now time.Time) s
 	c := jwt.MapClaims{
 		"iss": kcIssuer, "azp": "teknoir-cli", "email": "alice@example.com", "email_verified": true,
 		"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(), "sub": "u-1",
+		"aud": []string{"teknoir-cli", "teknoir-ztna", "account"},
 	}
 	if mutate != nil {
 		mutate(c)
@@ -437,5 +438,118 @@ func TestKeycloakTokenIdentity(t *testing.T) {
 	}
 	if id.TokenID != "jti-1" || !id.IssuedAt.Equal(now) {
 		t.Fatalf("identity %+v", id)
+	}
+}
+
+func newKCVerifierMode(t *testing.T, j *jwksServer, clock *fakeClock, mode string) (*KeycloakVerifier, error) {
+	t.Helper()
+	return NewKeycloakVerifier(KeycloakConfig{
+		Issuer: kcIssuer, JWKSURL: j.srv.URL, Now: clock.Now, MinRefresh: time.Second, AudienceMode: mode,
+	})
+}
+
+func TestKeycloakAudience(t *testing.T) {
+	key := newKCKey(t, "k1")
+	j := newJWKSServer(t, key)
+	clock := newFakeClock()
+	now := clock.Now()
+	ctx := context.Background()
+
+	enforce, err := newKCVerifierMode(t, j, clock, "") // the default mode is enforce
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := newKCVerifierMode(t, j, clock, "transition")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withAud := func(aud any) func(jwt.MapClaims) {
+		return func(c jwt.MapClaims) {
+			if aud == nil {
+				delete(c, "aud")
+				return
+			}
+			c["aud"] = aud
+		}
+	}
+	tests := []struct {
+		name        string
+		mutate      func(jwt.MapClaims)
+		wantEnforce bool // accepted in enforce mode
+	}{
+		{"array with the audience", withAud([]string{"teknoir-cli", "teknoir-ztna", "account"}), true},
+		{"string audience", withAud("teknoir-ztna"), true},
+		{"main token (cli only)", withAud([]string{"teknoir-cli", "master-realm", "account"}), false},
+		{"string without the audience", withAud("teknoir-cli"), false},
+		{"no aud claim", withAud(nil), false},
+		{"empty array", withAud([]string{}), false},
+		{"prefix of the audience is not it", withAud([]string{"teknoir-ztna-status"}), false},
+		{"non-string aud", withAud(42), false},
+		{"azp teknoir with the audience", func(c jwt.MapClaims) { c["azp"] = "teknoir"; c["aud"] = "teknoir-ztna" }, false},
+	}
+	for _, tc := range tests {
+		tok := kcToken(t, key, tc.mutate, now)
+		t.Run("enforce/"+tc.name, func(t *testing.T) {
+			id, err := enforce.Authenticate(ctx, tok)
+			if tc.wantEnforce {
+				if err != nil || id.LegacyAudience {
+					t.Fatalf("err=%v legacy=%v", err, id.LegacyAudience)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("accepted")
+			}
+			if !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("want ErrUnauthenticated, got %v", err)
+			}
+		})
+		t.Run("transition/"+tc.name, func(t *testing.T) {
+			id, err := transition.Authenticate(ctx, tok)
+			azpWrong := tc.name == "azp teknoir with the audience"
+			switch {
+			case azpWrong:
+				if err == nil {
+					t.Fatal("azp teknoir accepted in transition mode")
+				}
+			case err != nil:
+				t.Fatalf("rejected: %v", err)
+			case id.LegacyAudience == tc.wantEnforce:
+				t.Fatalf("legacy=%v for a token that %s", id.LegacyAudience, tc.name)
+			}
+		})
+	}
+
+	// The enforce error satisfies both sentinels, so asDenial answers 401.
+	_, err = enforce.Authenticate(ctx, kcToken(t, key, withAud("teknoir-cli"), now))
+	if !errors.Is(err, ErrMissingAudience) || !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("got %v", err)
+	}
+	if d := asDenial(err); d.status != http.StatusUnauthorized || d.reason != "unauthenticated" {
+		t.Fatalf("denial %+v", d)
+	}
+}
+
+func TestKeycloakAudienceConfigurable(t *testing.T) {
+	key := newKCKey(t, "k1")
+	j := newJWKSServer(t, key)
+	clock := newFakeClock()
+	v, err := NewKeycloakVerifier(KeycloakConfig{Issuer: kcIssuer, JWKSURL: j.srv.URL, Now: clock.Now, Audience: "hub-x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Authenticate(context.Background(), kcToken(t, key, func(c jwt.MapClaims) { c["aud"] = "teknoir-ztna" }, clock.Now())); !errors.Is(err, ErrMissingAudience) {
+		t.Fatalf("default audience accepted for a verifier configured for hub-x: %v", err)
+	}
+	if _, err := v.Authenticate(context.Background(), kcToken(t, key, func(c jwt.MapClaims) { c["aud"] = []string{"hub-x"} }, clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKeycloakBadAudienceModeRejected(t *testing.T) {
+	for _, mode := range []string{"off", "audit", "Enforce", "true"} {
+		if _, err := NewKeycloakVerifier(KeycloakConfig{Issuer: kcIssuer, JWKSURL: "http://x", AudienceMode: mode}); err == nil {
+			t.Errorf("mode %q accepted", mode)
+		}
 	}
 }

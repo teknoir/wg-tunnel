@@ -82,6 +82,9 @@ type UserIdentity struct {
 	// present a different, not older token than the previously accepted one.
 	TokenID  string
 	IssuedAt time.Time
+	// LegacyAudience is true when the token lacks the hub audience and was
+	// accepted anyway (audience mode "transition").
+	LegacyAudience bool
 }
 
 // UserAuthenticator verifies Keycloak access tokens.

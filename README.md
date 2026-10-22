@@ -91,7 +91,7 @@ Device identity:
   specific reasons (`reenroll`, `pending_approval`, ...) go to authenticated devices.
 
 Listeners: `HTTP_ADDR` (8080) is the outside API behind the ingress gateways and
-serves Keycloak users and devices only. `INTERNAL_HTTP_ADDR` (8081) is not
+serves Keycloak users and devices only. A Keycloak token must have `azp` `teknoir-cli` and `aud` `teknoir-ztna` (`KEYCLOAK_AUDIENCE_MODE`). `INTERNAL_HTTP_ADDR` (8081) is not
 routed by any VirtualService and additionally accepts service-account
 delegation (`onBehalfOf`, TokenReview audience `teknoir-ztna`, SA labelled
 `app.kubernetes.io/managed-by=device-controller` and annotated for the device)
@@ -115,6 +115,8 @@ delegated sessions, the budget is per (service account, email).
 | `TURN_SECRET_REF` | `namespace/name` of the Secret holding key `secret` | `stunner-system/stunner-auth-secret` |
 | `KEYCLOAK_ISSUER` / `KEYCLOAK_JWKS_URL` | access-token issuer and key set | `https://auth.<DOMAIN>/auth/realms/master` |
 | `ALLOWED_AZP` | accepted Keycloak `azp` values | `teknoir-cli` |
+| `KEYCLOAK_AUDIENCE` | `aud` a Keycloak token must carry (tnctl asks for it with the optional scope `teknoir-ztna` on hub calls only) | `teknoir-ztna` |
+| `KEYCLOAK_AUDIENCE_MODE` | `enforce` refuses a token without the audience (`unauthenticated`, or `posture` for a tnctl older than 0.1.2); `transition` accepts it and counts it as `legacy` (`wghub_user_tokens_total{op,audience}`, log field `token_audience`); any other value stops the hub | `enforce` |
 | `CLIENT_IP_HEADER` | trusted proxy header with the real client IP; without it there is no per-IP limit | none |
 | `STATUS_ADDR` | listener for the Backstage live status and admin API (the chart sets `:8082`); off when empty | off |
 | `BACKSTAGE_SA` | full username of the Backstage service account (`system:serviceaccount:<ns>:<name>`), required with `STATUS_ADDR` | |
