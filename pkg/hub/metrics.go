@@ -59,7 +59,7 @@ func newMetrics() *metrics {
 			Name: "wghub_handover_total", Help: "Planned handovers by result (successor: another replica took the lease, no_successor, not_leader).",
 		}, []string{"result"}),
 		handoverNotices: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "wghub_handover_notices_total", Help: "Hub-handover notices to device agents by result (delivered, failed, skipped).",
+			Name: "wghub_handover_notices_total", Help: "Hub-handover notices to device agents by result (delivered, delivered_legacy: an agent that refused hub_handover took a device_unknown notice instead, failed, skipped).",
 		}, []string{"result"}),
 		rolePatchErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "wghub_role_patch_errors_total", Help: "Failed updates of this pod's hub-role label and deletion-cost annotation.",
@@ -70,7 +70,7 @@ func newMetrics() *metrics {
 	// Make zero series visible.
 	m.sessions.WithLabelValues("device").Set(0)
 	m.sessions.WithLabelValues("client").Set(0)
-	for _, r := range []string{"delivered", "failed", "skipped"} {
+	for _, r := range []string{"delivered", "delivered_legacy", "failed", "skipped"} {
 		m.handoverNotices.WithLabelValues(r)
 	}
 	for _, r := range []string{"successor", "no_successor", "not_leader"} {

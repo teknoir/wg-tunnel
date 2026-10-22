@@ -440,6 +440,7 @@ func (a *Agent) serveServices(ctx context.Context, sess serviceSession, resp api
 	}
 	a.grants.Store(grants)
 	control := newControlServer(a.log, connect, grants, pb)
+	control.refuseHandover = a.cfg.RefuseHandoverNotice
 	control.revoke = &revokeTarget{sessionID: resp.SessionID, setCause: sess.SetEndCause, end: sess.EndWith}
 
 	closePlaneB := func() {

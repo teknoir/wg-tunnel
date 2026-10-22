@@ -174,14 +174,18 @@ PodDisruptionBudget are not blocked by the standby.
   out through the dead-tunnel limit as before (the same pod takes its lease
   back at once; a lost pod or node costs the 60 s lease first). An API server
   outage longer than `RENEW_DEADLINE` makes the leader step down.
-- **Agents.** `hub_handover` is accepted by agents built from this change on; an
-  older agent refuses the notice with 400 (counted as `failed`) and finds out by
-  itself, as before.
+- **Agents.** `hub_handover` is accepted by agents built from this change on. An
+  older agent (the one pinned on staging before the re-pin) refuses it with 400;
+  the hub then sends a second notice with reason `device_unknown`, which that
+  agent accepts and which only ends the session (counted as `delivered_legacy`).
+  The agent takes its normal back-off, 1 to 2 s after a stable session, so the
+  devices are back within seconds either way. If the second notice fails too the
+  notice counts as `failed` and the agent finds out through the dead-tunnel limit.
 
 Metrics: `wghub_leader` (1 on the serving replica, also 1 without election),
 `wghub_handover_total{result}` (`successor`, `no_successor`, `not_leader`),
-`wghub_handover_notices_total{result}` (`delivered`, `failed`, `skipped`) and
-`wghub_role_patch_errors_total`. RBAC: `pods` get/patch, and `leases` create plus
+`wghub_handover_notices_total{result}` (`delivered`, `delivered_legacy`, `failed`, `skipped`) and
+`wghub_role_patch_errors_total`. RBAC: `pods` patch, and `leases` create plus
 get/update on the named Lease, in `HUB_NAMESPACE`.
 
 `wg-hub flags-watcher` takes `HUB_NAMESPACE`, `LOG_LEVEL` and `METRICS_ADDR`

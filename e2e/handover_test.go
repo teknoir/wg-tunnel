@@ -109,3 +109,45 @@ type recorder struct {
 func (r *recorder) Header() http.Header         { return r.header }
 func (r *recorder) Write(p []byte) (int, error) { return len(p), nil }
 func (r *recorder) WriteHeader(c int)           { r.code = c }
+
+// An agent built before hub_handover existed (the one pinned on staging)
+// answers that notice with 400. The hub then sends a notice with a reason that
+// agent knows, and the agent still moves to the new hub within seconds although
+// its renewals and its dead-tunnel limit are a minute away.
+func TestHandoverBringsAnAgentBuiltBeforeHubHandoverBackOnTheNewHub(t *testing.T) {
+	t.Parallel()
+	r := e2erig.New(t, e2erig.Options{
+		RenewAfter:   time.Minute,
+		DeadAfter:    time.Minute,
+		AgentBackoff: agent.Backoff{Min: time.Second, Max: 4 * time.Second, Stable: time.Minute},
+		Agent:        func(c *agent.Config) { c.RefuseHandoverNotice = true },
+	})
+	r.StartAgent()
+	r.WaitDeviceUp(1)
+
+	a := r.ReplaceHub(nil)
+	newHub := r.Hub
+	t0 := time.Now()
+	if err := a.Handover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if t.Failed() {
+			t.Logf("agent log:\n%s\nhub log:\n%s", r.AgentLogs.String(), r.HubLogs.String())
+		}
+	}()
+	e2erig.Eventually(t, 5*time.Second, "the old agent to be on the new hub", func() bool {
+		d, _ := newHub.SessionCounts()
+		return d == 1 && r.AgentLogs.Count(`"msg":"exposing port"`) >= 2
+	})
+	t.Logf("the agent was on hub B %v after the handover began", time.Since(t0).Round(time.Millisecond))
+	if n := r.AgentLogs.Count("the hub is ending this session"); n != 1 {
+		t.Fatalf("%d notices logged by the agent, want 1", n)
+	}
+	if n := r.AgentLogs.Count(`"reason":"device_unknown"`); n == 0 {
+		t.Fatal("the agent did not see the fallback reason")
+	}
+	if err := e2erig.EchoVia(r.MustClient(e2erig.AliceEmail), "after the handover", 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}

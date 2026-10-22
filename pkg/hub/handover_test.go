@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -104,5 +105,73 @@ func TestHandoverNoticesAreCounted(t *testing.T) {
 	}
 	if got := counterValue(t, w.h.met.handoverNotices, "delivered"); got != 0 {
 		t.Fatalf("delivered notices = %v, want 0", got)
+	}
+}
+
+// legacyAgent is an agent built before hub_handover existed: it answers that
+// reason with 400, as the wg-agent pinned on staging does.
+func legacyAgent() *svcAgent {
+	return &svcAgent{revokeRefuse: map[string]bool{api.ReasonHubHandover: true}}
+}
+
+// TestHandoverFallsBackForAnAgentThatRefusesHubHandover: the agent answers 400
+// to hub_handover, so the hub sends a second notice with a reason the agent
+// accepts, before the peer is removed, and counts it as delivered_legacy.
+func TestHandoverFallsBackForAnAgentThatRefusesHubHandover(t *testing.T) {
+	agent := legacyAgent()
+	w, rec := noticeRig(t, capsFull, agent, 20*time.Millisecond)
+	w.h.SetLeading(false)
+	if err := w.h.Handover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := agent.revokes()
+	if len(got) != 2 || got[0].Reason != api.ReasonHubHandover || got[1].Reason != handoverFallbackReason {
+		t.Fatalf("notices = %+v, want hub_handover then %q", got, handoverFallbackReason)
+	}
+	for _, n := range got {
+		if n.SessionID != w.devSess.SessionID {
+			t.Fatalf("notice for session %q, want %q", n.SessionID, w.devSess.SessionID)
+		}
+	}
+	removed, ok := rec.firstRemoval()
+	if !ok || !got[1].at.Before(removed) {
+		t.Fatalf("the peer was removed (%v, %v) before the fallback notice (%v)", removed, ok, got[1].at)
+	}
+	if v := counterValue(t, w.h.met.handoverNotices, "delivered_legacy"); v != 1 {
+		t.Fatalf("delivered_legacy = %v, want 1", v)
+	}
+	if v := counterValue(t, w.h.met.handoverNotices, "failed") + counterValue(t, w.h.met.handoverNotices, "delivered"); v != 0 {
+		t.Fatalf("failed+delivered = %v, want 0", v)
+	}
+}
+
+// TestHandoverFallbackThatFailsIsCounted: an agent that refuses both reasons
+// counts as failed, and only one fallback is tried.
+func TestHandoverFallbackThatFailsIsCounted(t *testing.T) {
+	agent := &svcAgent{revokeRefuse: map[string]bool{api.ReasonHubHandover: true, handoverFallbackReason: true}}
+	w, _ := noticeRig(t, capsFull, agent, 20*time.Millisecond)
+	if err := w.h.Handover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(agent.revokes()); n != 2 {
+		t.Fatalf("%d notices, want 2", n)
+	}
+	if v := counterValue(t, w.h.met.handoverNotices, "failed"); v != 1 {
+		t.Fatalf("failed = %v, want 1", v)
+	}
+}
+
+// TestHandoverNoFallbackForOtherFailures: a 500 or 409 is not a legacy agent;
+// no second notice goes out.
+func TestHandoverNoFallbackForOtherFailures(t *testing.T) {
+	for _, st := range []int{http.StatusInternalServerError, http.StatusConflict} {
+		agent := &svcAgent{revokeStatus: st}
+		w, _ := noticeRig(t, capsFull, agent, 20*time.Millisecond)
+		if err := w.h.Handover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(agent.revokes()); n != 1 {
+			t.Fatalf("status %d: %d notices, want 1", st, n)
+		}
 	}
 }

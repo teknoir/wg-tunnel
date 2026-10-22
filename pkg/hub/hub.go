@@ -335,6 +335,15 @@ func (h *Hub) Leading() bool { return h.leading.Load() }
 // standbyDenial is the answer of a standby replica.
 func standbyDenial() *denial { return denyUnavailable("hub standby") }
 
+// handoverFallbackReason is the reason of the second notice to an agent that
+// refused hub_handover with 400 because it was built before that reason
+// existed (its set of reasons is reenroll, device_revoked, device_disabled,
+// device_unknown and pending_approval). It must end the session without
+// side effects: reenroll would rotate the identity and the others would log a
+// misleading hint. The agent takes its normal back-off after it (1-2 s after
+// a stable session) and then connects to the new leader.
+const handoverFallbackReason = api.ReasonDeviceUnknown
+
 // handoverConcurrency bounds the revoke notices of Handover that are in flight.
 const handoverConcurrency = 32
 
@@ -343,8 +352,11 @@ const handoverConcurrency = 32
 // (api.ReasonHubHandover), so the agent connects again at once instead of when
 // a renewal fails 80 seconds later, and then closes the hub (streams first,
 // peers after the flush grace). Notices go out at most 32 at a time, one second
-// each, best effort; when ctx ends the remaining sessions get none. Call it
-// after SetLeading(false) and after the new leader is reachable.
+// each, best effort; when ctx ends the remaining sessions get none. An agent
+// that refuses hub_handover with 400 (built before it existed) gets a second
+// notice with handoverFallbackReason, which every agent with a control
+// listener accepts. Call it after SetLeading(false) and after the new leader is
+// reachable.
 func (h *Hub) Handover(ctx context.Context) error {
 	h.mu.Lock()
 	var devs []*session
@@ -373,7 +385,20 @@ loop:
 			nctx, cancel := context.WithTimeout(ctx, revokeNoticeTimeout)
 			defer cancel()
 			n := api.RevokeNotice{Reason: api.ReasonHubHandover, SessionID: s.id, Detail: "the hub hands over to another replica"}
-			if err := h.postRevoke(nctx, s, n); err != nil {
+			err := h.postRevoke(nctx, s, n)
+			var refused *agentStatusError
+			if errors.As(err, &refused) && refused.status == http.StatusBadRequest {
+				// An agent that does not know hub_handover: end its session
+				// with a reason it does know.
+				fctx, fcancel := context.WithTimeout(ctx, revokeNoticeTimeout)
+				defer fcancel()
+				n.Reason = handoverFallbackReason
+				if err = h.postRevoke(fctx, s, n); err == nil {
+					h.met.handoverNotices.WithLabelValues("delivered_legacy").Inc()
+					return
+				}
+			}
+			if err != nil {
 				h.met.handoverNotices.WithLabelValues("failed").Inc()
 				h.log.Debug("handover notice not delivered", "ns", s.ns, "device", s.device, "session", s.id, "err", err)
 				return

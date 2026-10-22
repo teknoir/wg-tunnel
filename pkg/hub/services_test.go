@@ -165,6 +165,9 @@ type svcAgent struct {
 	notices      []revokeRec
 	revokeStatus int
 	revokeHang   time.Duration
+	// revokeRefuse lists notice reasons answered 400 (an agent built before
+	// the reason existed).
+	revokeRefuse map[string]bool
 }
 
 // revokeRec is one RevokeNotice as the agent saw it.
@@ -295,6 +298,9 @@ func (a *svcAgent) handleControl(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.notices = append(a.notices, revokeRec{RevokeNotice: n, at: time.Now()})
 		status, hang := a.revokeStatus, a.revokeHang
+		if a.revokeRefuse[n.Reason] {
+			status, hang = http.StatusBadRequest, 0
+		}
 		a.mu.Unlock()
 		if hang > 0 {
 			select {
