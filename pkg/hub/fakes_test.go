@@ -246,6 +246,10 @@ type fakeUsers struct {
 	tokens map[string]UserIdentity
 	err    error
 	n      int
+	// legacy tokens carry no hub audience: refused with ErrMissingAudience
+	// while enforce is set, accepted (flagged LegacyAudience) otherwise.
+	legacy  map[string]bool
+	enforce bool
 }
 
 func newFakeUsers() *fakeUsers { return &fakeUsers{tokens: map[string]UserIdentity{}} }
@@ -260,7 +264,24 @@ func (u *fakeUsers) Authenticate(_ context.Context, token string) (UserIdentity,
 	if !ok {
 		return UserIdentity{}, fmt.Errorf("%w: unknown token", ErrUnauthenticated)
 	}
+	if u.legacy[token] {
+		if u.enforce {
+			return UserIdentity{}, ErrMissingAudience
+		}
+		id.LegacyAudience = true
+	}
 	return id, nil
+}
+
+// setLegacy marks token as lacking the hub audience; enforce selects the mode.
+func (u *fakeUsers) setLegacy(token string, enforce bool) {
+	u.mu.Lock()
+	if u.legacy == nil {
+		u.legacy = map[string]bool{}
+	}
+	u.legacy[token] = true
+	u.enforce = enforce
+	u.mu.Unlock()
 }
 
 // set registers (or re-issues) a token. Every call gives the token a new id and

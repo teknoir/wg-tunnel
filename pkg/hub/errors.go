@@ -2,9 +2,11 @@ package hub
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/mail"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/teknoir/wg-tunnel/pkg/api"
@@ -34,6 +36,48 @@ var reasonStatus = map[string]int{
 	api.ReasonSessionMaxAge:   http.StatusForbidden,
 	api.ReasonBadRequest:      http.StatusBadRequest,
 	api.ReasonInternal:        http.StatusInternalServerError,
+}
+
+// ErrMissingAudience is returned by the Keycloak verifier in enforce mode for a
+// token that lacks the hub audience. It wraps ErrUnauthenticated.
+var ErrMissingAudience = fmt.Errorf("%w: token lacks the hub audience", ErrUnauthenticated)
+
+// tnctlBelow reports whether p is a tnctl whose version parses (optional "v"
+// prefix and "-pre"/"+build" suffix ignored) and is below min (a "x.y.z" string).
+func tnctlBelow(p api.Posture, min string) bool {
+	if p.Software != "tnctl" {
+		return false
+	}
+	v, ok := parseVersion(p.Version)
+	m, ok2 := parseVersion(min)
+	if !ok || !ok2 {
+		return false
+	}
+	for i := range v {
+		if v[i] != m[i] {
+			return v[i] < m[i]
+		}
+	}
+	return false
+}
+
+func parseVersion(s string) (v [3]int, ok bool) {
+	s = strings.TrimPrefix(s, "v")
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return v, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 || len(p) > 6 {
+			return v, false
+		}
+		v[i] = n
+	}
+	return v, true
 }
 
 // denial is an error that carries the API reason and HTTP status.

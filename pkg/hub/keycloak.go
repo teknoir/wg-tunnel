@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/teknoir/wg-tunnel/pkg/api"
 )
 
 const (
@@ -33,7 +35,13 @@ type KeycloakConfig struct {
 	JWKSURL string
 	// AllowedAZP lists the accepted authorized parties (default: api.KeycloakAllowedAZP).
 	AllowedAZP []string
-	HTTPClient *http.Client
+	// Audience is the aud a token must carry (default: api.KeycloakZTNAAudience).
+	Audience string
+	// AudienceMode is api.AudienceModeEnforce (default: a token without the
+	// audience is refused) or api.AudienceModeTransition (accepted, flagged
+	// UserIdentity.LegacyAudience). Anything else is a constructor error.
+	AudienceMode string
+	HTTPClient   *http.Client
 	// CacheTTL is how long a fetched key set is trusted (default 10m).
 	CacheTTL time.Duration
 	// MinRefresh is the minimum time between fetches triggered by an unknown
@@ -80,6 +88,17 @@ func NewKeycloakVerifier(cfg KeycloakConfig) (*KeycloakVerifier, error) {
 	if len(cfg.AllowedAZP) == 0 {
 		cfg.AllowedAZP = []string{"teknoir-cli"}
 	}
+	if cfg.Audience == "" {
+		cfg.Audience = api.KeycloakZTNAAudience
+	}
+	switch cfg.AudienceMode {
+	case "":
+		cfg.AudienceMode = api.AudienceModeEnforce
+	case api.AudienceModeEnforce, api.AudienceModeTransition:
+	default:
+		return nil, fmt.Errorf("hub: audience mode must be %s or %s, got %q",
+			api.AudienceModeTransition, api.AudienceModeEnforce, cfg.AudienceMode)
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 5 * time.Second}
 	}
@@ -99,7 +118,7 @@ func NewKeycloakVerifier(cfg KeycloakConfig) (*KeycloakVerifier, error) {
 }
 
 // Authenticate verifies an access token: RS256 only, signature by a key of the
-// realm JWKS, iss, azp, exp/nbf (30s skew), a lowercase email, email_verified.
+// realm JWKS, iss, azp, aud (see KeycloakConfig.AudienceMode), exp/nbf (30s skew), a lowercase email, email_verified.
 func (v *KeycloakVerifier) Authenticate(ctx context.Context, token string) (UserIdentity, error) {
 	if token == "" || len(token) > maxBearerTokenSize {
 		return UserIdentity{}, fmt.Errorf("%w: bad token length", ErrUnauthenticated)
@@ -133,6 +152,13 @@ func (v *KeycloakVerifier) Authenticate(ctx context.Context, token string) (User
 	if azp, _ := claims["azp"].(string); azp == "" || !slices.Contains(v.cfg.AllowedAZP, azp) {
 		return bad("authorized party")
 	}
+	legacy := false
+	if aud, err := claims.GetAudience(); err != nil || !slices.Contains(aud, v.cfg.Audience) {
+		if v.cfg.AudienceMode == api.AudienceModeEnforce {
+			return UserIdentity{}, ErrMissingAudience
+		}
+		legacy = true
+	}
 	if ev, ok := claims["email_verified"].(bool); !ok || !ev {
 		return bad("email not verified")
 	}
@@ -144,7 +170,7 @@ func (v *KeycloakVerifier) Authenticate(ctx context.Context, token string) (User
 	if err != nil || exp == nil {
 		return bad("exp")
 	}
-	id := UserIdentity{Email: email, ExpiresAt: exp.Time}
+	id := UserIdentity{Email: email, ExpiresAt: exp.Time, LegacyAudience: legacy}
 	id.TokenID, _ = claims["jti"].(string)
 	if iat, err := claims.GetIssuedAt(); err == nil && iat != nil {
 		id.IssuedAt = iat.Time

@@ -40,7 +40,7 @@ const (
 const (
 	DeviceEnrollPath  = "/v1/device/enroll"  // POST, Bearer <device RSA JWT (enrollment)>, EnrollRequest
 	DeviceSessionPath = "/v1/device/session" // POST, Bearer <device identity JWT (EdDSA)>, DeviceSessionRequest
-	ClientSessionPath = "/v1/client/session" // POST, Bearer <Keycloak token (azp teknoir-cli)> or <SA token + OnBehalfOf>, ClientSessionRequest
+	ClientSessionPath = "/v1/client/session" // POST, Bearer <Keycloak token (azp teknoir-cli, aud teknoir-ztna)> or <SA token + OnBehalfOf>, ClientSessionRequest
 	RenewPath         = "/v1/renew"          // POST in-tunnel, same Bearer kind as the session, RenewRequest
 	CloseSessionPath  = "/v1/close"          // POST in-tunnel, empty body; ends the session
 	HealthzPath       = "/healthz"
@@ -543,6 +543,24 @@ const (
 	// browser tokens (azp "teknoir") are forwarded to every upstream behind
 	// oauth2-proxy and must never be accepted.
 	KeycloakAllowedAZP = "teknoir-cli"
+
+	// KeycloakZTNAAudience is the audience (aud) a Keycloak token must carry to
+	// open or renew a session. tnctl asks for it with KeycloakZTNAScope only for
+	// hub calls, so the token it sends to Backstage and the fleet API (the main
+	// token) cannot open sessions. The string equals SATokenAudience; the two
+	// are never confused: Keycloak tokens are verified only against the realm
+	// JWKS and service account tokens only by TokenReview.
+	KeycloakZTNAAudience = "teknoir-ztna"
+	// KeycloakZTNAScope is the optional Keycloak client scope whose audience
+	// mapper adds KeycloakZTNAAudience.
+	KeycloakZTNAScope = "teknoir-ztna"
+	// AudienceModeTransition accepts a Keycloak token without the audience
+	// (counted as legacy); AudienceModeEnforce refuses it.
+	AudienceModeTransition = "transition"
+	AudienceModeEnforce    = "enforce"
+	// MinTnctlAudienceVersion is the first tnctl that sends a hub token with
+	// the audience; an older tnctl refused for a missing audience is told to update.
+	MinTnctlAudienceVersion = "0.1.2"
 
 	// Delegating service accounts (the per-device WG web terminal) live in
 	// HubNamespace and carry these annotations; the hub verifies the SA token

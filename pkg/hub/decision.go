@@ -20,8 +20,26 @@ type dctx struct {
 	remote  string
 	// service is the service id of a client request or connection (phase 2).
 	service string
+	// tokenAudience is audienceZTNA or audienceLegacy for decisions that
+	// verified a Keycloak token, empty otherwise.
+	tokenAudience string
 	// internal is true for requests served on api.HubInternalPort.
 	internal bool
+}
+
+const (
+	audienceZTNA   = "ztna"
+	audienceLegacy = "legacy"
+)
+
+// noteUserToken records whether a Keycloak token carried the hub audience, in
+// the decision log and the wghub_user_tokens_total metric.
+func (h *Hub) noteUserToken(d *dctx, op string, legacy bool) {
+	d.tokenAudience = audienceZTNA
+	if legacy {
+		d.tokenAudience = audienceLegacy
+	}
+	h.met.userTokens.WithLabelValues(op, d.tokenAudience).Inc()
 }
 
 // log writes the single decision line of a request and counts it.
@@ -44,6 +62,9 @@ func (h *Hub) logDecision(d *dctx, decision, reason, detail string) {
 	}
 	if d.service != "" {
 		attrs = append(attrs, slog.String("service", d.service))
+	}
+	if d.tokenAudience != "" {
+		attrs = append(attrs, slog.String("token_audience", d.tokenAudience))
 	}
 	if detail != "" {
 		attrs = append(attrs, slog.String("detail", detail))

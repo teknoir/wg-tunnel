@@ -118,6 +118,8 @@ func run() error {
 		return errors.New("KEYCLOAK_ISSUER or DOMAIN is required")
 	}
 	azp := hub.SplitList(env("ALLOWED_AZP", api.KeycloakAllowedAZP))
+	audience := env("KEYCLOAK_AUDIENCE", api.KeycloakZTNAAudience)
+	audienceMode := env("KEYCLOAK_AUDIENCE_MODE", api.AudienceModeEnforce)
 
 	orgMode, err := hub.ParseOrgGateMode(env("ORG_GATE_MODE", ""))
 	if err != nil {
@@ -157,7 +159,8 @@ func run() error {
 	flags.Start(runCtx)
 	org.Start(runCtx)
 
-	users, err := hub.NewKeycloakVerifier(hub.KeycloakConfig{Issuer: issuer, JWKSURL: jwks, AllowedAZP: azp})
+	users, err := hub.NewKeycloakVerifier(hub.KeycloakConfig{Issuer: issuer, JWKSURL: jwks, AllowedAZP: azp,
+		Audience: audience, AudienceMode: audienceMode})
 	if err != nil {
 		return err
 	}

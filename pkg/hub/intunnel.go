@@ -150,8 +150,12 @@ func (h *Hub) handleRenew(ctx context.Context, r *http.Request, body []byte, s *
 	case authKeycloak:
 		u, err := h.deps.Users.Authenticate(ctx, tok)
 		if err != nil {
+			if errors.Is(err, ErrMissingAudience) {
+				h.noteUserToken(d, "renew", true)
+			}
 			return 0, nil, asDenial(err)
 		}
+		h.noteUserToken(d, "renew", u.LegacyAudience)
 		if u.Email != s.subject {
 			return 0, nil, deny(api.ReasonUnauthenticated, "credential does not belong to this session")
 		}
