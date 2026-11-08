@@ -331,13 +331,18 @@ func (f *fakeSA) add(token, name, ns, device string) {
 }
 
 type fakeAuthz struct {
-	mu      sync.Mutex
-	allowed map[string]bool // email|ns
-	err     error
-	calls   int
+	mu         sync.Mutex
+	allowed    map[string]bool // email|ns, CanExec
+	admins     map[string]bool // email|ns, CanAdmin
+	err        error           // CanExec error
+	adminErr   error           // CanAdmin error
+	calls      int             // CanExec calls
+	adminCalls int             // CanAdmin calls
 }
 
-func newFakeAuthz() *fakeAuthz { return &fakeAuthz{allowed: map[string]bool{}} }
+func newFakeAuthz() *fakeAuthz {
+	return &fakeAuthz{allowed: map[string]bool{}, admins: map[string]bool{}}
+}
 
 func (a *fakeAuthz) CanExec(_ context.Context, email, ns string) (bool, error) {
 	a.mu.Lock()
@@ -349,10 +354,33 @@ func (a *fakeAuthz) CanExec(_ context.Context, email, ns string) (bool, error) {
 	return a.allowed[email+"|"+ns], nil
 }
 
+// CanAdmin answers the teamspace-admin check; false unless setAdmin was called.
+func (a *fakeAuthz) CanAdmin(_ context.Context, email, ns string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.adminCalls++
+	if a.adminErr != nil {
+		return false, a.adminErr
+	}
+	return a.admins[email+"|"+ns], nil
+}
+
 func (a *fakeAuthz) set(email, ns string, ok bool) {
 	a.mu.Lock()
 	a.allowed[email+"|"+ns] = ok
 	a.mu.Unlock()
+}
+
+func (a *fakeAuthz) setAdmin(email, ns string, ok bool) {
+	a.mu.Lock()
+	a.admins[email+"|"+ns] = ok
+	a.mu.Unlock()
+}
+
+func (a *fakeAuthz) adminCallsMade() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.adminCalls
 }
 
 // ---- tunnel ----

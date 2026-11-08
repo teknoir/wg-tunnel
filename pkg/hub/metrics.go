@@ -18,6 +18,7 @@ type metrics struct {
 	connsTotal  prometheus.Counter
 	bytes       *prometheus.CounterVec
 	orgGate     *prometheus.CounterVec
+	botCover    *prometheus.CounterVec
 
 	leader          prometheus.Gauge
 	handovers       *prometheus.CounterVec
@@ -53,6 +54,9 @@ func newMetrics() *metrics {
 		orgGate: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wghub_org_gate_total", Help: "Org gate decisions by mode, decision (allow, deny, would_deny) and reason.",
 		}, []string{"mode", "decision", "reason"}),
+		botCover: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wghub_bot_cover_total", Help: "TeknoirBot cover rule decisions by decision (creator, admin, deny, unknown).",
+		}, []string{"decision"}),
 		leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "wghub_leader", Help: "1 while this replica serves (it holds the lease, or leader election is off), 0 on a hot standby.",
 		}),
@@ -70,10 +74,13 @@ func newMetrics() *metrics {
 		}, []string{"op", "audience"}),
 	}
 	m.reg.MustRegister(m.sessions, m.creates, m.decisions, m.revocations, m.conns, m.connsTotal, m.bytes, m.orgGate,
-		m.leader, m.handovers, m.handoverNotices, m.rolePatchErrors, m.userTokens)
+		m.botCover, m.leader, m.handovers, m.handoverNotices, m.rolePatchErrors, m.userTokens)
 	// Make zero series visible.
 	m.sessions.WithLabelValues("device").Set(0)
 	m.sessions.WithLabelValues("client").Set(0)
+	for _, d := range []string{"creator", "admin", "deny", "unknown"} {
+		m.botCover.WithLabelValues(d)
+	}
 	for _, r := range []string{"delivered", "delivered_legacy", "failed", "skipped"} {
 		m.handoverNotices.WithLabelValues(r)
 	}

@@ -44,7 +44,8 @@ implementations (ConfigMap informers for policy and flags, identity ConfigMaps
 with optimistic concurrency, TokenReview, SubjectAccessReview, TURN secret).
 The hub needs no access to Device objects: `wg-hub flags-watcher` (a separate
 Deployment with its own ServiceAccount and no ingress) is the only component
-that reads them, metadata only, and mirrors the three switches into
+that reads them, metadata only, and mirrors the three switches, the org
+placement and the TeknoirBot fields into
 `ztna-flags-<teamspace>.<device>` ConfigMaps (written only on change; deleted
 when the Device is gone). A missing flags entry means "not enabled".
 
@@ -140,6 +141,25 @@ gone, relay lost), `pkg/wgclient` ends the session with `ErrTunnelDead` when a
 renewal fails at the transport level and nothing arrived through WireGuard for
 more than `DeadAfter` (twice the persistent keepalive, at least one renewal cycle
 plus its retry) since the last packet or the last successful renewal.
+
+### TeknoirBot cover rule
+
+A TeknoirBot (`tb-<bot>`, a virtual Device whose agent acts with its creator's
+platform rights) may be opened by its creator only, because opening it borrows
+those rights. The flags watcher mirrors its Device label `teknoir.org/teknoirbot`
+(when the name is `tb-` + the label) and the annotations
+`teknoir.org/teknoirbot-created-by` and `teknoir.org/teknoirbot-access` into the
+flags entry as `botKnown`, `bot`, `botCreator` and `botAccess`. With access
+`read` or `none` a teamspace admin (SubjectAccessReview `create rolebindings` in
+`rbac.authorization.k8s.io`, the portal's admin test) may open it too; with
+`creator` (or an unknown value) only the creator may. A `tb-` device whose entry
+has no bot fields (an older watcher), or whose label is missing or does not match
+its name, is refused (fail closed). The rule runs
+after the per-teamspace SubjectAccessReview and in every `ORG_GATE_MODE`. The
+creator never waits on the admin review. Metric:
+`wghub_bot_cover_total{decision}` (`creator`, `admin`, `deny`, `unknown`). A
+change of the bot fields takes effect at the next renewal, connection or gateway
+re-check (within about 60 s); it does not end open sessions at once.
 
 ### Leader election and handover
 
