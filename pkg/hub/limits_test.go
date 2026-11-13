@@ -102,14 +102,22 @@ func TestReplayCacheIsPartitionedPerSubject(t *testing.T) {
 }
 
 type countingAuthz struct {
-	allow bool
-	err   error
-	calls int
+	allow      bool
+	admin      bool
+	err        error
+	adminErr   error
+	calls      int
+	adminCalls int
 }
 
 func (c *countingAuthz) CanExec(context.Context, string, string) (bool, error) {
 	c.calls++
 	return c.allow, c.err
+}
+
+func (c *countingAuthz) CanAdmin(context.Context, string, string) (bool, error) {
+	c.adminCalls++
+	return c.admin, c.adminErr
 }
 
 func TestCachedAuthorizer(t *testing.T) {

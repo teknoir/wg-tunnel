@@ -353,6 +353,18 @@ type FlagsEntry struct {
 	// teknoir.org/org-tree-path and teknoir.org/org-tree-node-id.
 	OrgPath   string `json:"orgPath,omitempty"`
 	OrgNodeID string `json:"orgNodeId,omitempty"`
+	// BotKnown is true when the watcher wrote the bot fields below (even for a
+	// Device that is no bot). An entry without it (an older watcher) is unknown
+	// and the bot cover rule fails closed for a tb- device.
+	BotKnown bool `json:"botKnown,omitempty"`
+	// Bot is the Device label teknoir.org/teknoirbot, set only when the Device
+	// name is exactly BotDevicePrefix + label (and the label is not empty).
+	Bot string `json:"bot,omitempty"`
+	// BotCreator and BotAccess are the raw Device annotations
+	// teknoir.org/teknoirbot-created-by and teknoir.org/teknoirbot-access, set
+	// only when Bot is set.
+	BotCreator string `json:"botCreator,omitempty"`
+	BotAccess  string `json:"botAccess,omitempty"`
 }
 
 // Org-tree annotations of Devices and Users, read by the flags watcher.
@@ -361,6 +373,22 @@ const (
 	AnnotationOrgNodeID     = "teknoir.org/org-tree-node-id"
 	AnnotationOrgMemberPref = "teknoir.org/org-tree-member-" // + <teamspace>
 	AnnotationOrgUnitsPref  = "teknoir.org/org-tree-units-"  // + <teamspace>
+)
+
+// A TeknoirBot is a virtual Device named BotDevicePrefix + <bot>, created by
+// teknoirbot-controller with the label LabelTeknoirBot and the two
+// annotations below (the creator's email and the access level). Its agent acts
+// with its creator's platform rights, so opening it borrows them: the hub
+// applies the bot cover rule (only the creator, plus teamspace admins for
+// BotAccessRead and BotAccessNone).
+const (
+	LabelTeknoirBot        = "teknoir.org/teknoirbot"            // = <bot>
+	AnnotationBotCreatedBy = "teknoir.org/teknoirbot-created-by" // the creator's email
+	AnnotationBotAccess    = "teknoir.org/teknoirbot-access"     // BotAccess*
+	BotDevicePrefix        = "tb-"
+	BotAccessNone          = "none"    // only the creator
+	BotAccessRead          = "read"    // the creator or a teamspace admin
+	BotAccessCreator       = "creator" // only the creator
 )
 
 // Org documents: one ConfigMap per teamspace, written by the flags watcher

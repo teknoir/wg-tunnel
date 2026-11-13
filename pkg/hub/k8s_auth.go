@@ -91,8 +91,9 @@ func (d *K8sSADelegation) VerifyDelegate(ctx context.Context, token, ns, device 
 	return SAIdentity{Name: name}, nil
 }
 
-// K8sAuthorizer implements Authorizer with a SubjectAccessReview for
-// "create pods/exec" in the teamspace. Wrap it in NewCachedAuthorizer.
+// K8sAuthorizer implements Authorizer with SubjectAccessReviews for
+// "create pods/exec" (CanExec) and "create rolebindings" (CanAdmin, the
+// teamspace-admin test) in the teamspace. Wrap it in NewCachedAuthorizer.
 type K8sAuthorizer struct{ cs kubernetes.Interface }
 
 var _ Authorizer = (*K8sAuthorizer)(nil)
@@ -102,6 +103,16 @@ func NewK8sAuthorizer(cs kubernetes.Interface) *K8sAuthorizer { return &K8sAutho
 
 // CanExec implements Authorizer.
 func (a *K8sAuthorizer) CanExec(ctx context.Context, email, ns string) (bool, error) {
+	return a.can(ctx, email, ns, "", "pods", "exec")
+}
+
+// CanAdmin implements Authorizer: may create RoleBindings in the teamspace, the
+// platform's teamspace-admin test.
+func (a *K8sAuthorizer) CanAdmin(ctx context.Context, email, ns string) (bool, error) {
+	return a.can(ctx, email, ns, "rbac.authorization.k8s.io", "rolebindings", "")
+}
+
+func (a *K8sAuthorizer) can(ctx context.Context, email, ns, group, resource, subresource string) (bool, error) {
 	if !ValidEmail(email) || !validLabel(ns) {
 		return false, nil
 	}
@@ -109,7 +120,7 @@ func (a *K8sAuthorizer) CanExec(ctx context.Context, email, ns string) (bool, er
 		Spec: authzv1.SubjectAccessReviewSpec{
 			User: email,
 			ResourceAttributes: &authzv1.ResourceAttributes{
-				Namespace: ns, Verb: "create", Resource: "pods", Subresource: "exec",
+				Namespace: ns, Verb: "create", Group: group, Resource: resource, Subresource: subresource,
 			},
 		},
 	}, metav1.CreateOptions{})

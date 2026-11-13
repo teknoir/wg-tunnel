@@ -141,7 +141,8 @@ func NewFlagsWatcher(cs kubernetes.Interface, mc metadata.Interface, dc dynamic.
 		UpdateFunc: func(oldObj, newObj any) {
 			o, _ := oldObj.(*metav1.PartialObjectMetadata)
 			n, _ := newObj.(*metav1.PartialObjectMetadata)
-			if o != nil && n != nil && sameZtnaAnnotations(o.Annotations, n.Annotations) && sameOrgAnnotations(o.Annotations, n.Annotations) {
+			if o != nil && n != nil && sameZtnaAnnotations(o.Annotations, n.Annotations) &&
+				sameOrgAnnotations(o.Annotations, n.Annotations) && sameBotFields(o, n) {
 				return
 			}
 			w.enqueueDevice(newObj)
@@ -219,6 +220,23 @@ func sameOrgAnnotations(a, b map[string]string) bool {
 	return sameAnnotationMaps(orgAnnotations(a), orgAnnotations(b))
 }
 
+// botFields projects what the bot cover rule reads from Device metadata: the
+// label teknoir.org/teknoirbot and the two bot annotations.
+func botFields(labels, annotations map[string]string) map[string]string {
+	return map[string]string{
+		api.LabelTeknoirBot:        labels[api.LabelTeknoirBot],
+		api.AnnotationBotCreatedBy: annotations[api.AnnotationBotCreatedBy],
+		api.AnnotationBotAccess:    annotations[api.AnnotationBotAccess],
+	}
+}
+
+func sameBotFields(a, b *metav1.PartialObjectMetadata) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameAnnotationMaps(botFields(a.Labels, a.Annotations), botFields(b.Labels, b.Annotations))
+}
+
 func (w *FlagsWatcher) enqueueOrgConfigMap(o any) {
 	if t, ok := o.(cache.DeletedFinalStateUnknown); ok {
 		o = t.Obj
@@ -255,7 +273,7 @@ func (w *FlagsWatcher) enqueueConfigMap(o any) {
 
 // desiredEntry is what the flags ConfigMap of a Device should say.
 func desiredEntry(m *metav1.PartialObjectMetadata, now time.Time) api.FlagsEntry {
-	return api.FlagsEntry{
+	e := api.FlagsEntry{
 		Device: m.Name, Namespace: m.Namespace, Exists: true,
 		WireGuard:         m.Annotations[api.AnnotationWireGuard] == "enabled",
 		Compromised:       api.FlagSet(m.Annotations[api.AnnotationCompromised]),
@@ -264,7 +282,14 @@ func desiredEntry(m *metav1.PartialObjectMetadata, now time.Time) api.FlagsEntry
 		OrgKnown:          true,
 		OrgPath:           m.Annotations[api.AnnotationOrgPath],
 		OrgNodeID:         m.Annotations[api.AnnotationOrgNodeID],
+		BotKnown:          true,
 	}
+	if bot := m.Labels[api.LabelTeknoirBot]; bot != "" && m.Name == api.BotDevicePrefix+bot {
+		e.Bot = bot
+		e.BotCreator = m.Annotations[api.AnnotationBotCreatedBy]
+		e.BotAccess = m.Annotations[api.AnnotationBotAccess]
+	}
+	return e
 }
 
 // Ready reports whether both informers are synced.

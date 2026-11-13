@@ -115,9 +115,12 @@ type DelegateVerifier interface {
 }
 
 // Authorizer answers whether a user may open an exec-class session in a
-// teamspace (SubjectAccessReview create pods/exec).
+// teamspace (SubjectAccessReview create pods/exec) and whether the user is a
+// teamspace admin (SubjectAccessReview create rolebindings, the platform's
+// teamspace-admin test, the same SAR the portal uses).
 type Authorizer interface {
 	CanExec(ctx context.Context, email, ns string) (bool, error)
+	CanAdmin(ctx context.Context, email, ns string) (bool, error)
 }
 
 // TURNMinter mints TURN-REST credentials for a session.

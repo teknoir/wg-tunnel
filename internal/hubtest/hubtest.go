@@ -257,11 +257,12 @@ func (s *Identity) Entry(ns, device string) api.IdentityEntry {
 type Authz struct {
 	mu      sync.Mutex
 	allowed map[string]bool
+	admins  map[string]bool
 }
 
 var _ hub.Authorizer = (*Authz)(nil)
 
-func NewAuthz() *Authz { return &Authz{allowed: map[string]bool{}} }
+func NewAuthz() *Authz { return &Authz{allowed: map[string]bool{}, admins: map[string]bool{}} }
 
 func (a *Authz) CanExec(_ context.Context, email, ns string) (bool, error) {
 	a.mu.Lock()
@@ -269,10 +270,24 @@ func (a *Authz) CanExec(_ context.Context, email, ns string) (bool, error) {
 	return a.allowed[email+"|"+ns], nil
 }
 
+// CanAdmin answers the teamspace-admin check; false unless SetAdmin was called.
+func (a *Authz) CanAdmin(_ context.Context, email, ns string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.admins[email+"|"+ns], nil
+}
+
 // Set grants or revokes exec access of email in ns.
 func (a *Authz) Set(email, ns string, ok bool) {
 	a.mu.Lock()
 	a.allowed[email+"|"+ns] = ok
+	a.mu.Unlock()
+}
+
+// SetAdmin grants or revokes teamspace-admin rights of email in ns.
+func (a *Authz) SetAdmin(email, ns string, ok bool) {
+	a.mu.Lock()
+	a.admins[email+"|"+ns] = ok
 	a.mu.Unlock()
 }
 

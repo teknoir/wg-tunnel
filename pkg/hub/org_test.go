@@ -57,7 +57,8 @@ func (v orgVector) projection() UserProjection {
 
 type allowAllSAR struct{}
 
-func (allowAllSAR) CanExec(context.Context, string, string) (bool, error) { return true, nil }
+func (allowAllSAR) CanExec(context.Context, string, string) (bool, error)  { return true, nil }
+func (allowAllSAR) CanAdmin(context.Context, string, string) (bool, error) { return false, nil }
 
 // gateHub is a Hub reduced to what canOpen needs.
 func gateHub(mode string, authz Authorizer, org OrgSource, flags DeviceFlags) *Hub {
