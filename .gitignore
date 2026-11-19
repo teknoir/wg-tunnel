@@ -13,3 +13,6 @@ identity.key*
 /wg-agent
 /wg-connect
 /wg-gateway
+
+# Test logs (scripts/test under a coding agent)
+.test-logs/
