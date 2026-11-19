@@ -1,11 +1,18 @@
 GO ?= go
 
+# Under a coding agent make does not echo commands (see scripts/test).
+ifeq (,$(filter 0 false no off,$(AI_AGENT)))
+ifneq (,$(AI_AGENT)$(CLAUDECODE)$(CODEX_THREAD_ID)$(CODEX_SANDBOX))
+MAKEFLAGS += --silent
+endif
+endif
+
 .PHONY: all test vet lint tidy check docker-hub docker-agent docker-gateway docker
 
 all: check
 
 test:
-	$(GO) test -race -count=1 ./...
+	GO="$(GO)" scripts/test -race -count=1 ./...
 
 vet:
 	$(GO) vet ./...

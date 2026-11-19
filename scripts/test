@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Runs go test: scripts/test [go test flags and packages] (default: ./...).
+# Under a coding agent (AI_AGENT unless 0/false/no/off, CLAUDECODE, CODEX_THREAD_ID,
+# CODEX_SANDBOX) it writes the full output to .test-logs/ and prints only the output of
+# failing packages, a totals line, the exit code and the log path. Otherwise it is plain
+# go test.
+set -uo pipefail
+
+go=${GO:-go}
+[ $# -gt 0 ] || set -- ./...
+
+is_agent() {
+  case "${AI_AGENT:-}" in 0 | false | no | off) return 1 ;; "") ;; *) return 0 ;; esac
+  [ -n "${CLAUDECODE:-}${CODEX_THREAD_ID:-}${CODEX_SANDBOX:-}" ]
+}
+is_agent || exec "$go" test "$@"
+
+export NO_COLOR=1
+logs="$(cd "$(dirname "$0")/.." && pwd)/.test-logs"
+mkdir -p "$logs"
+log="$logs/go-test-$(date +%Y%m%d-%H%M%S)-$$.log"
+"$go" test "$@" >"$log" 2>&1
+rc=$?
+
+# Passing packages ("ok"), packages without tests and module downloads are noise here.
+shown=$(grep -vE '^(ok|\?)[[:space:]]|^[[:space:]]+[^[:space:]]+[[:space:]]+coverage: |^go: downloading ' "$log")
+if [ -n "$shown" ]; then
+  printf '%s\n' "$shown" | head -n 300
+  n=$(printf '%s\n' "$shown" | wc -l)
+  [ "$n" -le 300 ] || echo "... $((n - 300)) more lines in the log"
+fi
+echo "go test: $(grep -cE '^ok[[:space:]]' "$log") packages ok, $(grep -cE '^FAIL[[:space:]]' "$log") failed; exit $rc; full log: $log"
+ls -1t "$logs"/go-test-*.log | tail -n +21 | xargs -r rm -f --
+exit "$rc"
