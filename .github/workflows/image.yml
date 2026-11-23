@@ -1,0 +1,81 @@
+# Generated from charts/ci/files/repos/wg-tunnel.yaml on 2026-11-23 by plans/cicd/migrate/gen_callers.py
+# Edit freely afterwards; re-running the generator overwrites this file.
+name: image
+
+# Public image: ghcr.io/teknoir/<image>:sha-<8>, plus :<tag> for a v* tag on
+# main, built on a hosted runner.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  test-go-vet:
+    uses: teknoir/ci-workflows/.github/workflows/test.yml@main
+    with:
+      runs-on: ubuntu-latest
+      go-version-file: go.mod
+      command: go vet ./...
+    permissions:
+      contents: read
+  test-go-test-race:
+    uses: teknoir/ci-workflows/.github/workflows/test.yml@main
+    with:
+      runs-on: ubuntu-latest
+      go-version-file: go.mod
+      command: go test -race -count=1 -p 4 ./...
+    permissions:
+      contents: read
+  image-wg-hub:
+    needs: [test-go-vet, test-go-test-race]
+    uses: teknoir/ci-workflows/.github/workflows/image.yml@main
+    with:
+      image: wg-hub
+      target: wg-hub
+      platforms: linux/amd64,linux/arm64
+      build-args: VERSION={ref}-{sha7}
+      tag-build-args: VERSION={ref}
+      visibility: public
+      runs-on: ubuntu-latest
+      timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+  image-wg-agent:
+    needs: [test-go-vet, test-go-test-race]
+    uses: teknoir/ci-workflows/.github/workflows/image.yml@main
+    with:
+      image: wg-agent
+      target: wg-agent
+      platforms: linux/amd64,linux/arm64,linux/arm/v7
+      build-args: VERSION={ref}-{sha7}
+      tag-build-args: VERSION={ref}
+      visibility: public
+      runs-on: ubuntu-latest
+      timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+  image-wg-gateway:
+    needs: [test-go-vet, test-go-test-race]
+    uses: teknoir/ci-workflows/.github/workflows/image.yml@main
+    with:
+      image: wg-gateway
+      target: wg-gateway
+      platforms: linux/amd64,linux/arm64
+      build-args: VERSION={ref}-{sha7}
+      tag-build-args: VERSION={ref}
+      visibility: public
+      runs-on: ubuntu-latest
+      timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
