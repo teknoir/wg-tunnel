@@ -1,0 +1,33 @@
+# Generated from charts/ci/files/repos/wg-tunnel.yaml on 2026-11-23 by plans/cicd/migrate/gen_callers.py
+# Edit freely afterwards; re-running the generator overwrites this file.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  test-go-vet:
+    uses: teknoir/ci-workflows/.github/workflows/test.yml@main
+    with:
+      runs-on: ubuntu-latest
+      go-version-file: go.mod
+      command: go vet ./...
+    permissions:
+      contents: read
+  test-go-test-race:
+    uses: teknoir/ci-workflows/.github/workflows/test.yml@main
+    with:
+      runs-on: ubuntu-latest
+      go-version-file: go.mod
+      command: go test -race -count=1 -p 4 ./...
+    permissions:
+      contents: read
