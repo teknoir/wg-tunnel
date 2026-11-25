@@ -51,7 +51,9 @@ func TestVoidedIdentityIsNeverReadmittedInALaterEpoch(t *testing.T) {
 		t.Fatalf("voided identity got a session: %s", body)
 	}
 
-	// A fresh key enrolls; the history (and the conflict) is kept.
+	// A fresh key enrolls; the voided history is kept. The conflict above was
+	// counted on the pin of epoch 1 and ends with it: the count is per
+	// enrollment window (see ReplacePin).
 	r.dev.newIdentity(t)
 	etok, ereq := r.dev.enrollRequest(t, r.clock.Now())
 	if st, body = r.enroll(etok, ereq); st != http.StatusCreated {
@@ -61,8 +63,11 @@ func TestVoidedIdentityIsNeverReadmittedInALaterEpoch(t *testing.T) {
 	if got.EnrollmentEpoch != "epoch-2" || got.Voided || got.Fingerprint != r.dev.fingerprint() {
 		t.Fatalf("new pin %+v", got)
 	}
-	if !slices.Equal(got.VoidedFingerprints, []string{k1fp}) || got.Conflicts != 1 {
-		t.Fatalf("history lost: voided %v conflicts %d", got.VoidedFingerprints, got.Conflicts)
+	if !slices.Equal(got.VoidedFingerprints, []string{k1fp}) {
+		t.Fatalf("history lost: voided %v", got.VoidedFingerprints)
+	}
+	if got.Conflicts != 0 || !got.LastConflictAt.IsZero() {
+		t.Fatalf("the pin of a new epoch must start without conflicts: %d at %v", got.Conflicts, got.LastConflictAt)
 	}
 
 	// The history survives a second round: K2 voided in epoch 2, epoch 3 opens;
@@ -89,7 +94,7 @@ func TestVoidedIdentityIsNeverReadmittedInALaterEpoch(t *testing.T) {
 		t.Fatalf("K3: %d %s", st, body)
 	}
 	got = r.ids.entry(testNS, testDevice)
-	if !slices.Equal(got.VoidedFingerprints, []string{k1fp, k2.fingerprint()}) || got.Conflicts != 3 {
+	if !slices.Equal(got.VoidedFingerprints, []string{k1fp, k2.fingerprint()}) || got.Conflicts != 0 {
 		t.Fatalf("history %v conflicts %d", got.VoidedFingerprints, got.Conflicts)
 	}
 }
@@ -142,13 +147,20 @@ func TestK8sIdentityStoreKeepsVoidedHistoryAcrossEpochs(t *testing.T) {
 	if got, _, _ := s.Get(ctx, "acme", "cam-1"); got.EnrollmentEpoch != "epoch-1" || !got.Voided {
 		t.Fatalf("a refused pin must not touch the store: %+v", got)
 	}
-	// A new key replaces the pin and inherits the history and the conflicts.
+	// A new key replaces the pin and inherits the voided history, but not the
+	// conflict count of the epoch that ended.
 	cur, created, err := s.Pin(ctx, idEntryE(2, "epoch-2", "keyB"))
 	if err != nil || !created {
 		t.Fatal(created, err)
 	}
-	if cur.Voided || !slices.Equal(cur.VoidedFingerprints, []string{"SHA256:keyA"}) || cur.Conflicts != 1 || !cur.LastConflictAt.Equal(at) {
+	if cur.Voided || !slices.Equal(cur.VoidedFingerprints, []string{"SHA256:keyA"}) {
 		t.Fatalf("history not carried over: %+v", cur)
+	}
+	if cur.Conflicts != 0 || !cur.LastConflictAt.IsZero() {
+		t.Fatalf("conflicts carried over to the next epoch: %+v", cur)
+	}
+	if got, _, _ := s.Get(ctx, "acme", "cam-1"); got.Conflicts != 0 || !got.LastConflictAt.IsZero() {
+		t.Fatalf("conflicts stored for the next epoch: %+v", got)
 	}
 	// The same epoch's pin stays, whatever key asks.
 	if cur, created, _ := s.Pin(ctx, idEntryE(2, "epoch-2", "keyC")); created || cur.IdentityPublicKey != "keyB" {

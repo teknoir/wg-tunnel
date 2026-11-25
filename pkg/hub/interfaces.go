@@ -55,9 +55,11 @@ type IdentityStore interface {
 	// generation exists (first wins per epoch, voided or not). It returns the
 	// entry that is in effect afterwards and whether entry was written
 	// (created == true). A pin of any other epoch or generation is void and is
-	// replaced.
+	// replaced: the voided fingerprints and the distrusted keys are carried
+	// over, the conflict count is not (see ReplacePin).
 	Pin(ctx context.Context, entry api.IdentityEntry) (current api.IdentityEntry, created bool, err error)
-	// RecordConflict counts a rejected enrollment with a different key.
+	// RecordConflict counts a rejected enrollment with a different key on the
+	// stored pin (a no-op when nothing is pinned).
 	RecordConflict(ctx context.Context, ns, device string, at time.Time) error
 	// Void marks the pin of a device void for good (sticky revocation): it is
 	// never accepted again, whatever the policy says. It is a no-op (false)
