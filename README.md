@@ -88,6 +88,22 @@ Device identity:
 - When the hub sees a `compromised` or `health-check-failed` flag it voids the pin
   in the identity ConfigMap for good, whether or not device-controller noticed.
   Re-admission needs a new enrollment window (new epoch) and a new identity.
+- The pin (`ztna-identity-<teamspace>.<device>`) is kept when the Device is
+  deleted, by design: it is the device name's enrollment and revocation history
+  (the generation device-controller seeds the next one from, `voidedFingerprints`,
+  `distrustedKeys`), and nothing deletes it. It does not block a new Device of
+  the same name: that Device gets a new epoch, so the old pin is void, and the
+  first enrollment of the new epoch (inside the window, or attested by the
+  trusted device key outside it) replaces it. An attestation made for the old
+  epoch is refused.
+- The conflict count (`conflicts`, `lastConflictAt`) belongs to one enrollment
+  epoch and generation, like `replacements`: the pin that replaces a pin of
+  another epoch starts at zero. A reset enrollment, or a Device created again
+  under the name of a deleted one, does not show its predecessor's conflicts;
+  the voided fingerprints and the distrusted keys are still carried over. A
+  refusal counted against a pin that is already void (a voided identity that
+  tries again in a new window before anything is pinned there) ends with that
+  pin; the decision log has every refusal.
 - Callers who have not proven a credential only ever hear `unauthenticated`; the
   specific reasons (`reenroll`, `pending_approval`, ...) go to authenticated devices.
 
@@ -247,8 +263,8 @@ must send that token; until it does, every status call is refused.
   peer, transport (`turn`), agent version and capabilities, whether the
   identity waits for an admin, the hub's own record of the identity pin
   (`identity`: fingerprint, attested key (the device key) and type, enrollment
-  epoch and generation, activation source and time, voided, conflicts,
-  replacements; taken from the identity
+  epoch and generation, activation source and time, voided, conflicts and
+  replacements (both of the pin's own enrollment epoch); taken from the identity
   store, never from the Device CR, whose status device editors can write; the
   admin actions of Backstage compare against it), and its client sessions (subject, service,
   software, path, since, bytes). `BytesIn` is client to device, `BytesOut` device
@@ -421,6 +437,22 @@ identity that the device key attested activates by itself.
   `reenroll`, not `enroll_conflict`: the agent generates a new identity and
   enrolls it (and the console shows no squatting). Without the key it stays a
   conflict.
+- **The same Device bootstrapped again with a wiped agent state directory**
+  (`/var/lib/teknoir/wg-agent`: the identity key and a delivered device key
+  are gone; the policy epoch and the RSA key are the same). The new identity
+  meets the live pin of the old one, and first wins per epoch. The hub answers
+  the session `unauthenticated`, the agent enrolls and keeps retrying with its
+  back-off, and nobody has to log in to the device:
+
+  | Device key | Enrollment is answered | What brings the device back |
+  |---|---|---|
+  | trusted, and the agent still holds it (bootstrap key file) | `enroll_conflict` while the hub holds the old session (it expires 3 minutes after its last renewal), then `201` | Nothing: pin replacement above. |
+  | trusted, but the agent holds none | `attest_required` | An admin's **Rotate device key**: device-controller trusts a new key and delivers it sealed in the device's MQTT config; the agent attests with it and displaces the old pin. **Reset enrollment** alone does not help: an unattested enrollment is refused before the window is looked at. |
+  | none trusted (manual approval) | `enroll_conflict` | An admin's **Reset enrollment** (new epoch and window), then approval of the new fingerprint. |
+
+  The refused attempts are counted as conflicts of the epoch. Covered by
+  `TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir`; the delivery over MQTT
+  is device-controller's and the agent's part and is not in that test.
 - The live status (`api.LiveIdentity`) reports `activatedBy`, `activatedAt`,
   `replacements`, `lastReplacedAt`, `current` (the pin is of the policy's current
   epoch and generation) and `agentCapabilities`.

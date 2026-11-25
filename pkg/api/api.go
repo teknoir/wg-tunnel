@@ -296,7 +296,14 @@ const (
 )
 
 // Identity store, written only by the hub (TOFU enrollment pins). One
-// ConfigMap per device; device-controller reads it to show the fingerprint.
+// ConfigMap per device name; device-controller reads it to show the
+// fingerprint and to seed the enrollment generation.
+//
+// The ConfigMap is kept when the Device is deleted, by design: it is the
+// name's enrollment and revocation history (generation, voided fingerprints,
+// distrusted device keys), and nothing deletes it. It does not block a new
+// Device of the same name: that Device gets a new enrollment epoch, so the old
+// pin is void and the first enrollment of the new epoch replaces it.
 const (
 	IdentityConfigMapPrefix = "ztna-identity-"            // + <teamspace>.<device>
 	IdentityLabel           = "ztna.teknoir.org/identity" // = "true"
@@ -533,7 +540,10 @@ type IdentityEntry struct {
 	LastReplacedAt          time.Time `json:"lastReplacedAt,omitempty"`
 	LastReplacedFingerprint string    `json:"lastReplacedFingerprint,omitempty"`
 	// Conflicts counts rejected enrollments with a DIFFERENT key for this
-	// generation (possible key theft); surfaced in the UI.
+	// generation (possible key theft); surfaced in the UI. Like Replacements
+	// it belongs to this pin's enrollment epoch and generation: the pin that
+	// replaces this one for another epoch or generation starts at zero, while
+	// a displacement or replacement within the epoch keeps the count.
 	Conflicts      int       `json:"conflicts,omitempty"`
 	LastConflictAt time.Time `json:"lastConflictAt,omitempty"`
 }

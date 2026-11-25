@@ -217,8 +217,12 @@ func IsVoidedFingerprint(e api.IdentityEntry, fp string) bool {
 //     before; it is not pinned.
 //   - otherwise next is the entry to store: entry, carrying over the voided
 //     fingerprint history (including cur's own fingerprint when cur is void)
-//     and the conflict history of the device it replaces, and the keys that
-//     are distrusted (DistrustedKeys).
+//     and the keys that are distrusted (DistrustedKeys). The conflict count
+//     (Conflicts, LastConflictAt) is NOT carried over: it belongs to one
+//     enrollment window, like Replacements, so the pin of a new epoch or
+//     generation starts at zero. A reset enrollment, or a Device re-created
+//     under the name of a deleted one, does not inherit its predecessor's
+//     count.
 func ReplacePin(cur *api.IdentityEntry, entry api.IdentityEntry) (next api.IdentityEntry, same bool, err error) {
 	if cur == nil {
 		return entry, false, nil
@@ -253,18 +257,16 @@ func ReplacePin(cur *api.IdentityEntry, entry api.IdentityEntry) (next api.Ident
 		distrusted = appendBounded(distrusted, k, api.MaxDistrustedKeys)
 	}
 	next.DistrustedKeys = distrusted
-	next.Conflicts = cur.Conflicts + entry.Conflicts
-	next.LastConflictAt = cur.LastConflictAt
-	if entry.LastConflictAt.After(next.LastConflictAt) {
-		next.LastConflictAt = entry.LastConflictAt
-	}
+	// next.Conflicts and next.LastConflictAt stay entry's own (zero for a new
+	// enrollment): cur's count is that of the window that just ended.
 	return next, false, nil
 }
 
 // Pin implements IdentityStore. An existing pin of the SAME enrollment epoch
 // and generation is never replaced (first wins per epoch, voided or not); a pin
 // of any other epoch or generation is void and is replaced, carrying over the
-// voided fingerprint and conflict history. A voided identity is refused with
+// voided fingerprint history and the distrusted keys, but not the conflict
+// count (see ReplacePin). A voided identity is refused with
 // ErrFingerprintVoided.
 func (s *K8sIdentityStore) Pin(ctx context.Context, entry api.IdentityEntry) (api.IdentityEntry, bool, error) {
 	if !validLabel(entry.Namespace) || !validLabel(entry.Device) {
