@@ -429,8 +429,11 @@ identity that the device key attested activates by itself.
 - **Pin replacement**: an enrollment attested by the trusted device key also
   replaces a pin that IS trusted (attested by the key, or approved) when the
   device has **no live session**: the device lost its identity (re-image) and the
-  device key proves it is the same device. The old fingerprint is voided,
-  `replacements`, `lastReplacedAt` and `lastReplacedFingerprint` are recorded and
+  device key proves it is the same device. This needs automatic activation
+  (the rule above), also where displacement does not: with `activationMode:
+  manual`, a generation forced to manual or `duplicateHostKey` no trusted pin
+  is replaced. The old fingerprint is voided, `replacements`, `lastReplacedAt`
+  and `lastReplacedFingerprint` are recorded and
   the new identity activates. While the device is online the same enrollment is
   today's `enroll_conflict`. A voided identity that comes back (the pod moved
   from node A to B and back) and proves the trusted device key is answered
@@ -442,17 +445,60 @@ identity that the device key attested activates by itself.
   are gone; the policy epoch and the RSA key are the same). The new identity
   meets the live pin of the old one, and first wins per epoch. The hub answers
   the session `unauthenticated`, the agent enrolls and keeps retrying with its
-  back-off, and nobody has to log in to the device:
+  back-off. Nobody has to log in to the device, as long as what the row needs
+  reaches it: the hub, and in row 2 the device's MQTT config.
 
   | Device key | Enrollment is answered | What brings the device back |
   |---|---|---|
-  | trusted, and the agent still holds it (bootstrap key file) | `enroll_conflict` while the hub holds the old session (it expires 3 minutes after its last renewal), then `201` | Nothing: pin replacement above. |
-  | trusted, but the agent holds none | `attest_required` | An admin's **Rotate device key**: device-controller trusts a new key and delivers it sealed in the device's MQTT config; the agent attests with it and displaces the old pin. **Reset enrollment** alone does not help: an unattested enrollment is refused before the window is looked at. |
-  | none trusted (manual approval) | `enroll_conflict` | An admin's **Reset enrollment** (new epoch and window), then approval of the new fingerprint. |
+  | 1. trusted, and the agent still holds it (bootstrap key file) | `enroll_conflict` while the hub holds the old session (it expires 3 minutes after its last renewal), then `201` | With automatic activation nothing: pin replacement above. Without it the answer stays `enroll_conflict`: an admin's **Reset enrollment**, then approval (note 1). |
+  | 2. trusted, but the agent holds none | `attest_required` | An admin's **Rotate device key**, and a working MQTT path to the device (note 2). **Reset enrollment** alone does not help: an unattested enrollment is refused before the window is looked at. |
+  | 3. none trusted (manual approval) | `enroll_conflict` | An admin's **Reset enrollment** (new epoch and window), then approval of the new fingerprint. |
 
-  The refused attempts are counted as conflicts of the epoch. Covered by
-  `TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir`; the delivery over MQTT
-  is device-controller's and the agent's part and is not in that test.
+  1. **Row 1 recovers by itself only with automatic activation.** With
+     `activationMode: manual`, a generation forced to manual or
+     `duplicateHostKey` the device key replaces no trusted pin. The pin of the
+     old identity, which an admin approved (nothing else activates there),
+     stays: the enrollment is `enroll_conflict` while the old session lives and
+     also once the device is offline, however long the agent retries. Only
+     **Reset enrollment** (new epoch, generation and window; the approval is
+     dropped) and then approval of the new fingerprint bring the device back.
+     The approval is not needed where the new generation activates
+     automatically again (the forcing named the old generation only).
+  2. **Row 2 depends on MQTT, the lifeline.** WireGuard is what is down, so the
+     new key can only travel in the device's MQTT config. **Rotate device key**
+     makes device-controller create a key, seal it to the device's RSA key, put
+     it in that config and trust it in the policy; the agent opens it, attests
+     with it and displaces the old pin (`201`). device-controller delivers only
+     while it sees the device **online** (its DeviceState: the device reports
+     metrics and has no `lost` alert) and while `deviceKeyDelivery` is on in its
+     ZTNA config (the default; `false` is the kill switch). Until then the
+     request waits. An envelope the hub has not confirmed (it saw no
+     attestation by the key) is withdrawn after 15 minutes
+     (`deviceKeyWindowMinutes`), or earlier when device-controller no longer
+     sees the device online; a later reconcile delivers another key while the
+     device is online. If MQTT is down too, or the device does not apply its
+     config, no key arrives and WireGuard does **not** come back without
+     access to the device itself. With `activationMode: manual` the rotated
+     key does not replace the approved pin either: it then takes the rotated
+     key, **Reset enrollment** and approval.
+  3. **An old pin that an admin approved** (its fingerprint is the policy's
+     `approvedFingerprint`, whether or not the device key attested it too) is
+     never displaced, only replaced. With automatic activation and a live
+     session of the old identity the enrollment is
+     `enroll_conflict` for up to 3 minutes (until that session expires), then
+     `201`: in row 1 as the row says, and in row 2 also after the rotated key
+     arrived, where a pin that was activated by the device key alone is
+     displaced at once.
+
+  The refused attempts are counted as conflicts of the epoch. The hub's part is
+  covered by `TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir` (one subtest
+  per row, note 1 for each of the three modes, note 3 for both rows). The
+  delivery is device-controller's and the agent's part and is not in that test;
+  in device-controller (`internal/controller/plugin_wireguard`) see
+  `TestRotateDeviceKeyDeliversANewKey`, `TestOfflineDeviceGetsNoEnvelope`,
+  `TestEnvelopeIsRemovedWhenTheDeviceGoesOffline`,
+  `TestExpiredEnvelopeIsRemovedAndRedeliveredWhenOnline` and
+  `TestKillSwitchStopsDeliveryAndRemovesAnEnvelopeInFlight`.
 - The live status (`api.LiveIdentity`) reports `activatedBy`, `activatedAt`,
   `replacements`, `lastReplacedAt`, `current` (the pin is of the policy's current
   epoch and generation) and `agentCapabilities`.

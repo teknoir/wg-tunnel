@@ -333,10 +333,33 @@ func TestReplacePinStartsTheConflictCountAtZero(t *testing.T) {
 // comes back with a NEW identity key and meets the live pin of its old one.
 // First wins per epoch, so the hub does not take the new identity on the RSA
 // key alone (that key is widely exposed). What it answers, and what brings the
-// device back, depends on the device key. None of the ways back needs a login
-// on the device: they need the hub, and for a delivered key the device's MQTT
-// config (device-controller seals the key into it; not part of these tests).
+// device back, depends on the device key and on whether that key activates an
+// identity (automatic activation). None of the ways back needs a login on the
+// device as long as they reach it: they need the hub, and for a delivered key
+// the device's MQTT config (device-controller seals the key into it, only for
+// a device it sees online; not part of these tests). Without MQTT a lost
+// device key does not come back by itself.
 func TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir(t *testing.T) {
+	// Reset enrollment as the hub sees it: device-controller draws a new epoch
+	// and generation, opens a window and drops the approval.
+	resetEnrollment := func(r *rig, change func(*api.PolicyEntry)) {
+		p := r.policy
+		p.EnrollmentEpoch, p.EnrollmentGeneration, p.ApprovedFingerprint = "epoch-2", 2, ""
+		p.EnrollUntil = r.clock.Now().Add(15 * time.Minute)
+		if change != nil {
+			change(&p)
+		}
+		r.setPolicy(p)
+	}
+	expireSession := func(r *rig) {
+		r.t.Helper()
+		r.clock.Advance(r.h.cfg.SessionTTL + time.Second)
+		r.h.reap()
+		if d, _ := r.h.sessionCounts(); d != 0 {
+			r.t.Fatal("the session of the wiped agent must expire")
+		}
+	}
+
 	t.Run("device key still held: back by itself once the old session is gone", func(t *testing.T) {
 		r := newRig(t)
 		dk := newTestHostKey(t, "ed25519")
@@ -379,6 +402,153 @@ func TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir(t *testing.T) {
 		// Same epoch: the conflict counted above stays.
 		if got.Conflicts != 1 {
 			t.Fatalf("conflicts %d", got.Conflicts)
+		}
+		r.dev = wiped
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("session of the new identity: %d %s", st, body)
+		}
+	})
+
+	// The device key replaces a trusted pin only where it activates an identity
+	// (canReplace needs autoActivation). With manual activation, a generation
+	// forced to manual or a key shared with another device, the pin an admin
+	// approved stays, online or offline, and the device key the agent still
+	// holds changes nothing: it takes Reset enrollment and a new approval.
+	noAuto := []struct {
+		name string
+		mode func(*api.PolicyEntry)
+	}{
+		{"manual activation", func(p *api.PolicyEntry) { p.ActivationMode = "manual" }},
+		{"forced manual", func(p *api.PolicyEntry) { p.ForceManualGeneration = p.EnrollmentGeneration }},
+		{"shared key", func(p *api.PolicyEntry) { p.DuplicateHostKey = true }},
+	}
+	// approvedWithKey enrolls the device with the trusted key dk in a policy
+	// without automatic activation, has an admin approve it and brings it online.
+	approvedWithKey := func(t *testing.T, mode func(*api.PolicyEntry)) (*rig, testHostKey) {
+		t.Helper()
+		r := newRig(t)
+		dk := newTestHostKey(t, "ed25519")
+		p := r.policy
+		p.TrustedHostKey = dk.fp
+		mode(&p)
+		r.setPolicy(p)
+		if st, body := r.attestedEnroll(r.dev, dk); st != http.StatusCreated {
+			t.Fatalf("%d %s", st, body)
+		}
+		st, body := r.deviceSessionStatus()
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonPendingApproval)
+		r.approve()
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("%d %s", st, body)
+		}
+		return r, dk
+	}
+	for _, m := range noAuto {
+		t.Run("device key still held, "+m.name+": enroll_conflict also offline, until Reset enrollment and approval", func(t *testing.T) {
+			r, dk := approvedWithKey(t, m.mode)
+			old := r.dev.fingerprint()
+			wiped := r.otherDevice(t)
+
+			st, body := r.sessionOf(wiped)
+			wantReason(t, st, body, http.StatusUnauthorized, api.ReasonUnauthenticated)
+			st, body = r.attestedEnroll(wiped, dk)
+			wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+			// Unlike with automatic activation, the end of the old session
+			// changes nothing: the agent retries for ever.
+			expireSession(r)
+			st, body = r.attestedEnroll(wiped, dk)
+			wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+			r.clock.Advance(time.Hour)
+			st, body = r.attestedEnroll(wiped, dk)
+			wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+			if got := r.ids.entry(testNS, testDevice); got.Fingerprint != old || got.Replacements != 0 || got.Conflicts != 3 ||
+				got.ActivatedBy != api.ActivatedByApproval || len(got.VoidedFingerprints) != 0 {
+				t.Fatalf("pin %+v", got)
+			}
+
+			// Admin action "Reset enrollment" (the new generation is as manual
+			// as the old one), then approval of the new fingerprint.
+			resetEnrollment(r, m.mode)
+			if st, body := r.attestedEnroll(wiped, dk); st != http.StatusCreated {
+				t.Fatalf("enroll after the reset: %d %s", st, body)
+			}
+			if got := r.ids.entry(testNS, testDevice); got.Fingerprint != wiped.fingerprint() || got.EnrollmentEpoch != "epoch-2" || got.Conflicts != 0 {
+				t.Fatalf("pin %+v", got)
+			}
+			r.dev = wiped
+			st, body = r.deviceSessionStatus()
+			wantReason(t, st, body, http.StatusForbidden, api.ReasonPendingApproval)
+			r.approve()
+			if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+				t.Fatalf("session after approval: %d %s", st, body)
+			}
+			if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByApproval {
+				t.Fatalf("pin %+v", got)
+			}
+		})
+	}
+
+	// A generation is forced to manual by number. When Reset enrollment gives
+	// a generation above it, the device key activates again and the reset
+	// alone brings the device back.
+	t.Run("device key still held, forced manual ended with the old generation: Reset enrollment is enough", func(t *testing.T) {
+		r, dk := approvedWithKey(t, func(p *api.PolicyEntry) { p.ForceManualGeneration = p.EnrollmentGeneration })
+		wiped := r.otherDevice(t)
+		expireSession(r)
+		st, body := r.attestedEnroll(wiped, dk)
+		wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+
+		resetEnrollment(r, nil) // forceManualGeneration stays 1, the generation is 2
+		if st, body := r.attestedEnroll(wiped, dk); st != http.StatusCreated {
+			t.Fatalf("enroll after the reset: %d %s", st, body)
+		}
+		r.dev = wiped
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("session of the new identity: %d %s", st, body)
+		}
+		if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByDeviceKey {
+			t.Fatalf("pin %+v", got)
+		}
+	})
+
+	// The pin of the old identity was approved by an admin (before the device
+	// had a key, or in addition to it) and automatic activation is on: an
+	// approved pin is never displaced, only replaced, so it is a conflict while
+	// its session lives (at most SessionTTL after the last renewal).
+	t.Run("device key still held, old pin approved by an admin: enroll_conflict while the old session lives, then back by itself", func(t *testing.T) {
+		r := newRig(t)
+		r.deviceSessionOK() // enrolled without a key, approved by an admin, online
+		dk := newTestHostKey(t, "ed25519")
+		r.trust(dk)
+		// The agent records its first device key on the approved pin.
+		if st, body := r.attestedEnroll(r.dev, dk); st != http.StatusOK {
+			t.Fatalf("re-attestation: %d %s", st, body)
+		}
+		old := r.dev.fingerprint()
+		if got := r.ids.entry(testNS, testDevice); got.ActivatedBy != api.ActivatedByApproval || r.policy.ApprovedFingerprint != old {
+			t.Fatalf("pin %+v", got)
+		}
+		wiped := r.otherDevice(t)
+
+		st, body := r.attestedEnroll(wiped, dk)
+		wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+		// One second before the session expires it is still a conflict.
+		r.clock.Advance(r.h.cfg.SessionTTL - time.Second)
+		r.h.reap()
+		st, body = r.attestedEnroll(wiped, dk)
+		wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+		r.clock.Advance(2 * time.Second)
+		r.h.reap()
+		if d, _ := r.h.sessionCounts(); d != 0 {
+			t.Fatal("the session of the wiped agent must expire")
+		}
+		if st, body := r.attestedEnroll(wiped, dk); st != http.StatusCreated {
+			t.Fatalf("replacement: %d %s", st, body)
+		}
+		got := r.ids.entry(testNS, testDevice)
+		if got.Fingerprint != wiped.fingerprint() || got.Replacements != 1 || got.Conflicts != 2 ||
+			got.ActivatedBy != api.ActivatedByDeviceKey || !slices.Contains(got.VoidedFingerprints, old) {
+			t.Fatalf("pin %+v", got)
 		}
 		r.dev = wiped
 		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
@@ -458,6 +628,80 @@ func TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir(t *testing.T) {
 		}
 		if got := r.ids.entry(testNS, testDevice); got.Fingerprint != wiped.fingerprint() || got.EnrollmentEpoch != "epoch-2" || got.Conflicts != 0 {
 			t.Fatalf("pin %+v", got)
+		}
+	})
+
+	// A rotated key displaces the pin of the lost identity at once only when no
+	// admin approved that pin. An approved pin keeps its session when trust
+	// moves to another key, and is replaced once that session is gone.
+	t.Run("device key lost, old pin approved by an admin: the rotated key replaces it once the old session is gone", func(t *testing.T) {
+		r := newRig(t)
+		dk := newTestHostKey(t, "ed25519")
+		r.trust(dk)
+		if st, body := r.attestedEnroll(r.dev, dk); st != http.StatusCreated {
+			t.Fatalf("%d %s", st, body)
+		}
+		r.deviceSessionOK() // approved as well, online
+		old := r.dev.fingerprint()
+		wiped := r.otherDevice(t)
+		st, body := r.enrollWith(wiped, nil)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+
+		dk2 := newTestHostKey(t, "ed25519")
+		r.trust(dk2)
+		time.Sleep(100 * time.Millisecond) // the enforcer would have ended it by now
+		if d, _ := r.h.sessionCounts(); d != 1 {
+			t.Fatal("the session of the approved pin stays when the key is rotated")
+		}
+		st, body = r.attestedEnroll(wiped, dk2)
+		wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+		expireSession(r)
+		if st, body := r.attestedEnroll(wiped, dk2); st != http.StatusCreated {
+			t.Fatalf("attested by the rotated key: %d %s", st, body)
+		}
+		got := r.ids.entry(testNS, testDevice)
+		if got.Fingerprint != wiped.fingerprint() || got.AttestedHostKey != dk2.fp || got.Replacements != 1 ||
+			got.ActivatedBy != api.ActivatedByDeviceKey || !slices.Contains(got.VoidedFingerprints, old) {
+			t.Fatalf("pin %+v", got)
+		}
+		r.dev = wiped
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("session of the new identity: %d %s", st, body)
+		}
+	})
+
+	// With manual activation the rotated key replaces no approved pin either:
+	// it takes the rotated key (an unattested enrollment is refused), Reset
+	// enrollment and a new approval.
+	t.Run("device key lost, manual activation: rotated key, Reset enrollment and approval", func(t *testing.T) {
+		manual := func(p *api.PolicyEntry) { p.ActivationMode = "manual" }
+		r, _ := approvedWithKey(t, manual)
+		old := r.dev.fingerprint()
+		wiped := r.otherDevice(t)
+		st, body := r.enrollWith(wiped, nil)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+
+		dk2 := newTestHostKey(t, "ed25519")
+		r.trust(dk2)
+		expireSession(r)
+		st, body = r.attestedEnroll(wiped, dk2)
+		wantReason(t, st, body, http.StatusConflict, api.ReasonEnrollConflict)
+		if got := r.ids.entry(testNS, testDevice); got.Fingerprint != old || got.Replacements != 0 {
+			t.Fatalf("pin %+v", got)
+		}
+
+		resetEnrollment(r, manual)
+		st, body = r.enrollWith(wiped, nil)
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonAttestRequired)
+		if st, body := r.attestedEnroll(wiped, dk2); st != http.StatusCreated {
+			t.Fatalf("enroll after the reset: %d %s", st, body)
+		}
+		r.dev = wiped
+		st, body = r.deviceSessionStatus()
+		wantReason(t, st, body, http.StatusForbidden, api.ReasonPendingApproval)
+		r.approve()
+		if st, body := r.deviceSessionStatus(); st != http.StatusCreated {
+			t.Fatalf("session after approval: %d %s", st, body)
 		}
 	})
 
