@@ -461,9 +461,17 @@ identity that the device key attested activates by itself.
      stays: the enrollment is `enroll_conflict` while the old session lives and
      also once the device is offline, however long the agent retries. Only
      **Reset enrollment** (new epoch, generation and window; the approval is
-     dropped) and then approval of the new fingerprint bring the device back.
-     The approval is not needed where the new generation activates
-     automatically again (the forcing named the old generation only).
+     dropped) and then approval of the new fingerprint bring the device back,
+     with the mode unchanged. For `duplicateHostKey` there is a second way:
+     **Rotate device key** (needs MQTT, note 2) gives the device a key of its
+     own, automatic activation applies again and the old pin is replaced once
+     its session is gone.
+     A generation forced to manual is, in the hub alone, forced by number: a
+     reset to a higher generation would let the held key activate again. With
+     device-controller that state does not occur: it forces a generation only
+     for a pending key rotation and then trusts no key (row 3), so the device
+     comes back by approval or by the rotated key arriving over MQTT (note 2).
+     The hub test for the number rule is hub-only.
   2. **Row 2 depends on MQTT, the lifeline.** WireGuard is what is down, so the
      new key can only travel in the device's MQTT config. **Rotate device key**
      makes device-controller create a key, seal it to the device's RSA key, put
@@ -476,9 +484,15 @@ identity that the device key attested activates by itself.
      attestation by the key) is withdrawn after 15 minutes
      (`deviceKeyWindowMinutes`), or earlier when device-controller no longer
      sees the device online; a later reconcile delivers another key while the
-     device is online. If MQTT is down too, or the device does not apply its
-     config, no key arrives and WireGuard does **not** come back without
-     access to the device itself. With `activationMode: manual` the rotated
+     device is online, 10 minutes after the last delivery at the earliest,
+     doubled per unconfirmed delivery up to 24 hours (a new **Rotate device
+     key** request delivers at once and resets that count). With manual
+     activation do the Reset enrollment and approval within the 15 minutes, or
+     the key is withdrawn and replaced. If MQTT is down too, or the device does
+     not apply its config, no key arrives and no supported platform action
+     brings WireGuard back without access to the device itself. (The hub
+     would take an unattested enrollment again, as in row 3, if the policy
+     trusted no device key, but there is no admin action for removing it today.) With `activationMode: manual` the rotated
      key does not replace the approved pin either: it then takes the rotated
      key, **Reset enrollment** and approval.
   3. **An old pin that an admin approved** (its fingerprint is the policy's

@@ -488,9 +488,11 @@ func TestRebootstrapOfTheSameDeviceWithAWipedIdentityDir(t *testing.T) {
 		})
 	}
 
-	// A generation is forced to manual by number. When Reset enrollment gives
-	// a generation above it, the device key activates again and the reset
-	// alone brings the device back.
+	// Hub-only rule: a generation is forced to manual by number. When Reset
+	// enrollment gives a generation above it, the device key activates again
+	// and the reset alone brings the device back. device-controller never
+	// writes this state for an enrollable device (it forces a generation only
+	// for a pending rotation, with no key trusted): see README note 1.
 	t.Run("device key still held, forced manual ended with the old generation: Reset enrollment is enough", func(t *testing.T) {
 		r, dk := approvedWithKey(t, func(p *api.PolicyEntry) { p.ForceManualGeneration = p.EnrollmentGeneration })
 		wiped := r.otherDevice(t)
